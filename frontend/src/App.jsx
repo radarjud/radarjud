@@ -41,6 +41,7 @@ function CompanyLogo({ logo, companyName }) {
 
   useEffect(() => {
     setImgErrorStep(0);
+    console.log('[RadarJus][CompanyLogo]', { companyName, logo });
   }, [companyName, logo?.logo_url, logo?.google_favicon_url, logo?.logo_primary_url]);
 
   if (logoUrl) {
@@ -306,6 +307,25 @@ function Overview({ data, navigate }) {
   const isFastPath = data?.scanStatus === 'PARTIAL_FAST_PATH';
   const isCompleted = data?.scanStatus === 'COMPLETED';
   const tstCount = (data?.processes || []).filter(p => p.is_tst_recurso || p.tribunal === 'tst' || String(p.grau || '').includes('TST')).length;
+
+  useEffect(() => {
+    if (!data) return;
+    console.log('[RadarJus][Overview Render]', {
+      empresa: data.name,
+      totalProcessos: data.total,
+      scanStatus: data.scanStatus,
+      cached: data.cached,
+      cacheLevel: data.cacheLevel,
+      riskScore: data.riskScore,
+      capitalSocial: data.idoneidadeEconomica?.valor_formatado || data.idoneidadeEconomica?.capital_social_formatado,
+      unidadesConsolidadas: data.idoneidadeEconomica?.unidades_consolidadas,
+      cnpjsConsolidados: data.idoneidadeEconomica?.cnpjs_consolidados,
+      raizesConsolidadas: data.idoneidadeEconomica?.raizes_consolidadas,
+      cenario: data.idoneidadeEconomica?.cenario_tipo,
+      logo: data.logo,
+      idoneidadeEconomica: data.idoneidadeEconomica,
+    });
+  }, [data]);
 
   return (
     <div className="stack">
@@ -940,8 +960,10 @@ export default function App() {
     const intervalId = setInterval(async () => {
       try {
         const statusRes = await request(`/search_status/${data.searchId}`);
+        console.log('[RadarJus][Polling /search_status]', statusRes);
         if (statusRes?.is_completed && statusRes.data) {
           const updated = normalize(statusRes.data);
+          console.log('[RadarJus][Polling Completed NORMALIZED]', updated);
           if (updated) {
             setData((prev) => ({
               ...updated,
@@ -971,7 +993,9 @@ export default function App() {
         method: 'POST',
         body: JSON.stringify({ company_name: query.trim() }),
       });
+      console.log('[RadarJus][API /search-company RAW]', result);
       const normalized = normalize(result);
+      console.log('[RadarJus][API /search-company NORMALIZED]', normalized);
       if (!normalized) throw new Error('A API não retornou dados de empresa válidos.');
       setData(normalized);
       navigate('overview');
@@ -1000,7 +1024,9 @@ export default function App() {
     setHistoryError('');
     try {
       const result = await request(`/history/${encodeURIComponent(id)}`);
+      console.log('[RadarJus][API /history/:id RAW]', result);
       const normalized = normalize(result);
+      console.log('[RadarJus][API /history/:id NORMALIZED]', normalized);
       if (!normalized) throw new Error('A consulta salva não contém dados válidos.');
       setData(normalized);
       setQuery(normalized.name);
