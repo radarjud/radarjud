@@ -137,6 +137,8 @@ def _deep_scan_background_worker(
                             "numero_processo": num,
                             "siglaTribunal": p.get("tribunal", ""),
                             "publicacoes_texto": p.get("publicacoes_texto", []),
+                            "destinatarios_nomes": p.get("destinatarios_nomes", []),
+                            "cnpjs_encontrados": p.get("cnpjs_encontrados", []),
                             "classes_pje": p.get("classes_pje", []),
                             "is_tst_recurso": p.get("is_tst_recurso", False),
                         }
@@ -152,12 +154,10 @@ def _deep_scan_background_worker(
                         if cnj not in all_processes_map:
                             all_processes_map[cnj] = data
                         else:
-                            for t in data.get("publicacoes_texto", []):
-                                if t not in all_processes_map[cnj]["publicacoes_texto"]:
-                                    all_processes_map[cnj]["publicacoes_texto"].append(t)
-                            for c in data.get("classes_pje", []):
-                                if c not in all_processes_map[cnj].get("classes_pje", []):
-                                    all_processes_map[cnj].setdefault("classes_pje", []).append(c)
+                            for field in ("publicacoes_texto", "classes_pje", "destinatarios_nomes", "cnpjs_encontrados"):
+                                for val in data.get(field, []):
+                                    if val not in all_processes_map[cnj].setdefault(field, []):
+                                        all_processes_map[cnj][field].append(val)
 
                     s = db.session.get(CompanySearch, search_id)
                     if s:
@@ -182,12 +182,10 @@ def _deep_scan_background_worker(
                 if cnj not in all_processes_map:
                     all_processes_map[cnj] = data
                 else:
-                    for t in data.get("publicacoes_texto", []):
-                        if t not in all_processes_map[cnj]["publicacoes_texto"]:
-                            all_processes_map[cnj]["publicacoes_texto"].append(t)
-                    for c in data.get("classes_pje", []):
-                        if c not in all_processes_map[cnj].get("classes_pje", []):
-                            all_processes_map[cnj].setdefault("classes_pje", []).append(c)
+                    for field in ("publicacoes_texto", "classes_pje", "destinatarios_nomes", "cnpjs_encontrados"):
+                        for val in data.get(field, []):
+                            if val not in all_processes_map[cnj].setdefault(field, []):
+                                all_processes_map[cnj][field].append(val)
 
             if job_id:
                 with ACTIVE_SEARCH_LOCK:
@@ -227,11 +225,12 @@ def _deep_scan_background_worker(
             deep_results["movements_hash"] = generate_movements_hash(enriched_list)
             deep_results["processos"] = enriched_list
 
+            all_discovered = list(set(scan_res.get("discovered_entities") or []) | cnpjs_found)
             deep_results["idoneidade_economica"] = economic_service.evaluate_economic_standing(
                 company_name=company_name,
                 company_processes=enriched_list,
                 p_condenacao_trabalhista=deep_results.get("probabilidade_condenacao_geral_pct") or 0.0,
-                discovered_entities=list(cnpjs_found),
+                discovered_entities=all_discovered,
                 search_strategy=strat,
             )
             econ = deep_results["idoneidade_economica"]
@@ -504,11 +503,21 @@ def search_company():
                     cached_search.predictions_summary = fresh_metrics["plus_previsao_condenacao"]
                     cached_search.overall_risk_score = fresh_metrics["score_risco_terceirizacao"]
                 # Análise de Idoneidade Econômica & Risco de Calote Subsidiário (Súmula 331 TST)
+                saved_econ = cached_search.economic_standing if isinstance(cached_search.economic_standing, dict) else {}
+                saved_entities = list(saved_econ.get("cnpjs_consolidados") or [])
+                if saved_econ.get("razao_social_principal"):
+                    saved_entities.append(saved_econ["razao_social_principal"])
+                effective_cached_cnpj = (
+                    cnpj_used
+                    or saved_econ.get("cnpj_triangulado")
+                    or saved_econ.get("cnpj_utilizado")
+                )
                 econ_data = economic_service.evaluate_economic_standing(
                     company_name=cached_search.company_name,
-                    cnpj=cnpj_used,
+                    cnpj=effective_cached_cnpj,
                     company_processes=proc_dicts,
                     p_condenacao_trabalhista=res.get("probabilidade_condenacao_geral_pct") or 0.0,
+                    discovered_entities=saved_entities,
                     search_strategy=search_strategy,
                 )
                 res["idoneidade_economica"] = econ_data

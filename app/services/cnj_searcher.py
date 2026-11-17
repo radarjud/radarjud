@@ -877,6 +877,7 @@ class CNJProcessSearcher:
             },
             "publicacoes_texto": com_data.get("publicacoes_texto", []),
             "destinatarios_nomes": com_data.get("destinatarios_nomes", []),
+            "cnpjs_encontrados": com_data.get("cnpjs_encontrados", []),
             "classes_pje": classes_list,
             "resumoPublicacao": (com_data.get("publicacoes_texto") or [""])[0][:500],
             "raw_metadata": dj if dj else None,

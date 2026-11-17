@@ -193,7 +193,9 @@ def belongs_to_same_corporate_brand(user_brand_query: str, cnpj_razao_social: st
     # Se a busca é uma única marca distintiva (ex: 'PICPAY', 'ITAU', 'BRADESCO', 'COMPESA')
     if len(distinctive_tokens) == 1:
         token = distinctive_tokens[0]
-        return token in target_words or token in target_phrase
+        if token in target_words:
+            return True
+        return len(token) >= 7 and token in target_phrase
 
     # Se há múltiplos tokens distintivos (ex: 'MAGAZINE LUIZA', 'MERCADO LIVRE')
     return all(t in target_words for t in distinctive_tokens)
@@ -266,67 +268,447 @@ def extract_smart_brand_slug(user_query: str = "", razao_social: str = "", nome_
     return extract_brand_search_term(user_query, without_parens, nome_fantasia)
 
 
-def discover_real_corporate_domain_and_logo(brand_name: str, email_rfb: str = "") -> Dict[str, Any]:
-    """
-    Resolução Universal de Domínio e Logo em Cascata:
-    1. Dicionário de domínios corporativos especiais/estatais (SPECIAL_DOMAINS).
-    2. Domínio corporativo extraído do e-mail da Receita Federal (se não for genérico/provedor).
-    3. Clearbit Autocomplete API (descoberta dinâmica de logos de qualquer empresa sem hardcoding).
-    4. Fallback slug {slug}.com.br e iniciais representativas.
-    """
-    clean_name = re.sub(r"\(.*?\)", "", brand_name or "").strip()
-    norm_name = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", normalize_ascii(clean_name))).strip()
+CORPORATE_LEGAL_MARKERS = re.compile(
+    r"\b("
+    r"L\.?T\.?D\.?A\.?|LIMITADA|S\.?A\.?|S/A|SOCIEDADE\s+ANONIMA|EIRELI|"
+    r"M\.?E\.?|E\.?P\.?P\.?|COMPANHIA|CIA|HOLDING|PARTICIPACOES|"
+    r"INSTITUICAO|BANCO|COOPERATIVA|ASSOCIACAO|FUNDACAO|INSTITUTO|"
+    r"CONSULTORIA|TECNOLOGIA|DIGITAL|SISTEMAS|SOLUCOES|ENGENHARIA|"
+    r"CONSTRUTORA|COMERCIO|INDUSTRIA|SERVICOS|LOGISTICA|TRANSPORTES|"
+    r"ALIMENTOS|ENERGIA|SANEAMENTO|TELECOMUNICACOES|SEGURADORA|SEGUROS|"
+    r"FINANCEIRA|CREDITO|ADMINISTRADORA|COMUNICACAO|INFORMATICA|DISTRIBUIDORA"
+    r")\b",
+    re.IGNORECASE,
+)
 
-    domain = None
-    # 1. Domínios especiais mapeados
+GENERIC_EMAIL_HOSTS = (
+    "gmail", "hotmail", "outlook", "yahoo", "contabil",
+    "assessoria", "adv", "bol", "uol", "terra", "live", "icloud",
+    "ig.com", "r7.com", "zipmail", "proton", "msn", "ymail",
+)
+
+
+def _extract_corporate_domain_from_email(email_rfb: str) -> Optional[str]:
+    """Extrai o domínio corporativo de um e-mail da RFB, descartando provedores genéricos e escritórios contábeis."""
+    if not email_rfb or "@" not in email_rfb:
+        return None
+    email_dom = email_rfb.split("@")[-1].lower().strip()
+    if "." not in email_dom or any(g in email_dom for g in GENERIC_EMAIL_HOSTS):
+        return None
+    return email_dom
+
+
+def _strip_corporate_suffixes_for_search(name: str) -> str:
+    """Remove sufixos societários (LTDA, S.A., EIRELI, ME, EPP) preservando o núcleo nominal para busca."""
+    cleaned = re.sub(r"\(.*?\)", "", str(name or "")).strip()
+    cleaned = re.sub(
+        r"\b(L\.?T\.?D\.?A\.?|LIMITADA|S\.?A\.?|S\s*/\s*A|SOCIEDADE\s+ANONIMA|"
+        r"E\.?I\.?R\.?E\.?L\.?I\.?|MICROEMPRESA|SOCIEDADE\s+UNIPESSOAL|"
+        r"SOCIEDADE\s+SIMPLES|M\.?E\.?|E\.?P\.?P\.?)\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[^\w\s&.-]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"\s+\b(E|DE|DA|DO|DOS|DAS|EM)\b\s*$", "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned
+
+
+def extract_process_legal_names(
+    processes: Any,
+    brand_query: str = "",
+    discovered_entities: Optional[Any] = None,
+) -> List[str]:
+    """
+    Extrai e prioriza razões sociais reais (PJ) presentes nos destinatários e entidades dos processos,
+    filtrando pessoas físicas e terceiros sem vínculo com a marca consultada.
+    """
+    candidates_score: Dict[str, int] = {}
+    q_clean = re.sub(r"\(.*?\)", "", str(brand_query or "")).strip()
+    filter_by_brand = bool(q_clean) and not is_cnpj(q_clean)
+
+    def _consider(raw_name: Any) -> None:
+        if not isinstance(raw_name, str):
+            return
+        clean = re.sub(r"\(.*?\)", "", raw_name).strip().upper()
+        clean = re.sub(r"\s+", " ", clean)
+        if len(clean) < 5 or is_cnpj(clean):
+            return
+        words = [w for w in re.sub(r"[^\w\s]", " ", clean).split() if w]
+        if len(words) < 2:
+            return
+        if not CORPORATE_LEGAL_MARKERS.search(normalize_ascii(clean)):
+            return
+        if filter_by_brand and not belongs_to_same_corporate_brand(q_clean, clean):
+            return
+        score = score_corporate_name_priority(clean, 1)
+        if re.search(r"\b(LTDA|S\.?A\.?|S/A|EIRELI|ME|EPP)\b", clean):
+            score += 40
+        if clean not in candidates_score or score > candidates_score[clean]:
+            candidates_score[clean] = score
+
+    for ent in (discovered_entities or []):
+        _consider(ent)
+
+    procs_iter = processes.values() if isinstance(processes, dict) else (processes or [])
+    for proc in procs_iter:
+        if not isinstance(proc, dict):
+            continue
+        for dest_name in proc.get("destinatarios_nomes") or []:
+            _consider(dest_name)
+
+    return [
+        name for name, _ in sorted(
+            candidates_score.items(),
+            key=lambda item: (item[1], len(item[0])),
+            reverse=True,
+        )
+    ]
+
+
+def _pick_best_rfb_identity(records: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+    """Seleciona (razao_social, nome_fantasia, email_corporativo) dentre os registros válidos da RFB."""
+    if not records:
+        return "", "", ""
+
+    best_email = ""
+    best_razao = ""
+    best_fantasia = ""
+
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        em = str(rec.get("email") or "").strip()
+        if _extract_corporate_domain_from_email(em):
+            best_email = em
+            best_razao = str(rec.get("razao_social") or "").strip()
+            best_fantasia = str(rec.get("nome_fantasia") or "").strip()
+            break
+
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if not best_razao and rec.get("razao_social"):
+            best_razao = str(rec.get("razao_social")).strip()
+        if not best_fantasia and rec.get("nome_fantasia"):
+            best_fantasia = str(rec.get("nome_fantasia")).strip()
+
+    return best_razao, best_fantasia, best_email
+
+
+def _match_special_domain(norm_name: str) -> Optional[str]:
+    """Correspondência exata ou por palavra inteira em SPECIAL_DOMAINS (evita colisões por substring/fuzzy)."""
+    if not norm_name:
+        return None
     if norm_name in SPECIAL_DOMAINS:
-        domain = SPECIAL_DOMAINS[norm_name]
-    else:
-        for k, v in SPECIAL_DOMAINS.items():
-            if k == norm_name or (len(k) >= 3 and (norm_name.startswith(k + " ") or norm_name == k or (len(k) >= 4 and k in norm_name))):
-                domain = v
-                break
-        if not domain and len(norm_name) >= 4:
-            matches = difflib.get_close_matches(norm_name, list(SPECIAL_DOMAINS.keys()), n=1, cutoff=0.75)
-            if matches:
-                domain = SPECIAL_DOMAINS[matches[0]]
+        return SPECIAL_DOMAINS[norm_name]
+    for k, v in sorted(SPECIAL_DOMAINS.items(), key=lambda item: len(item[0]), reverse=True):
+        if len(k) >= 2 and re.search(rf"(?:^|\s){re.escape(k)}(?:\s|$)", norm_name):
+            return v
+    return None
 
-    # 2. Domínio do e-mail cadastral da Receita Federal
-    if not domain and email_rfb and "@" in email_rfb:
-        email_dom = email_rfb.split("@")[-1].lower().strip()
-        generic_hosts = [
-            "gmail", "hotmail", "outlook", "yahoo", "contabil",
-            "assessoria", "adv", "bol", "uol", "terra", "live", "icloud"
-        ]
-        if not any(g in email_dom for g in generic_hosts) and "." in email_dom:
-            domain = email_dom
 
-    # 3. Clearbit Autocomplete API (busca em tempo real para qualquer empresa)
-    if not domain:
+def _is_valid_clearbit_candidate(query_name: str, candidate: Dict[str, Any]) -> bool:
+    """
+    Valida se uma sugestão do Clearbit Autocomplete realmente pertence à empresa consultada,
+    evitando exibir a logo de homônimos estrangeiros ou empresas distintas com nome parecido.
+    """
+    cand_name = normalize_ascii(candidate.get("name") or "")
+    cand_domain = str(candidate.get("domain") or "").strip().lower()
+    if not cand_name or not cand_domain or "." not in cand_domain:
+        return False
+
+    q_norm = normalize_ascii(re.sub(r"\(.*?\)", "", query_name or "").strip())
+    q_words = [w for w in re.sub(r"[^\w\s]", " ", q_norm).split() if len(w) >= 2]
+    c_words = [w for w in re.sub(r"[^\w\s]", " ", cand_name).split() if len(w) >= 2]
+
+    q_distinct = [w for w in q_words if w not in GENERIC_CORPORATE_WORDS and w not in STOPWORDS_SOCIETARIAS]
+    c_distinct = [w for w in c_words if w not in GENERIC_CORPORATE_WORDS and w not in STOPWORDS_SOCIETARIAS]
+    if not q_distinct:
+        q_distinct = q_words
+    if not c_distinct:
+        c_distinct = c_words
+    if not q_distinct or not c_distinct:
+        return False
+
+    domain_parts = [
+        w for w in re.sub(r"[^\w\s]", " ", normalize_ascii(cand_domain)).split()
+        if len(w) >= 2 and w not in {"COM", "BR", "NET", "ORG", "GOV", "CO", "IO", "WWW"}
+    ]
+    domain_distinct = [w for w in domain_parts if w not in GENERIC_CORPORATE_WORDS and w not in STOPWORDS_SOCIETARIAS]
+
+    q_set = set(q_distinct)
+    c_set = set(c_distinct)
+    cand_identity_set = c_set | set(domain_distinct)
+
+    if len(q_set) >= 2:
+        # Exige presença dos tokens distintivos da consulta no nome ou domínio (ex: Alfa + alfa.digital)
+        if q_set.issubset(cand_identity_set):
+            return True
+        if len(q_distinct) > 2 and set(q_distinct[:2]).issubset(cand_identity_set):
+            return True
+        joined_prefix = "".join(q_distinct[:2]).lower()
+        if cand_domain.endswith(".br") and joined_prefix in cand_domain and q_distinct[0] in cand_identity_set:
+            return True
+        return False
+
+    # Para marca de token único (ex: 'ALFA'), rejeita sugestões que acrescentam outro nome distintivo
+    # (ex: 'Alfa Controls', 'Alfa AG') e exige domínio brasileiro (.br) para evitar homônimos globais
+    if c_set != q_set:
+        return False
+    return cand_domain.endswith(".br")
+
+
+def _shares_corporate_identity(razao_a: str, razao_b: str) -> bool:
+    """Verifica se duas razões sociais brasileiras representam a mesma pessoa jurídica ou núcleo societário."""
+    clean_a = _strip_corporate_suffixes_for_search(normalize_ascii(razao_a))
+    clean_b = _strip_corporate_suffixes_for_search(normalize_ascii(razao_b))
+    if not clean_a or not clean_b:
+        return False
+    if clean_a == clean_b:
+        return True
+    stop = {"DE", "DA", "DO", "DOS", "DAS", "E", "EM", "PARA", "COM"}
+    words_a = [w for w in clean_a.split() if len(w) >= 2 and w not in stop]
+    words_b = [w for w in clean_b.split() if len(w) >= 2 and w not in stop]
+    if not words_a or not words_b:
+        return False
+    set_a, set_b = set(words_a), set(words_b)
+    if set_a == set_b:
+        return True
+    # Para razões sociais completas (2+ palavras), exige interseção mínima de 2 termos ou do núcleo completo
+    if len(words_a) >= 2 and len(words_b) >= 2:
+        return len(set_a & set_b) >= 2 and words_a[0] == words_b[0]
+    return words_a[0] == words_b[0]
+
+
+def _extract_rdap_registrant_identity(data: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Extrai (cnpj_14_digitos, razao_social) da entidade titular no JSON oficial RDAP do Registro.br."""
+    if not isinstance(data, dict):
+        return None, None
+    for ent in data.get("entities") or []:
+        if not isinstance(ent, dict):
+            continue
+        roles = ent.get("roles") or []
+        if "registrant" not in roles:
+            continue
+        found_cnpj = None
+        for pid in ent.get("publicIds") or []:
+            if isinstance(pid, dict) and str(pid.get("type") or "").lower() == "cnpj":
+                digits = re.sub(r"\D", "", str(pid.get("identifier") or ""))
+                if len(digits) == 14 and is_valid_cnpj(digits):
+                    found_cnpj = digits
+                    break
+        found_name = None
+        vcard = ent.get("vcardArray")
+        if isinstance(vcard, list) and len(vcard) >= 2 and isinstance(vcard[1], list):
+            for prop in vcard[1]:
+                if isinstance(prop, list) and len(prop) >= 4 and prop[0] == "fn":
+                    found_name = str(prop[3] or "").strip().upper()
+                    break
+        if found_cnpj or found_name:
+            return found_cnpj, found_name
+    return None, None
+
+
+def _build_br_domain_candidates(brand_name: str, legal_names: Optional[List[str]] = None) -> List[str]:
+    """Gera até 3 slugs candidatos .com.br a partir da marca e das razões sociais reais."""
+    candidates: List[str] = []
+    seen = set()
+    stop = {"DE", "DA", "DO", "DOS", "DAS", "E", "EM", "PARA", "COM"}
+
+    def _add_slug(slug: str) -> None:
+        s = re.sub(r"[^a-z0-9-]", "", slug.lower()).strip("-")
+        if len(s) >= 3 and s not in seen:
+            seen.add(s)
+            candidates.append(f"{s}.com.br")
+
+    brand_norm = normalize_ascii(_strip_corporate_suffixes_for_search(brand_name))
+    brand_words = [
+        w.lower() for w in re.sub(r"[^\w\s]", " ", brand_norm).split()
+        if len(w) >= 2 and w not in stop
+    ]
+    brand_distinct = [
+        w for w in brand_words
+        if w.upper() not in GENERIC_CORPORATE_WORDS and w.upper() not in STOPWORDS_SOCIETARIAS
+    ]
+    if len(brand_distinct) == 1:
+        _add_slug(brand_distinct[0])
+    elif len(brand_distinct) >= 2:
+        _add_slug("".join(brand_distinct[:2]))
+        _add_slug(brand_distinct[0])
+    elif brand_words:
+        _add_slug("".join(brand_words[:2]))
+
+    for legal in (legal_names or []):
+        l_norm = normalize_ascii(_strip_corporate_suffixes_for_search(legal))
+        l_words = [w.lower() for w in re.sub(r"[^\w\s]", " ", l_norm).split() if len(w) >= 2 and w not in stop]
+        if len(l_words) >= 2:
+            _add_slug("".join(l_words[:2]))
+        if l_words:
+            _add_slug(l_words[0])
+
+    return candidates[:3]
+
+
+def resolve_br_domain_and_cnpj_via_rdap(
+    brand_name: str,
+    legal_names: Optional[List[str]] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Consulta o servidor oficial RDAP do Registro.br (NIC.br) para validar se um domínio .com.br
+    pertence legitimamente à empresa consultada e extrair seu CNPJ e Razão Social oficiais.
+    """
+    cand_domains = _build_br_domain_candidates(brand_name, legal_names)
+    clean_legal = [
+        n for n in (legal_names or [])
+        if isinstance(n, str) and len(_strip_corporate_suffixes_for_search(n)) >= 4
+    ]
+    for dom in cand_domains:
         try:
-            q = requests.utils.quote(clean_name)
             resp = requests.get(
-                f"https://autocomplete.clearbit.com/v1/companies/suggest?query={q}",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=2.0
+                f"https://rdap.registro.br/domain/{dom}",
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/rdap+json, application/json"},
+                timeout=1.5,
             )
-            if resp.ok:
-                data = resp.json()
-                if isinstance(data, list) and data and isinstance(data[0], dict) and data[0].get("domain"):
-                    domain = data[0]["domain"].strip().lower()
+            if resp.status_code != 200:
+                continue
+            rdap_cnpj, rdap_fn = _extract_rdap_registrant_identity(resp.json())
+            if not rdap_fn:
+                continue
+            if not belongs_to_same_corporate_brand(brand_name, rdap_fn):
+                continue
+            if clean_legal and not any(_shares_corporate_identity(rdap_fn, ln) for ln in clean_legal):
+                continue
+            return dom, rdap_cnpj, rdap_fn
+        except requests.RequestException:
+            break
         except Exception:
             pass
+    return None, None, None
 
-    # 4. Fallback para slug derivado
+
+def _build_clearbit_search_queries(
+    brand_name: str,
+    full_name: str = "",
+    nome_fantasia: str = "",
+    legal_names: Optional[List[str]] = None,
+) -> List[str]:
+    """Gera consultas priorizadas (Nome Fantasia -> Núcleo da Razão Social -> Marca) para o Clearbit."""
+    queries: List[str] = []
+    seen = set()
+
+    def _add(term: str) -> None:
+        cleaned = re.sub(r"\s+", " ", str(term or "")).strip()
+        key = normalize_ascii(cleaned)
+        if cleaned and len(key) >= 2 and key not in seen:
+            seen.add(key)
+            queries.append(cleaned)
+
+    if nome_fantasia:
+        nf_clean = _strip_corporate_suffixes_for_search(nome_fantasia)
+        _add(nf_clean)
+
+    for raw_legal in [full_name] + list(legal_names or []):
+        if not raw_legal:
+            continue
+        stripped = _strip_corporate_suffixes_for_search(raw_legal)
+        if not stripped:
+            continue
+        words = [w for w in stripped.split() if len(w) >= 2 and w.upper() not in {"DE", "DA", "DO", "DOS", "DAS", "E", "EM", "PARA", "COM"}]
+        if len(words) >= 2:
+            _add(" ".join(words[:2]))
+        if len(words) >= 3:
+            _add(" ".join(words[:3]))
+        _add(stripped)
+
+    clean_brand = re.sub(r"\(.*?\)", "", str(brand_name or "")).strip()
+    _add(clean_brand)
+    return queries[:3]
+
+
+def discover_real_corporate_domain_and_logo(
+    brand_name: str,
+    email_rfb: str = "",
+    full_name: str = "",
+    nome_fantasia: str = "",
+    legal_names: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Resolução Universal de Domínio e Logo em Cascata Segura:
+    1. Dicionário de domínios corporativos especiais/estatais (SPECIAL_DOMAINS) por palavra inteira.
+    2. Domínio corporativo extraído do e-mail da Receita Federal (se não for genérico/provedor).
+    3. Clearbit Autocomplete API alimentado pela Razão Social/Nome Fantasia dos processos e RFB.
+    4. Validação oficial no RDAP do Registro.br (NIC.br) confrontando titularidade e CNPJ.
+    5. Sem domínio verificado, retorna logo_url=None para exibir iniciais oficiais sem logo falsa.
+    """
+    clean_name = re.sub(r"\(.*?\)", "", brand_name or "").strip()
+    clean_full = re.sub(r"\(.*?\)", "", full_name or clean_name).strip()
+    clean_fantasia = re.sub(r"\(.*?\)", "", nome_fantasia or "").strip()
+
+    domain = None
+    for candidate_text in [clean_name, clean_fantasia, clean_full] + list(legal_names or []):
+        norm_text = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", normalize_ascii(candidate_text))).strip()
+        domain = _match_special_domain(norm_text)
+        if domain:
+            break
+
+    # 2. Domínio do e-mail cadastral da Receita Federal
     if not domain:
-        slug = extract_smart_brand_slug(clean_name, clean_name)
-        slug_ascii = normalize_ascii(slug)
-        clean_slug = re.sub(r"[^\w]", "", slug_ascii).lower()
-        domain = f"{clean_slug}.com.br" if clean_slug else "empresa.com.br"
+        domain = _extract_corporate_domain_from_email(email_rfb)
 
-    initials = extract_initials(clean_name)
-    primary_url = f"https://www.google.com/s2/favicons?domain=www.{domain}&sz=128"
-    secondary_url = f"https://unavatar.io/{domain}?fallback=false"
+    # 3. Clearbit Autocomplete API com Razão Social completa / Nome Fantasia e validação anti-homônimo
+    network_unavailable = False
+    if not domain:
+        search_queries = _build_clearbit_search_queries(
+            clean_name,
+            full_name=clean_full,
+            nome_fantasia=clean_fantasia,
+            legal_names=legal_names,
+        )
+        for search_query in search_queries:
+            try:
+                q = requests.utils.quote(search_query)
+                resp = requests.get(
+                    f"https://autocomplete.clearbit.com/v1/companies/suggest?query={q}",
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=1.5
+                )
+                if resp.ok:
+                    data = resp.json()
+                    if isinstance(data, list):
+                        valid_candidates = [
+                            item for item in data[:5]
+                            if isinstance(item, dict) and _is_valid_clearbit_candidate(search_query, item)
+                        ]
+                        if valid_candidates:
+                            br_first = sorted(
+                                valid_candidates,
+                                key=lambda item: 0 if str(item.get("domain", "")).lower().endswith(".br") else 1,
+                            )
+                            domain = br_first[0]["domain"].strip().lower()
+                            break
+            except requests.RequestException:
+                # Se a rede ou DNS estiver indisponível/timeout, interrompe tentativas subsequentes
+                network_unavailable = True
+                break
+            except Exception:
+                pass
+
+    # 4. Registro.br (NIC.br) RDAP oficial: valida propriedade .com.br por Razão Social / CNPJ
+    if not domain and not network_unavailable:
+        rdap_context = [n for n in ([clean_full, clean_fantasia] + list(legal_names or [])) if n]
+        rdap_domain, _, _ = resolve_br_domain_and_cnpj_via_rdap(clean_name or clean_full, legal_names=rdap_context)
+        if rdap_domain:
+            domain = rdap_domain
+
+    initials = extract_initials(clean_full or clean_fantasia or clean_name)
+    if domain:
+        primary_url = f"https://www.google.com/s2/favicons?domain=www.{domain}&sz=128"
+        secondary_url = f"https://unavatar.io/{domain}?fallback=false"
+    else:
+        primary_url = None
+        secondary_url = None
 
     return {
         "brand": brand_name,
@@ -351,13 +733,22 @@ def resolve_company_logo(
     user_query: str = "",
     razao_social: str = "",
     nome_fantasia: str = "",
-    email_rfb: str = ""
+    email_rfb: str = "",
+    legal_names: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Extrai a marca/sigla inteligente e resolve os links de logo da empresa."""
-    target_name = razao_social or user_query or nome_fantasia or "Empresa"
+    """Extrai a marca/sigla inteligente e resolve os links de logo da empresa sem confundir homônimos."""
+    fallback_legal = legal_names[0] if legal_names else ""
+    target_name = razao_social or fallback_legal or nome_fantasia or user_query or "Empresa"
     clean_target = re.sub(r"\(.*?\)", "", target_name).strip()
     brand = extract_smart_brand_slug(user_query=user_query, razao_social=clean_target, nome_fantasia=nome_fantasia)
-    res = discover_real_corporate_domain_and_logo(brand or clean_target, email_rfb=email_rfb)
+    full_context = re.sub(r"\(.*?\)", "", (razao_social or fallback_legal or nome_fantasia or user_query or "")).strip()
+    res = discover_real_corporate_domain_and_logo(
+        brand or clean_target,
+        email_rfb=email_rfb,
+        full_name=full_context,
+        nome_fantasia=nome_fantasia,
+        legal_names=legal_names,
+    )
     initials = extract_initials(clean_target)
     res["initials"] = initials
     res["fallback_initials"] = initials
@@ -377,13 +768,14 @@ def clear_cnpj_cache() -> None:
 
 
 def _get_next_provider_order() -> List[str]:
-    """Retorna a ordem dos provedores balanceada em Round-Robin."""
+    """Alterna entre provedores rápidos sem limite rígido primeiro e usa rate-limited como fallback."""
     global _PROVIDER_INDEX
-    providers = ["brasilapi", "cnpjws", "minhareceita", "receitaws"]
+    high_throughput = ["brasilapi", "minhareceita"]
     with _PROVIDER_LOCK:
-        idx = _PROVIDER_INDEX
-        _PROVIDER_INDEX = (_PROVIDER_INDEX + 1) % len(providers)
-    return providers[idx:] + providers[:idx]
+        idx = _PROVIDER_INDEX % len(high_throughput)
+        _PROVIDER_INDEX += 1
+    primary = high_throughput[idx:] + high_throughput[:idx]
+    return primary + ["cnpjws", "receitaws"]
 
 
 def _extract_porte_str(raw_porte: Any) -> str:
@@ -486,6 +878,45 @@ def _fetch_from_receitaws(digits: str, headers: dict, timeout: float) -> dict:
     return {}
 
 
+def enrich_rfb_corporate_email(cnpj: str, timeout: float = 2.0) -> str:
+    """
+    Consulta provedores secundários que expõem o campo `estabelecimento.email` da RFB
+    (ex: CNPJ.ws e ReceitaWS) quando o provedor primário omite o e-mail cadastral.
+    """
+    digits = re.sub(r"\D", "", str(cnpj or ""))
+    if len(digits) != 14:
+        return ""
+    if fetch_accurate_cnpj_data is not _fetch_accurate_cnpj_data_proxy:
+        res = fetch_accurate_cnpj_data(digits, timeout=timeout) or {}
+        em = str(res.get("email") or "").strip()
+        return em if _extract_corporate_domain_from_email(em) else ""
+
+    root = digits[:8]
+    with _CACHE_LOCK:
+        cached = CNPJ_ROOT_CACHE.get(root)
+        if cached and _extract_corporate_domain_from_email(str(cached.get("email") or "")):
+            return str(cached.get("email") or "").strip()
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+    }
+    for fetcher in (_fetch_from_cnpjws, _fetch_from_receitaws):
+        try:
+            res = fetcher(digits, headers, timeout)
+            em = str((res or {}).get("email") or "").strip()
+            if _extract_corporate_domain_from_email(em):
+                with _CACHE_LOCK:
+                    if root in CNPJ_ROOT_CACHE:
+                        CNPJ_ROOT_CACHE[root]["email"] = em
+                return em
+        except requests.RequestException:
+            break
+        except Exception:
+            pass
+    return ""
+
+
 def _fetch_accurate_cnpj_data_impl(digits: str, timeout: float = 4.0) -> dict:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -498,17 +929,21 @@ def _fetch_accurate_cnpj_data_impl(digits: str, timeout: float = 4.0) -> dict:
         "receitaws": _fetch_from_receitaws,
     }
     provider_order = _get_next_provider_order()
+    best_fallback = {}
     for prov in provider_order:
         fn = fetchers.get(prov)
         if fn:
             res = fn(digits, headers, timeout)
             if res and res.get("razao_social"):
-                return res
-    return {}
+                if float(res.get("capital_social") or 0.0) > 0.0:
+                    return res
+                if not best_fallback:
+                    best_fallback = res
+    return best_fallback
 
 
 def fetch_accurate_cnpj_data_cached(cnpj: str, timeout: float = 4.0) -> dict:
-    """Consulta CNPJ usando cache global por raiz de 8 dígitos e balanceamento Round-Robin."""
+    """Consulta CNPJ usando cache global por raiz de 8 dígitos e fallback inteligente entre provedores."""
     digits = re.sub(r"\D", "", str(cnpj or ""))
     if len(digits) != 14:
         return {}
@@ -532,8 +967,10 @@ def fetch_accurate_cnpj_data_cached(cnpj: str, timeout: float = 4.0) -> dict:
 
     res = _fetch_accurate_cnpj_data_impl(digits, timeout=timeout)
     if res and res.get("razao_social"):
-        with _CACHE_LOCK:
-            CNPJ_ROOT_CACHE[root] = res
+        # Só persiste em cache permanente quando possui capital > 0 para não congelar falha transitória
+        if float(res.get("capital_social") or 0.0) > 0.0:
+            with _CACHE_LOCK:
+                CNPJ_ROOT_CACHE[root] = res
         return res
     return {}
 
@@ -699,46 +1136,71 @@ def filter_valid_group_cnpjs(cnpj_records: list[dict], total_processes: int = 0)
 def resolve_cnpjs_by_company_name_online(company_name: str, legal_names_from_pje: List[str] = None) -> List[str]:
     """
     Descobre os CNPJs reais de qualquer empresa (grande, média ou pequena) mesmo quando
-    as intimações do Comunica PJe não trazem o CNPJ no texto, consultando de forma concorrente.
+    as intimações do Comunica PJe não trazem o CNPJ no texto:
+    1. Consulta oficial RDAP do Registro.br (NIC.br) validando titularidade nominal e CNPJ.
+    2. Fallback concorrente para busca textual pública por Razão Social corporativa.
     """
+    discovered_roots: Dict[str, str] = {}
+
+    clean_legals = [
+        re.sub(r"\(.*?\)", "", str(n or "")).strip()
+        for n in (legal_names_from_pje or [])
+        if isinstance(n, str) and CORPORATE_LEGAL_MARKERS.search(normalize_ascii(n))
+    ]
+
+    # 1. Descoberta oficial e determinística via RDAP do Registro.br (sem CAPTCHA)
+    _, rdap_cnpj, _ = resolve_br_domain_and_cnpj_via_rdap(company_name, legal_names=clean_legals)
+    if rdap_cnpj and len(rdap_cnpj) == 14 and is_valid_cnpj(rdap_cnpj):
+        discovered_roots[rdap_cnpj[:8]] = rdap_cnpj
+
     candidates = []
     clean_main = re.sub(r"\(.*?\)", "", company_name or "").strip()
     if clean_main and len(clean_main) >= 2:
         candidates.append(clean_main)
-    if legal_names_from_pje:
-        for name in legal_names_from_pje:
-            clean_n = re.sub(r"\(.*?\)", "", name or "").strip()
-            if clean_n and clean_n not in candidates and len(clean_n) >= 3:
-                candidates.append(clean_n)
+    for clean_n in clean_legals:
+        if clean_n not in candidates and len(clean_n) >= 3:
+            candidates.append(clean_n)
 
-    discovered_roots: Dict[str, str] = {}
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128.0.0.0 Safari/537.36"
     }
 
     def _search_name(name: str) -> List[str]:
         found = []
-        try:
-            q = requests.utils.quote(f'"{name}" CNPJ')
-            resp = requests.get(f"https://html.duckduckgo.com/html/?q={q}", headers=headers, timeout=4.0)
-            if resp.status_code == 200:
-                for match in CNPJ_REGEX.findall(resp.text):
-                    digits = re.sub(r"\D", "", match)
-                    if len(digits) == 14:
-                        found.append(digits)
-        except Exception:
-            pass
+        quoted_q = requests.utils.quote('"' + name + '" CNPJ')
+        plain_q = requests.utils.quote(f"{name} CNPJ")
+        queries = [
+            f"https://html.duckduckgo.com/html/?q={quoted_q}",
+            f"https://lite.duckduckgo.com/lite/?q={plain_q}",
+        ]
+        for url in queries:
+            try:
+                resp = requests.get(url, headers=headers, timeout=2.0)
+                if resp.status_code in (202, 403, 429):
+                    break
+                if resp.status_code == 200 and resp.text:
+                    for match in CNPJ_REGEX.findall(resp.text):
+                        digits = re.sub(r"\D", "", match)
+                        if len(digits) == 14 and is_valid_cnpj(digits) and digits not in found:
+                            found.append(digits)
+                if found:
+                    break
+            except requests.RequestException:
+                break
+            except Exception:
+                pass
         return found
 
-    with ThreadPoolExecutor(max_workers=min(6, max(1, len(candidates)))) as pool:
-        futures = [pool.submit(_search_name, n) for n in candidates[:6]]
-        for fut in as_completed(futures):
-            for digits in fut.result():
-                root = digits[:8]
-                if root not in discovered_roots:
-                    discovered_roots[root] = digits
-                if len(discovered_roots) >= 5:
-                    break
+    if candidates and not discovered_roots:
+        with ThreadPoolExecutor(max_workers=min(4, max(1, len(candidates)))) as pool:
+            futures = [pool.submit(_search_name, n) for n in candidates[:4]]
+            for fut in as_completed(futures):
+                for digits in fut.result():
+                    root = digits[:8]
+                    if root not in discovered_roots:
+                        discovered_roots[root] = digits
+                    if len(discovered_roots) >= 5:
+                        break
 
     return list(discovered_roots.values())
 
@@ -748,11 +1210,12 @@ def extract_and_discover_all_group_cnpjs(
     brand_term: str,
     all_processes: Any,
     search_strategy: Optional[Dict[str, Any]] = None,
+    discovered_entities: Optional[Any] = None,
 ) -> Tuple[List[str], int]:
     """
     Descobre os CNPJs do grupo de forma multi-fonte:
     1. Catálogo de Resolução Cadastral Oficial (DNS Corporativo de Grandes Litigantes).
-    2. Extração dos destinatários e textos das intimações do Comunica PJe.
+    2. Extração dos destinatários, entidades descobertas e textos das intimações do Comunica PJe.
     3. Busca online concorrente para empresas fora do catálogo.
     """
     mode = (search_strategy.get("mode") if search_strategy else None) or classify_search_mode(user_query)
@@ -784,22 +1247,39 @@ def extract_and_discover_all_group_cnpjs(
                 if digits[:8] not in root_to_main_cnpj:
                     root_to_main_cnpj[digits[:8]] = digits
 
-    # 3. Extrai dos processos: destinatários e textos das publicações
-    upper_brand = normalize_ascii(brand_term or user_query)
-    clean_brand = re.sub(r"[^\w]", "", upper_brand)
-    has_known_roots = bool(root_to_main_cnpj)
+    # 2.5 Incorpora entidades/CNPJs descobertos diretamente pelo CNJSearcher (Deep Scan)
+    for ent in (discovered_entities or []):
+        if isinstance(ent, str) and ent.strip():
+            ent_digits = re.sub(r"\D", "", ent)
+            if len(ent_digits) == 14 and is_cnpj(ent):
+                all_distinct_branch_cnpjs.add(ent_digits)
+                mat = to_matrix_cnpj(ent_digits)
+                if mat[:8] not in root_to_main_cnpj:
+                    root_to_main_cnpj[mat[:8]] = mat
+            else:
+                ent_clean = ent.strip().upper()
+                if (
+                    belongs_to_same_corporate_brand(brand_term or user_query, ent_clean)
+                    and CORPORATE_LEGAL_MARKERS.search(normalize_ascii(ent_clean))
+                ):
+                    if ent_clean not in legal_names_found:
+                        legal_names_found.append(ent_clean)
 
+    # 3. Extrai dos processos: destinatários e textos das publicações
     procs_iter = all_processes.values() if isinstance(all_processes, dict) else (all_processes or [])
     for proc in procs_iter:
         if not isinstance(proc, dict):
             continue
 
-        # Destinatários
+        # Destinatários (filtra apenas PJs corporativas reais, evitando nomes de pessoas físicas)
         dest_names = proc.get("destinatarios_nomes") or []
         for dest_name in dest_names:
             if isinstance(dest_name, str) and dest_name.strip():
                 dest_clean = dest_name.strip().upper()
-                if belongs_to_same_corporate_brand(brand_term or user_query, dest_clean):
+                if (
+                    belongs_to_same_corporate_brand(brand_term or user_query, dest_clean)
+                    and CORPORATE_LEGAL_MARKERS.search(normalize_ascii(dest_clean))
+                ):
                     if dest_clean not in legal_names_found:
                         legal_names_found.append(dest_clean)
 
@@ -851,7 +1331,7 @@ def extract_and_discover_all_group_cnpjs(
         first_cnpj = list(root_to_main_cnpj.values())[0]
         return [first_cnpj], 1
 
-    unidades_count = max(len(all_distinct_branch_cnpjs), len(root_to_main_cnpj), len(legal_names_found), 1)
+    unidades_count = max(len(all_distinct_branch_cnpjs), len(root_to_main_cnpj), 1)
     return list(root_to_main_cnpj.values()), unidades_count
 
 
@@ -860,9 +1340,16 @@ def discover_company_cnpjs(
     brand_term: str,
     all_processes: Any,
     search_strategy: Optional[Dict[str, Any]] = None,
+    discovered_entities: Optional[Any] = None,
 ) -> List[str]:
     """Interface padrão para descoberta de CNPJs de uma empresa."""
-    cnpjs, _ = extract_and_discover_all_group_cnpjs(user_query, brand_term, all_processes, search_strategy=search_strategy)
+    cnpjs, _ = extract_and_discover_all_group_cnpjs(
+        user_query,
+        brand_term,
+        all_processes,
+        search_strategy=search_strategy,
+        discovered_entities=discovered_entities,
+    )
     return cnpjs
 
 
@@ -1044,6 +1531,7 @@ def consolidate_all_group_cnpjs_unbounded(
     search_strategy: Optional[Dict[str, Any]] = None,
     max_wave1: int = 12,
     max_total_roots: int = 60,
+    discovered_entities: Optional[Any] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
     Consolida todos os CNPJs do grupo econômico sem limite artificial de 8 CNPJs:
@@ -1054,13 +1542,18 @@ def consolidate_all_group_cnpjs_unbounded(
     strategy = search_strategy or {}
     mode = strategy.get("mode") or classify_search_mode(user_query)
 
-    cnpjs_to_query, total_unidades = extract_and_discover_all_group_cnpjs(
-        user_query, brand_term, all_processes, search_strategy=strategy
+    cnpjs_to_query, _ = extract_and_discover_all_group_cnpjs(
+        user_query,
+        brand_term,
+        all_processes,
+        search_strategy=strategy,
+        discovered_entities=discovered_entities,
     )
 
     # Coleta raízes candidatas e converte para CNPJ Matriz
     root_to_candidate: Dict[str, str] = {}
     candidate_scores: Dict[str, int] = defaultdict(int)
+    branch_cnpjs_by_root: Dict[str, Set[str]] = defaultdict(set)
 
     dir_cnpjs = lookup_corporate_directory(user_query, brand_term, mode=mode)
     for c in dir_cnpjs:
@@ -1069,23 +1562,39 @@ def consolidate_all_group_cnpjs_unbounded(
             mat = to_matrix_cnpj(digits)
             r = mat[:8]
             root_to_candidate[r] = mat
+            branch_cnpjs_by_root[r].add(digits)
             candidate_scores[r] += 1000
 
     procs_len = len(all_processes) if hasattr(all_processes, "__len__") else 0
     procs_iter = all_processes.values() if isinstance(all_processes, dict) else (all_processes or [])
     for p in procs_iter:
         if isinstance(p, dict):
+            proc_roots = set()
+            for c_found in p.get("cnpjs_encontrados") or []:
+                c_digits = re.sub(r"\D", "", str(c_found))
+                if len(c_digits) == 14:
+                    branch_cnpjs_by_root[c_digits[:8]].add(c_digits)
+                    proc_roots.add(c_digits[:8])
+            for txt in (p.get("publicacoes_texto") or p.get("textos_pje") or []):
+                if isinstance(txt, str):
+                    for m in CNPJ_REGEX.findall(txt):
+                        m_digits = re.sub(r"\D", "", m)
+                        if len(m_digits) == 14:
+                            branch_cnpjs_by_root[m_digits[:8]].add(m_digits)
+                            proc_roots.add(m_digits[:8])
+            for pr in proc_roots:
+                candidate_scores[pr] += 25
             for d_name in p.get("destinatarios_nomes") or []:
                 if isinstance(d_name, str):
-                    for r in root_to_candidate:
-                        if r in d_name:
-                            candidate_scores[r] += score_corporate_name_priority(d_name, 1)
+                    for pr in proc_roots:
+                        candidate_scores[pr] += score_corporate_name_priority(d_name, 1)
 
     for c in cnpjs_to_query:
         digits = re.sub(r"\D", "", str(c))
         if len(digits) == 14:
             mat = to_matrix_cnpj(digits)
             r = mat[:8]
+            branch_cnpjs_by_root[r].add(digits)
             if r not in root_to_candidate:
                 root_to_candidate[r] = mat
             candidate_scores[r] += 10
@@ -1175,9 +1684,25 @@ def consolidate_all_group_cnpjs_unbounded(
         first_c = list(root_to_candidate.values())[0]
         fallback_data = fetch_accurate_cnpj_data_cached(first_c)
         if fallback_data:
-            validated_records = [fallback_data]
+            fb_razao = fallback_data.get("razao_social") or ""
+            fb_fantasia = fallback_data.get("nome_fantasia") or ""
+            fb_root = fallback_data.get("raiz") or (fallback_data.get("cnpj") or "")[:8]
+            if (
+                mode == "STRICT_CNPJ"
+                or fb_root in dir_roots
+                or belongs_to_same_corporate_brand(brand_term or user_query, fb_razao, fb_fantasia)
+            ):
+                validated_records = [fallback_data]
 
-    unidades_final = max(len(validated_records), total_unidades, 1)
+    validated_roots = {
+        r.get("raiz") or (r.get("cnpj") or "")[:8]
+        for r in validated_records
+        if (r.get("raiz") or r.get("cnpj"))
+    }
+    validated_branches = set()
+    for vr in validated_roots:
+        validated_branches.update(branch_cnpjs_by_root.get(vr, set()))
+    unidades_final = max(len(validated_records), len(validated_branches), 1)
     return validated_records, unidades_final
 
 
@@ -1189,6 +1714,7 @@ def calculate_calibrated_group_capital(
     brand_term: str,
     total_unidades: int,
     effective_cnpj: Optional[str] = None,
+    legal_names: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Calcula todas as métricas consolidadas de capital social e solvência do grupo."""
     procs_len = total_processes
@@ -1231,10 +1757,16 @@ def calculate_calibrated_group_capital(
     cenario_descricao = calibrated["cenario_descricao"]
     indice_exposicao_financeira = calibrated["indice_exposicao_financeira"]
 
-    first_razao = validated_records[0].get("razao_social", "") if validated_records else ""
-    first_fantasia = validated_records[0].get("nome_fantasia", "") if validated_records else ""
-    first_email = validated_records[0].get("email", "") if validated_records else ""
-    logo_info = resolve_company_logo(user_query=user_query, razao_social=first_razao, nome_fantasia=first_fantasia, email_rfb=first_email)
+    first_razao, first_fantasia, first_email = _pick_best_rfb_identity(validated_records)
+    if not first_razao and legal_names:
+        first_razao = legal_names[0]
+    logo_info = resolve_company_logo(
+        user_query=user_query,
+        razao_social=first_razao,
+        nome_fantasia=first_fantasia,
+        email_rfb=first_email,
+        legal_names=legal_names,
+    )
 
     unidades_final = max(len(validated_records), total_unidades, 1)
 
@@ -1286,6 +1818,9 @@ def calculate_calibrated_group_capital(
         "cnpj_utilizado": used_cnpj,
         "cnpjs_consolidados": [r.get("cnpj") for r in validated_records if r.get("cnpj")],
         "raizes_consolidadas": list(set(r.get("raiz") or (r.get("cnpj") or "")[:8] for r in validated_records)),
+        "razao_social_principal": first_razao,
+        "nome_fantasia_principal": first_fantasia,
+        "email_rfb_principal": first_email,
     }
 
 
@@ -1295,6 +1830,7 @@ def evaluate_economic_health_and_capital(
     all_processes: Any,
     conviction_prob_pct: float,
     search_strategy: Optional[Dict[str, Any]] = None,
+    discovered_entities: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Cruza e soma o Capital Social de todos os CNPJs do grupo econômico e calcula a
@@ -1303,12 +1839,18 @@ def evaluate_economic_health_and_capital(
     """
     strategy = search_strategy or {}
     procs_len = len(all_processes) if hasattr(all_processes, "__len__") else 0
+    process_legal_names = extract_process_legal_names(
+        all_processes,
+        brand_query=brand_term or user_query,
+        discovered_entities=discovered_entities,
+    )
 
     validated_records, total_unidades = consolidate_all_group_cnpjs_unbounded(
         user_query=user_query,
         brand_term=brand_term,
         all_processes=all_processes,
         search_strategy=strategy,
+        discovered_entities=discovered_entities,
     )
 
     return calculate_calibrated_group_capital(
@@ -1318,6 +1860,7 @@ def evaluate_economic_health_and_capital(
         user_query=user_query,
         brand_term=brand_term,
         total_unidades=total_unidades,
+        legal_names=process_legal_names,
     )
 
 
@@ -1406,11 +1949,11 @@ def aggregate_group_capital(
     }
 
 
-def find_company_cnpj_by_name(name: str) -> Optional[Dict[str, Any]]:
+def find_company_cnpj_by_name(name: str, legal_names: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """Localiza o CNPJ Matriz de uma empresa a partir do nome via busca online dinâmica."""
     if not name:
         return None
-    cnpjs = resolve_cnpjs_by_company_name_online(name)
+    cnpjs = resolve_cnpjs_by_company_name_online(name, legal_names_from_pje=legal_names)
     if cnpjs:
         data = fetch_accurate_cnpj_data(cnpjs[0])
         if data:
@@ -1420,8 +1963,12 @@ def find_company_cnpj_by_name(name: str) -> Optional[Dict[str, Any]]:
 
 
 def extract_cnpj_from_processes(processes: List[Dict[str, Any]]) -> Optional[str]:
-    """Extrai CNPJ da empresa mencionado nos textos de publicação ou metadados dos processos."""
+    """Extrai CNPJ da empresa mencionado nos destinatários, textos de publicação ou metadados dos processos."""
     for p in processes:
+        for structured in (p.get("cnpjs_encontrados") or []):
+            clean = re.sub(r"\D", "", str(structured or ""))
+            if len(clean) == 14:
+                return clean
         text_corpus = " ".join([
             str(p.get("observation") or ""),
             str(p.get("raw_metadata") or ""),
@@ -1572,29 +2119,18 @@ class EconomicStandingService:
 
         effective_cnpj = cnpj
         brand_slug = extract_smart_brand_slug(company_name)
-        discovered_cnpjs = discover_company_cnpjs(
-            company_name, brand_slug, processes, search_strategy=search_strategy
+        process_legal_names = extract_process_legal_names(
+            processes,
+            brand_query=brand_slug or company_name,
+            discovered_entities=discovered_entities,
         )
-
-        if not effective_cnpj or not is_cnpj(effective_cnpj):
-            if discovered_cnpjs:
-                effective_cnpj = discovered_cnpjs[0]
-            else:
-                reg_data = find_company_cnpj_by_name(company_name)
-                if reg_data:
-                    effective_cnpj = reg_data.get("cnpj")
-                else:
-                    effective_cnpj = extract_cnpj_from_processes(processes)
-
-        cadastral_data = self.fetch_brasilapi_data(effective_cnpj) if (effective_cnpj and is_cnpj(effective_cnpj)) else {}
-        razao = cadastral_data.get("razao_social") or company_name
-        fantasia = cadastral_data.get("nome_fantasia") or ""
-        email_val = cadastral_data.get("email") or ""
-        logo_info = resolve_company_logo(user_query=company_name, razao_social=razao, nome_fantasia=fantasia, email_rfb=email_val)
-
-        cgu_data = self.fetch_cgu_sanctions(effective_cnpj) if effective_cnpj else {"possui_sancoes": False, "status_cgu": "REGULAR"}
-        pgfn_data = self.fetch_pgfn_divida_ativa(effective_cnpj) if effective_cnpj else {"possui_divida_ativa": False, "status_pgfn": "CERTIDAO_NEGATIVA"}
-        insolvency_data = self.check_judicial_insolvency_indicators(processes)
+        discovered_cnpjs = discover_company_cnpjs(
+            company_name,
+            brand_slug,
+            processes,
+            search_strategy=search_strategy,
+            discovered_entities=discovered_entities,
+        )
 
         # Avaliação centralizada e dinâmica de idoneidade, capital do grupo e risco de calote
         query_for_eval = company_name if (not search_strategy or search_strategy.get("mode") == "BROAD_BRAND" or not is_cnpj(company_name)) else (effective_cnpj or company_name)
@@ -1604,7 +2140,98 @@ class EconomicStandingService:
             all_processes=processes,
             conviction_prob_pct=p_condenacao_trabalhista,
             search_strategy=search_strategy,
+            discovered_entities=discovered_entities,
         )
+
+        if not effective_cnpj or not is_cnpj(effective_cnpj):
+            if econ_result.get("cnpj_utilizado"):
+                effective_cnpj = econ_result["cnpj_utilizado"]
+            elif discovered_cnpjs:
+                effective_cnpj = discovered_cnpjs[0]
+            else:
+                proc_cnpj = extract_cnpj_from_processes(processes)
+                if proc_cnpj:
+                    effective_cnpj = proc_cnpj
+                else:
+                    reg_data = find_company_cnpj_by_name(company_name, legal_names=process_legal_names)
+                    if reg_data:
+                        effective_cnpj = reg_data.get("cnpj")
+
+        cadastral_data = self.fetch_brasilapi_data(effective_cnpj) if (effective_cnpj and is_cnpj(effective_cnpj)) else {}
+        if effective_cnpj and is_cnpj(effective_cnpj):
+            has_corp_email = bool(_extract_corporate_domain_from_email(cadastral_data.get("email") or ""))
+            if not cadastral_data.get("razao_social") or not has_corp_email:
+                fallback_rfb = fetch_accurate_cnpj_data_cached(effective_cnpj)
+                if fallback_rfb:
+                    if not cadastral_data.get("razao_social") and fallback_rfb.get("razao_social"):
+                        cadastral_data["razao_social"] = fallback_rfb["razao_social"]
+                    if not cadastral_data.get("nome_fantasia") and fallback_rfb.get("nome_fantasia"):
+                        cadastral_data["nome_fantasia"] = fallback_rfb["nome_fantasia"]
+                    if not has_corp_email and _extract_corporate_domain_from_email(fallback_rfb.get("email") or ""):
+                        cadastral_data["email"] = fallback_rfb["email"]
+                    if not cadastral_data.get("porte") and fallback_rfb.get("porte"):
+                        cadastral_data["porte"] = fallback_rfb["porte"]
+
+        is_strict_cnpj = bool(search_strategy and search_strategy.get("mode") == "STRICT_CNPJ") or is_cnpj(company_name)
+        cad_razao = str(cadastral_data.get("razao_social") or "").strip()
+        cad_fantasia = str(cadastral_data.get("nome_fantasia") or "").strip()
+        cadastral_matches = bool(cad_razao) and (
+            is_strict_cnpj
+            or belongs_to_same_corporate_brand(brand_slug or company_name, cad_razao, cad_fantasia)
+        )
+
+        razao = (
+            cad_razao
+            if cadastral_matches
+            else (
+                econ_result.get("razao_social_principal")
+                or (process_legal_names[0] if process_legal_names else company_name)
+            )
+        )
+        fantasia = (
+            cad_fantasia
+            if cadastral_matches
+            else (econ_result.get("nome_fantasia_principal") or "")
+        )
+
+        cad_email = str(cadastral_data.get("email") or "").strip() if cadastral_matches else ""
+        econ_email = str(econ_result.get("email_rfb_principal") or "").strip()
+        email_val = (
+            cad_email
+            if _extract_corporate_domain_from_email(cad_email)
+            else (econ_email if _extract_corporate_domain_from_email(econ_email) else (cad_email or econ_email))
+        )
+
+        # Se nenhum provedor primário retornou e-mail corporativo (ex: BrasilAPI omite email),
+        # consulta provedores secundários que preservam `estabelecimento.email` da RFB
+        has_special_domain = bool(
+            _match_special_domain(normalize_ascii(brand_slug or company_name))
+            or _match_special_domain(normalize_ascii(razao))
+        )
+        if (
+            effective_cnpj
+            and is_cnpj(effective_cnpj)
+            and (cadastral_matches or not cad_razao)
+            and not _extract_corporate_domain_from_email(email_val)
+            and not has_special_domain
+        ):
+            extra_email = enrich_rfb_corporate_email(effective_cnpj, timeout=1.5)
+            if extra_email:
+                email_val = extra_email
+
+        logo_info = resolve_company_logo(
+            user_query=company_name,
+            razao_social=razao,
+            nome_fantasia=fantasia,
+            email_rfb=email_val,
+            legal_names=process_legal_names,
+        )
+        if not logo_info.get("domain") and isinstance(econ_result.get("logo"), dict) and econ_result["logo"].get("domain"):
+            logo_info = econ_result["logo"]
+
+        cgu_data = self.fetch_cgu_sanctions(effective_cnpj) if effective_cnpj else {"possui_sancoes": False, "status_cgu": "REGULAR"}
+        pgfn_data = self.fetch_pgfn_divida_ativa(effective_cnpj) if effective_cnpj else {"possui_divida_ativa": False, "status_pgfn": "CERTIDAO_NEGATIVA"}
+        insolvency_data = self.check_judicial_insolvency_indicators(processes)
 
         # Incorpora alertas judiciais graves (Falência / Recuperação Judicial no DataJud)
         # Distingue grandes empresas solventes (com solvência comprovada) de devedores falimentares reais
