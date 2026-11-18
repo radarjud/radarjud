@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Equipe RadarJus - Todos os direitos reservados (Lei nº 9.609/1998).
+# Proibida a reprodução, distribuição ou uso comercial sem autorização expressa dos autores.
+
 import os
 import re
 import logging

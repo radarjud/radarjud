@@ -179,6 +179,10 @@ def _dispatch_via_proxy(
     proxy_headers = dict(headers)
     proxy_headers["X-Target-Url"] = target_url
 
+    proxy_secret = os.getenv("PROXY_SHARED_SECRET", "").strip()
+    if proxy_secret:
+        proxy_headers["x-proxy-secret"] = proxy_secret
+
     return _call_client(
         client=client,
         method=method,

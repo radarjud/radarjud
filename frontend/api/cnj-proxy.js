@@ -16,9 +16,22 @@ export default async function handler(req) {
       headers: {
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization, chave-api-dados, X-Target-Url',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, chave-api-dados, X-Target-Url, x-proxy-secret',
       },
     });
+  }
+
+  const expectedSecret = (typeof process !== 'undefined' && process.env && process.env.PROXY_SHARED_SECRET)
+    ? String(process.env.PROXY_SHARED_SECRET).trim()
+    : '';
+  if (expectedSecret) {
+    const providedSecret = (req.headers.get('x-proxy-secret') || '').trim();
+    if (providedSecret !== expectedSecret) {
+      return new Response(JSON.stringify({ error: 'Unauthorized proxy access' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      });
+    }
   }
 
   const urlObj = new URL(req.url);
