@@ -220,4 +220,4 @@ Copyright (c) 2026 Equipe RadarJus (Cláudio Farias, Laryssa Falcão, Luana Brit
 
 Este software é protegido pela **Lei do Software (Lei nº 9.609/1998)**, pela **Lei de Direitos Autorais (Lei nº 9.610/1998)** e pela **Lei de Propriedade Industrial (Lei nº 9.279/1996)**. O acesso a este repositório destina-se exclusivamente à avaliação técnica e acadêmica no **Hack Garanhuns Tech 2026**, sendo proibida qualquer cópia, redistribuição, engenharia reversa, treinamento de modelos ou uso comercial sem autorização expressa por escrito de todos os autores.
 
-Consulte o arquivo [`LICENSE`](LICENSE) para os termos integrais e [`PROOF_OF_AUTHORSHIP.sha256`](PROOF_OF_AUTHORSHIP.sha256) para o manifesto criptográfico de anterioridade do código-fonte.
+Desenvolvido sob rigorosos padrões de conformidade jurídica para prevenção de riscos de terceirização sob o escudo da **Súmula 331 do Tribunal Superior do Trabalho**. Consulte o arquivo [`LICENSE`](LICENSE) para os termos integrais e [`PROOF_OF_AUTHORSHIP.sha256`](PROOF_OF_AUTHORSHIP.sha256) para o manifesto criptográfico de anterioridade do código-fonte.
