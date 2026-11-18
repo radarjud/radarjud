@@ -49,3 +49,7 @@ Não copie ou sobrescreva `app/`, `run.py`, `requirements.txt` ou outros arquivo
 As rotas visuais **Visão geral**, **Processos** e **Estimativas** permanecem acessíveis antes de qualquer pesquisa. Cada uma apresenta estrutura de cartões e painéis vazios, com indicação clara de que ainda não há dados. Nenhum valor fictício é tratado como resultado real. O botão **Visualizar exemplo do Figma** habilita separadamente o modo demonstração, identificado por aviso.
 
 A ausência de uma integração com IA não impede a navegação: o frontend consome os endpoints Flask já existentes. A IA pode futuramente enriquecer as respostas da API, sem ser pré-requisito para renderizar as telas.
+
+## Licença e Propriedade Intelectual
+
+**Todos os direitos reservados (All Rights Reserved)** — Copyright (c) 2026 Equipe RadarJus (Cláudio Farias, Laryssa Falcão, Luana Brito, Matheus Marcos, Mayara Karoline). Software proprietário protegido pela Lei nº 9.609/1998, Lei nº 9.610/1998 e Lei nº 9.279/1996. Acesso restrito à avaliação do Hack Garanhuns Tech 2026; proibida cópia, modificação, redistribuição, engenharia reversa ou uso comercial sem autorização expressa por escrito. Consulte [`../LICENSE`](../LICENSE).
