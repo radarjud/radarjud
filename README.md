@@ -214,4 +214,4 @@ Rotas disponíveis:
 ---
 
 ## 🛡️ Licença e Propriedade
-Desenvolvido sob rigorosos padrões de conformidade jurídica para prevenção de riscos de terceirização sob a égide da **Súmula 331 do Tribunal Superior do Trabalho**.
+Desenvolvido sob rigorosos padrões de conformidade jurídica para prevenção de riscos de terceirização sob o escudo da **Súmula 331 do Tribunal Superior do Trabalho**.
