@@ -54,8 +54,8 @@ class Config:
         "pool_recycle": 300,
     }
 
-    # APIs Públicas Oficiais do Judiciário
-    DATAJUD_API_KEY = os.getenv("DATAJUD_API_KEY") or "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="
+    # APIs Públicas Oficiais do Judiciário (chave pública oficial disponibilizada pelo CNJ)
+    DATAJUD_API_KEY = os.getenv("DATAJUD_API_KEY") or "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="  # gitleaks:allow
     DATAJUD_BASE_URL = os.getenv("DATAJUD_BASE_URL", "https://api-publica.datajud.cnj.jus.br")
     COMUNICA_PJE_URL = os.getenv("COMUNICA_PJE_URL", "https://comunicaapi.pje.jus.br/api/v1/comunicacao")
 

@@ -277,7 +277,8 @@ class CNJMetadataOrchestrator:
     def __init__(self):
         self.comunica_url = os.getenv("COMUNICA_PJE_URL", "https://comunicaapi.pje.jus.br/api/v1/comunicacao")
         self.datajud_base_url = os.getenv("DATAJUD_BASE_URL", "https://api-publica.datajud.cnj.jus.br")
-        default_key = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="
+        # Chave pública oficial disponibilizada pelo CNJ (https://datajud-wiki.cnj.jus.br)
+        default_key = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="  # gitleaks:allow
         raw_key = os.getenv("DATAJUD_API_KEY")
         self.datajud_key = raw_key.strip() if (raw_key and raw_key.strip()) else default_key
         self.session = requests.Session()

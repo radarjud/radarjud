@@ -1,0 +1,17 @@
+# Configuração do Gitleaks para o RadarJus
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Permite chave publica oficial do CNJ DataJud e arquivos de exemplo"
+paths = [
+  '''\.env\.example$''',
+]
+commits = [
+  "95f059c4f19fb1611a20a5d13109bb7906285897",
+  "40d6d8faad48c43c3ac9f6199f628659a11bbebc",
+  "ecb098f97d3a0998d2e0847da96aec75f685886b",
+]
+regexes = [
+  '''cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw==''',
+]
