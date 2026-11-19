@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-RadarJus - Revisor Automático de PR com Gemini 2.5 Flash-Lite.
+RadarJus - Revisor Automático de PR com Gemini Flash via Descoberta Dinâmica de Modelos.
 
 Este script lê as regras do RadarJus (.github/REVIEW_RULES.md), extrai o diff
 apenas de arquivos de código relevantes, aplica truncamento econômico de tokens
-(máx 12.000 caracteres) e consulta a API REST do Gemini para gerar uma revisão
-estruturada em 3 seções essenciais.
+(máx 12.000 caracteres) e consulta a API REST do Gemini utilizando descoberta
+dinâmica de modelos Flash suportados pela chave de API.
 """
 
 import fnmatch
@@ -21,6 +21,14 @@ MAX_DIFF_CHARS = 12000
 OUTPUT_COMMENT_FILE = "ai_review_comment.md"
 REVIEW_RULES_FILE = ".github/REVIEW_RULES.md"
 COMMENT_HEADER_TAG = "<!-- radarjus-ai-reviewer -->"
+
+FALLBACK_FLASH_MODELS = [
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-1.5-flash-8b",
+]
 
 # Filtros de inclusão de arquivos de código
 CODE_PATTERNS = [
@@ -164,12 +172,73 @@ def load_review_rules() -> str:
     )
 
 
-def call_gemini_api(prompt: str, api_key: str) -> str:
-    """Chama a API REST do Gemini com baixo consumo de tokens."""
-    models_to_try = [
-        "gemini-2.5-flash-lite",
-        "gemini-2.5-flash",
-    ]
+def discover_available_flash_models(api_key: str) -> list[str]:
+    """Consulta ListModels na API do Gemini e retorna modelos Flash elegíveis ordenados por relevância."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+    req = urllib.request.Request(
+        url,
+        headers={"x-goog-api-key": api_key},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            models = data.get("models", [])
+
+            scored_flash: list[tuple[int, str]] = []
+            other_eligible: list[str] = []
+
+            for m in models:
+                raw_name = m.get("name", "")
+                model_id = raw_name.replace("models/", "").strip()
+                methods = m.get("supportedGenerationMethods", [])
+
+                if "generateContent" not in methods:
+                    continue
+
+                lower_id = model_id.lower()
+                # Ignorar modelos não textuais ou pesados
+                if any(bad in lower_id for bad in ["embedding", "embed", "tts", "image", "imagen", "audio", "aqa"]):
+                    continue
+
+                if "flash" in lower_id:
+                    score = 0
+                    if "lite" in lower_id:
+                        score += 10
+                    if "2.5" in lower_id:
+                        score += 5
+                    elif "2.0" in lower_id:
+                        score += 4
+                    elif "1.5" in lower_id:
+                        score += 2
+                    scored_flash.append((score, model_id))
+                elif "gemini" in lower_id:
+                    other_eligible.append(model_id)
+
+            scored_flash.sort(key=lambda x: x[0], reverse=True)
+            results = [item[1] for item in scored_flash]
+            if not results:
+                results = other_eligible
+
+            if results:
+                print(f"[INFO] Modelos descobertos automaticamente: {results[:5]}")
+                return results
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] Falha ao consultar ListModels ({e}). Utilizando lista padrão de fallback.")
+
+    return FALLBACK_FLASH_MODELS
+
+
+def call_gemini_api(prompt: str, api_key: str) -> tuple[str, str]:
+    """Chama a API REST do Gemini testando modelos disponíveis e retorna (texto_revisao, modelo_utilizado)."""
+    env_model = os.getenv("GEMINI_MODEL", "").strip()
+
+    if env_model:
+        models_to_try = [env_model]
+        print(f"[INFO] Usando modelo sobrescrito por GEMINI_MODEL: {env_model}")
+    else:
+        discovered = discover_available_flash_models(api_key)
+        models_to_try = discovered if discovered else FALLBACK_FLASH_MODELS
 
     payload = {
         "contents": [
@@ -198,23 +267,26 @@ def call_gemini_api(prompt: str, api_key: str) -> str:
             method="POST",
         )
         try:
+            print(f"[INFO] Solicitando revisão ao modelo: {model}...")
             with urllib.request.urlopen(req, timeout=45) as resp:
                 resp_json = json.loads(resp.read().decode("utf-8"))
                 candidates = resp_json.get("candidates", [])
                 if candidates:
                     parts = candidates[0].get("content", {}).get("parts", [])
                     if parts and "text" in parts[0]:
-                        return parts[0]["text"].strip()
+                        return parts[0]["text"].strip(), model
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
             last_error = f"HTTP {e.code} ({model}): {err_body}"
-            if e.code == 404:
-                # Modelo pode não estar disponível nessa versão de API, tenta o próximo
+            print(f"[WARN] Modelo {model} retornou erro {e.code}: {err_body[:200]}")
+            if e.code in (404, 429, 503):
+                # Tenta automaticamente o próximo modelo disponível
                 continue
             break
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             last_error = str(e)
-            break
+            print(f"[WARN] Erro de rede com modelo {model}: {e}")
+            continue
 
     raise RuntimeError(f"Falha ao chamar a API do Gemini: {last_error}")
 
@@ -282,22 +354,19 @@ Responda em Português do Brasil de forma concisa e direta, estritamente estrutu
 
 ### 💡 3. Sugestões de Melhoria
 (Sugestões pontuais de tipagem, clareza ou testes adicionais recomendados.)
-
-Ao final, adicione uma linha de resumo:
----
-*Revisão automática gerada com gemini-2.5-flash-lite | ~{estimated_input_tokens} tokens processados | {len(changed_files)} arquivo(s) inspecionado(s)*
 """
 
     print(f"[INFO] Consultando Gemini para {len(changed_files)} arquivos ({total_chars} chars)...")
     try:
-        review_markdown = call_gemini_api(prompt, api_key)
+        review_markdown, used_model = call_gemini_api(prompt, api_key)
         final_comment = (
             f"{COMMENT_HEADER_TAG}\n"
             "## 🤖 RadarJus AI Code Reviewer\n\n"
-            f"{review_markdown}\n"
+            f"{review_markdown}\n\n"
+            f"---\n*Revisão automática gerada com `{used_model}` | ~{estimated_input_tokens} tokens processados | {len(changed_files)} arquivo(s) inspecionado(s)*\n"
         )
         Path(OUTPUT_COMMENT_FILE).write_text(final_comment, encoding="utf-8")
-        print(f"[SUCCESS] Revisão salva em {OUTPUT_COMMENT_FILE}")
+        print(f"[SUCCESS] Revisão salva em {OUTPUT_COMMENT_FILE} com modelo {used_model}")
     except Exception as e:  # noqa: BLE001
         print(f"[WARN] Erro ao chamar Gemini: {e}")
         error_comment = (
