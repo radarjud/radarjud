@@ -1,0 +1,31 @@
+repos:
+  # Linter e formatador ultrarrápido em Rust (Ruff)
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.9
+    hooks:
+      - id: ruff
+        args: [--fix, --select=E9,F63,F7,F82]
+      - id: ruff-format
+
+  # Hooks essenciais de higiene de código e segurança
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ['--maxkb=1024']
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: end-of-file-fixer
+        exclude: ^(PROOF_OF_AUTHORSHIP\.sha256|.*\.min\..*)$
+      - id: trailing-whitespace
+        exclude: ^(PROOF_OF_AUTHORSHIP\.sha256|.*\.min\..*)$
+
+  # Bloqueio estrito de arquivos proibidos (bancos locais, credenciais e chaves)
+  - repo: local
+    hooks:
+      - id: block-forbidden-files
+        name: Bloqueio de arquivos proibidos (*.db, *.sqlite, .env, *.pem, *.key)
+        entry: Arquivo sensivel ou proibido detectado! Nunca versione credenciais, chaves ou bancos locais.
+        language: fail
+        files: '(\.env(\..+)?|.*\.db|.*\.sqlite|.*\.sqlite3|.*\.pem|.*\.key)$'
+        exclude: '(\.env\.example|frontend/\.env\.example)$'
