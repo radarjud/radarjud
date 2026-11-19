@@ -214,7 +214,8 @@ class CNJProcessSearcher:
 
     COMUNICA_URL = "https://comunicaapi.pje.jus.br/api/v1/comunicacao"
     DATAJUD_BASE = "https://api-publica.datajud.cnj.jus.br"
-    DEFAULT_DATAJUD_KEY = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="
+    # Chave pública oficial disponibilizada pelo CNJ (https://datajud-wiki.cnj.jus.br)
+    DEFAULT_DATAJUD_KEY = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="  # gitleaks:allow
 
     def __init__(self, session: Optional[requests.Session] = None):
         key = os.getenv("DATAJUD_API_KEY") or self.DEFAULT_DATAJUD_KEY
