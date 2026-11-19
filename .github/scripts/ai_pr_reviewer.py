@@ -168,8 +168,7 @@ def call_gemini_api(prompt: str, api_key: str) -> str:
     """Chama a API REST do Gemini com baixo consumo de tokens."""
     models_to_try = [
         "gemini-2.5-flash-lite",
-        "gemini-2.0-flash-lite",
-        "gemini-1.5-flash",
+        "gemini-2.5-flash",
     ]
 
     payload = {
@@ -192,7 +191,10 @@ def call_gemini_api(prompt: str, api_key: str) -> str:
         req = urllib.request.Request(
             url,
             data=json_data,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
             method="POST",
         )
         try:
