@@ -28,3 +28,4 @@ As seguintes diretrizes são inegociáveis para qualquer Pull Request:
    - Manter `sourcemap: false` e remoção de comentários no build (`vite.config.js`).
    - Proibido introduzir links/imagens que gerem erro 404 no console (ex.: favicons sintéticos não validados).
    - Não permitir overflow ou scroll horizontal em resoluções mobile (`<= 768px`).
+

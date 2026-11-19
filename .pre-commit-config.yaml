@@ -29,3 +29,4 @@ repos:
         language: fail
         files: '(\.env(\..+)?|.*\.db|.*\.sqlite|.*\.sqlite3|.*\.pem|.*\.key)$'
         exclude: '(\.env\.example|frontend/\.env\.example)$'
+

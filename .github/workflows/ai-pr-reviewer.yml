@@ -56,3 +56,4 @@ jobs:
             echo "Criando novo comentário no PR #$PR_NUMBER"
             gh pr comment "$PR_NUMBER" --body-file "$COMMENT_FILE"
           fi
+

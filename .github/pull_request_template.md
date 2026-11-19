@@ -36,3 +36,4 @@
    ```bash
    cd frontend && node --test src/companyNavigation.test.js && npm run build
    ```
+
