@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Equipe RadarJus - Todos os direitos reservados (Lei nº 9.609/1998).
 # Proibida a reprodução, distribuição ou uso comercial sem autorização expressa dos autores.
 
+import re
 import math
 import logging
 import unicodedata
@@ -905,3 +906,387 @@ class BayesianRiskPredictor:
             metrics["desfechos_sentencas"]["em_aberto"] = metrics["desfechos_sentencas"].get("em_aberto", 0) + diff
 
         return metrics
+
+
+def _parse_capital_social_num(val: Any) -> float:
+    """Extrai valor numérico de capital social a partir de float, int ou string formatada em BRL."""
+    if val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip().replace("R$", "").replace(" ", "")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _format_capital_brl(num: float) -> str:
+    """Formata valor numérico no padrão monetário brasileiro R$ 0.000,00."""
+    return f"R$ {num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def build_sector_benchmark(company_payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Motor de Benchmarking Setorial com Ranqueamento Bayesiano, Classificação em 3 Faixas e IC 90%.
+
+    Regras e Invariantes:
+    1. Não recalcula nem diverge dos scores individuais de /overview.
+    2. Preserva regra de bloqueio para zero condenações (0.0%).
+    3. Três faixas de decisão: APROVAR (R_sub <= 10.0%), CAUTELA (10.0% < R_sub < 40.0%), REPROVAR (R_sub >= 40.0%).
+    4. Ordenação determinística: menor risco subsidiário, maior capital social, menor probabilidade condenação.
+    5. Fator de risco relativo: R_sub_max / max(R_sub_min, 0.01), com tratamento para 0.0%.
+    6. Validação de CNAE resiliente com detecção de mesmo segmento econômico.
+    7. Contrato com series de gráficos e parecer comparativo executivo (compatível com US-12).
+    """
+    if not company_payloads:
+        return {
+            "empresas_ranqueadas": [],
+            "resumo_setorial": {
+                "total_empresas_comparadas": 0,
+                "mesmo_segmento": None,
+                "cnae_comum": None,
+                "alerta_setorial": None,
+                "fator_risco_relativo": 1.0,
+                "fator_risco_relativo_texto": "Nenhuma empresa avaliada.",
+                "melhor_opcao": None,
+                "pior_opcao": None,
+            },
+            "grafico_comparativo": {
+                "labels": [],
+                "series": {
+                    "probabilidade_condenacao_bayes": [],
+                    "risco_subsidiario_sumula_331": [],
+                },
+            },
+            "parecer_comparativo": {
+                "recomendacao_compra": "",
+                "primeiro_lugar": None,
+                "alerta_critico": None,
+                "economia_potencial_texto": "",
+                "justificativa_executiva": "",
+            },
+        }
+
+    processed_companies = []
+
+    for raw in company_payloads:
+        p = dict(raw) if isinstance(raw, dict) else {}
+
+        empresa_nome = str(
+            p.get("empresa")
+            or p.get("company_name")
+            or p.get("display_title")
+            or p.get("name")
+            or "Empresa Avaliada"
+        ).strip()
+
+        econ = p.get("idoneidade_economica") if isinstance(p.get("idoneidade_economica"), dict) else {}
+        strat = p.get("search_strategy") if isinstance(p.get("search_strategy"), dict) else {}
+
+        # CNPJ
+        cnpj_val = str(
+            p.get("cnpj")
+            or econ.get("cnpj_utilizado")
+            or econ.get("cnpj_triangulado")
+            or strat.get("target_cnpj")
+            or ""
+        ).strip()
+
+        # Capital Social
+        cap_num = _parse_capital_social_num(
+            econ.get("capital_social_num")
+            or p.get("capital_social_num")
+            or econ.get("capital_social")
+            or p.get("capital_social")
+        )
+        cap_formatted = (
+            econ.get("capital_social_formatado")
+            or econ.get("capital_social_display")
+            or p.get("capital_social_consolidado")
+            or p.get("capital_social_display")
+            or _format_capital_brl(cap_num)
+        )
+
+        # Risco Subsidiário (Súmula 331)
+        r_sub_raw = (
+            p.get("risco_subsidiario")
+            if p.get("risco_subsidiario") is not None
+            else (
+                p.get("score_risco_terceirizacao")
+                if p.get("score_risco_terceirizacao") is not None
+                else (
+                    p.get("overall_risk_score")
+                    if p.get("overall_risk_score") is not None
+                    else (
+                        econ.get("risco_calote_subsidiario")
+                        if econ.get("risco_calote_subsidiario") is not None
+                        else econ.get("indice_exposicao_financeira", 0.0)
+                    )
+                )
+            )
+        )
+        try:
+            r_sub = round(float(r_sub_raw), 1)
+        except (ValueError, TypeError):
+            r_sub = 0.0
+
+        # Probabilidade de Condenação (Bayes)
+        p_cond_raw = (
+            p.get("probabilidade_condenacao")
+            if p.get("probabilidade_condenacao") is not None
+            else (
+                p.get("probabilidade_condenacao_geral_pct")
+                if p.get("probabilidade_condenacao_geral_pct") is not None
+                else (
+                    p.get("taxa_historica_condenacao_pct")
+                    if p.get("taxa_historica_condenacao_pct") is not None
+                    else 0.0
+                )
+            )
+        )
+        try:
+            p_cond = round(float(p_cond_raw), 1)
+        except (ValueError, TypeError):
+            p_cond = 0.0
+
+        # Regra de Bloqueio de 0 condenações
+        outcomes = p.get("desfechos_sentencas") or p.get("outcomes_summary") or {}
+        condenacoes_count = outcomes.get("condenacoes", 0)
+        previsao_bloqueada = bool(
+            p.get("previsao_bloqueada")
+            or (condenacoes_count == 0 and p.get("total_processos", 0) > 0 and r_sub == 0.0)
+            or (r_sub == 0.0 and p_cond == 0.0 and p.get("total_processos", 0) > 0)
+        )
+        if previsao_bloqueada and r_sub == 0.0:
+            p_cond = 0.0
+
+        # IC 90%
+        ic_90_data = p.get("ic_90")
+        if isinstance(ic_90_data, dict):
+            lo = float(ic_90_data.get("inferior", ic_90_data.get("lo", 0.0)))
+            hi = float(ic_90_data.get("superior", ic_90_data.get("hi", 0.0)))
+        elif isinstance(ic_90_data, (list, tuple)) and len(ic_90_data) >= 2:
+            lo = float(ic_90_data[0])
+            hi = float(ic_90_data[1])
+        elif p.get("ic_90_inferior_pct") is not None and p.get("ic_90_superior_pct") is not None:
+            lo = float(p["ic_90_inferior_pct"])
+            hi = float(p["ic_90_superior_pct"])
+        elif p.get("plus_previsao_condenacao"):
+            first_pred = p["plus_previsao_condenacao"][0]
+            lo = float(first_pred.get("ic_90_inferior_pct", 0.0))
+            hi = float(first_pred.get("ic_90_superior_pct", 0.0))
+        elif previsao_bloqueada or r_sub == 0.0:
+            lo, hi = 0.0, 0.0
+        else:
+            lo = max(0.0, round(p_cond - 4.5, 1))
+            hi = min(100.0, round(p_cond + 4.5, 1))
+
+        ic_dict = {
+            "inferior": round(lo, 1),
+            "superior": round(hi, 1),
+            "largura_pp": round(hi - lo, 1),
+            "formatado": f"{round(lo, 1)}% a {round(hi, 1)}%",
+        }
+
+        # Cenário
+        cenario_val = str(
+            p.get("cenario")
+            or p.get("cenario_tipo")
+            or econ.get("cenario_tipo")
+            or econ.get("cenario")
+            or ("CENARIO_A" if r_sub < 40.0 else "CENARIO_B")
+        ).upper()
+        if "CENARIO_A" in cenario_val or "CENÁRIO A" in cenario_val:
+            cenario_clean = "CENARIO_A"
+        elif "CENARIO_B" in cenario_val or "CENÁRIO B" in cenario_val:
+            cenario_clean = "CENARIO_B"
+        else:
+            cenario_clean = "CENARIO_A" if r_sub < 40.0 else "CENARIO_B"
+
+        # Classificação em 3 faixas de decisão:
+        # APROVAR (Cenário A - baixo risco subsidiário / alta solvência)
+        # CAUTELA (faixa intermediária - recomendação de Retenção de 10% em contrato)
+        # REPROVAR (Cenário B - alto risco subsidiário / insolvência crítica)
+        if r_sub <= 10.0:
+            faixa = "APROVAR"
+            rec = "Aprovar fornecedor. Baixo risco subsidiário e solvência econômico-trabalhista preservada."
+        elif r_sub < 40.0:
+            faixa = "CAUTELA"
+            rec = "Contratar com cautela. Recomendação de retenção técnica de 10% do valor contratual para contingências."
+        else:
+            faixa = "REPROVAR"
+            rec = "Reprovar / Alto risco subsidiário de calote trabalhista (Súmula 331 TST)."
+
+        # CNAE
+        cnae_cod = (
+            p.get("cnae_codigo")
+            or p.get("cnae_fiscal")
+            or econ.get("cnae_codigo")
+            or econ.get("cnae_fiscal")
+            or econ.get("cnae")
+        )
+        cnae_desc = (
+            p.get("cnae_descricao")
+            or p.get("cnae_fiscal_descricao")
+            or econ.get("cnae_descricao")
+            or econ.get("cnae_fiscal_descricao")
+        )
+
+        processed_companies.append({
+            "empresa": empresa_nome,
+            "cnpj": cnpj_val,
+            "capital_social": cap_formatted,
+            "capital_social_num": cap_num,
+            "risco_subsidiario": r_sub,
+            "probabilidade_condenacao": p_cond,
+            "ic_90": ic_dict,
+            "ic_90_inferior": ic_dict["inferior"],
+            "ic_90_superior": ic_dict["superior"],
+            "cenario": cenario_clean,
+            "cenario_tipo": cenario_clean,
+            "faixa_decisao": faixa,
+            "recomendacao": rec,
+            "cnae_codigo": str(cnae_cod).strip() if cnae_cod else None,
+            "cnae_descricao": str(cnae_desc).strip() if cnae_desc else None,
+            "previsao_bloqueada": previsao_bloqueada,
+            "total_processos": p.get("total_processos", 0),
+        })
+
+    # Ordenação determinística (do melhor para o pior fornecedor):
+    # 1º critério: menor risco_subsidiario (crescente)
+    # 2º critério (desempate): maior capital_social (decrescente, portanto -capital_social_num)
+    # 3º critério (desempate): menor probabilidade_condenacao (crescente)
+    processed_companies.sort(
+        key=lambda x: (
+            x["risco_subsidiario"],
+            -x["capital_social_num"],
+            x["probabilidade_condenacao"],
+        )
+    )
+
+    # Atribuição da posição no ranking
+    for idx, comp in enumerate(processed_companies):
+        comp["posicao_ranking"] = idx + 1
+
+    # Fator de Risco Relativo
+    r_sub_min = processed_companies[0]["risco_subsidiario"]
+    r_sub_max = max(c["risco_subsidiario"] for c in processed_companies)
+
+    if r_sub_min == 0.0 and r_sub_max == 0.0:
+        fator_risco_relativo = 1.0
+        fator_texto = "Todas as empresas avaliadas possuem 0.0% de risco subsidiário (sem passivo condenatório)."
+    else:
+        denom = max(r_sub_min, 0.01)
+        fator_risco_relativo = round(r_sub_max / denom, 2)
+        fator_texto = (
+            f"A fornecedora de maior risco ({processed_companies[-1]['empresa']}) apresenta exposição "
+            f"subsidiária {fator_risco_relativo}x superior à melhor colocada ({processed_companies[0]['empresa']})."
+        )
+
+    # Validação Setorial (CNAE)
+    cnaes_present = [
+        (c["cnae_codigo"], c["cnae_descricao"])
+        for c in processed_companies
+        if c.get("cnae_codigo")
+    ]
+
+    if not cnaes_present:
+        mesmo_segmento = None
+        cnae_comum = None
+        alerta_setorial = None
+    else:
+        unique_clean_codes = {
+            re.sub(r"\D", "", cod) for cod, _desc in cnaes_present if cod
+        }
+        if len(unique_clean_codes) == 1:
+            mesmo_segmento = True
+            cnae_comum = {
+                "codigo": cnaes_present[0][0],
+                "descricao": cnaes_present[0][1],
+            }
+            alerta_setorial = None
+        else:
+            mesmo_segmento = False
+            cnae_comum = None
+            alerta_setorial = (
+                "Atenção: As empresas comparadas pertencem a segmentos econômicos distintos (CNAEs diferentes). "
+                "Recomenda-se ponderar particularidades setoriais ao avaliar o risco trabalhista e subsidiário."
+            )
+
+    melhor_opcao = {
+        "empresa": processed_companies[0]["empresa"],
+        "cnpj": processed_companies[0]["cnpj"],
+        "risco_subsidiario": processed_companies[0]["risco_subsidiario"],
+        "posicao_ranking": 1,
+        "faixa_decisao": processed_companies[0]["faixa_decisao"],
+    }
+    pior_opcao = {
+        "empresa": processed_companies[-1]["empresa"],
+        "cnpj": processed_companies[-1]["cnpj"],
+        "risco_subsidiario": processed_companies[-1]["risco_subsidiario"],
+        "posicao_ranking": len(processed_companies),
+        "faixa_decisao": processed_companies[-1]["faixa_decisao"],
+    }
+
+    resumo_setorial = {
+        "total_empresas_comparadas": len(processed_companies),
+        "mesmo_segmento": mesmo_segmento,
+        "cnae_comum": cnae_comum,
+        "alerta_setorial": alerta_setorial,
+        "fator_risco_relativo": fator_risco_relativo,
+        "fator_risco_relativo_texto": fator_texto,
+        "melhor_opcao": melhor_opcao,
+        "pior_opcao": pior_opcao,
+    }
+
+    grafico_comparativo = {
+        "labels": [c["empresa"] for c in processed_companies],
+        "series": {
+            "probabilidade_condenacao_bayes": [c["probabilidade_condenacao"] for c in processed_companies],
+            "risco_subsidiario_sumula_331": [c["risco_subsidiario"] for c in processed_companies],
+        },
+    }
+
+    diff_pts = round(pior_opcao["risco_subsidiario"] - melhor_opcao["risco_subsidiario"], 1)
+    alerta_critico = (
+        f"Alerta crítico: {pior_opcao['empresa']} apresenta risco subsidiário de {pior_opcao['risco_subsidiario']}%, "
+        f"classificada na faixa de REPROVAÇÃO com alta probabilidade de calote e redirecionamento (Súmula 331 TST)."
+        if pior_opcao["risco_subsidiario"] >= 40.0
+        else None
+    )
+    economia_texto = (
+        f"A contratação prioritária de {melhor_opcao['empresa']} em relação à última colocada "
+        f"mitiga a exposição ao passivo trabalhista em até {diff_pts} pontos percentuais de risco subsidiário."
+        if diff_pts > 0
+        else "Todas as empresas avaliadas possuem risco subsidiário equivalente."
+    )
+    justificativa = (
+        f"Comparativo técnico entre {len(processed_companies)} fornecedores com base em inferência bayesiana e solvência patrimonial. "
+        f"A empresa {melhor_opcao['empresa']} obteve a melhor qualificação ({melhor_opcao['faixa_decisao']}) "
+        f"com risco subsidiário de {melhor_opcao['risco_subsidiario']}%. "
+    )
+    if pior_opcao["faixa_decisao"] == "REPROVAR":
+        justificativa += (
+            f"Recomenda-se reprovação ou exigência de garantia fidejussória para {pior_opcao['empresa']} "
+            f"devido ao elevado risco subsidiário ({pior_opcao['risco_subsidiario']}%)."
+        )
+
+    parecer_comparativo = {
+        "recomendacao_compra": f"Recomenda-se a contratação prioritária de {melhor_opcao['empresa']}, classificada em 1º lugar.",
+        "primeiro_lugar": melhor_opcao["empresa"],
+        "alerta_critico": alerta_critico,
+        "economia_potencial_texto": economia_texto,
+        "justificativa_executiva": justificativa,
+    }
+
+    return {
+        "empresas_ranqueadas": processed_companies,
+        "resumo_setorial": resumo_setorial,
+        "grafico_comparativo": grafico_comparativo,
+        "parecer_comparativo": parecer_comparativo,
+    }
