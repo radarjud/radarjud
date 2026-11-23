@@ -25,13 +25,25 @@ export default async function handler(req) {
     ? String(process.env.PROXY_SHARED_SECRET).trim()
     : '';
   if (expectedSecret) {
-    const providedSecret = (req.headers.get('x-proxy-secret') || '').trim();
-    if (providedSecret !== expectedSecret) {
+    const authHeader = req.headers.get('authorization') || '';
+    const bearerSecret = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : authHeader.trim();
+    const providedSecret = (req.headers.get('x-proxy-secret') || bearerSecret || '').trim();
+    let isMatch = providedSecret.length === expectedSecret.length;
+    let diff = 0;
+    const len = Math.max(providedSecret.length, expectedSecret.length);
+    for (let i = 0; i < len; i++) {
+      const charA = i < providedSecret.length ? providedSecret.charCodeAt(i) : 0;
+      const charB = i < expectedSecret.length ? expectedSecret.charCodeAt(i) : 0;
+      diff |= charA ^ charB;
+    }
+    if (!isMatch || diff !== 0) {
       return new Response(JSON.stringify({ error: 'Unauthorized proxy access' }), {
         status: 401,
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
       });
     }
+  } else {
+    console.warn('[Proxy Warning] PROXY_SHARED_SECRET não configurado. Operando em modo aberto para desenvolvimento.');
   }
 
   const urlObj = new URL(req.url);
