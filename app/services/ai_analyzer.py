@@ -1,13 +1,60 @@
 import os
 import sys
+import time
 import json
 import asyncio
+import hashlib
 import logging
+import threading
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import requests
 
 logger = logging.getLogger(__name__)
+
+# Cache em memória para pareceres comparativos (proteção Render Free 512 MB RAM)
+COMPARATIVE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+COMPARATIVE_CACHE_LOCK = threading.Lock()
+COMPARATIVE_CACHE_MAX_ENTRIES = 100
+COMPARATIVE_CACHE_TTL = 900  # 15 minutos
+
+
+def generate_comparative_cache_key(
+    ranked_companies: List[Dict[str, Any]],
+    cnae_info: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Gera um hash SHA-256 determinístico baseado na ordenação das empresas,
+    identificadores (CNPJ ou nome normalizado) e snapshot dos scores preditivos.
+    Qualquer alteração nos scores, ordem ou solvência invalida o cache automaticamente.
+    """
+    items = []
+    for c in ranked_companies:
+        ident = str(c.get("cnpj") or c.get("empresa") or "").strip().upper()
+        r_sub = float(c.get("risco_subsidiario", 0.0) or 0.0)
+        p_cond = float(c.get("probabilidade_condenacao", 0.0) or 0.0)
+        cenario = str(c.get("cenario") or c.get("cenario_tipo") or "").strip().upper()
+        cap_num = float(c.get("capital_social_num", 0.0) or 0.0)
+        faixa = str(c.get("faixa_decisao") or "").strip().upper()
+        items.append(f"{ident}:{r_sub:.1f}:{p_cond:.1f}:{cenario}:{cap_num:.0f}:{faixa}")
+
+    cnae_cod = (cnae_info.get("codigo") if isinstance(cnae_info, dict) else "") or ""
+    serialized = "|".join(items) + f"|cnae:{cnae_cod}"
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _prune_comparative_cache_if_needed() -> None:
+    """Mantém o uso de memória estritamente seguro para o limite de 512 MB do Render Free."""
+    now = time.time()
+    expired = [k for k, (ts, _) in COMPARATIVE_CACHE.items() if (now - ts) > COMPARATIVE_CACHE_TTL]
+    for k in expired:
+        COMPARATIVE_CACHE.pop(k, None)
+
+    if len(COMPARATIVE_CACHE) > COMPARATIVE_CACHE_MAX_ENTRIES:
+        sorted_keys = sorted(COMPARATIVE_CACHE.keys(), key=lambda k: COMPARATIVE_CACHE[k][0])
+        excess = len(COMPARATIVE_CACHE) - COMPARATIVE_CACHE_MAX_ENTRIES
+        for k in sorted_keys[:excess]:
+            COMPARATIVE_CACHE.pop(k, None)
 
 # Integração nativa com o diretório radarjusAgent (Google ADK + Vertex AI)
 RADARJUS_AGENT_DIR = Path(__file__).resolve().parents[2] / "radarjusAgent"
@@ -374,3 +421,298 @@ class LegalAIAnalyzer:
 
         # 3. Fallback para o motor local gratuito
         return self._generate_local_legal_ai_report(summary_data)
+
+    # =========================================================================
+    # PARECER COMPARATIVO SETORIAL (US-12 / radarjusAgent)
+    # Cascata de 3 Níveis: ADK -> REST Gemini -> Fallback Heurístico Local
+    # =========================================================================
+
+    @classmethod
+    def reset_comparative_cache(cls) -> None:
+        """Limpa o cache em memória de pareceres comparativos (para testes unitários)."""
+        with COMPARATIVE_CACHE_LOCK:
+            COMPARATIVE_CACHE.clear()
+
+    def _validate_comparative_guardrails(
+        self,
+        candidate: Any,
+        expected_first_place: str,
+    ) -> bool:
+        """
+        Guardrail Anti-Alucinação para parecer comparativo de IA:
+        1. Valida estrutura JSON e presença das 5 chaves canônicas obrigatórias.
+        2. Proíbe troca de 1º lugar: o campo 'primeiro_lugar' deve coincidir estritamente
+           com a vencedora do ranking matemático da US-13.
+        3. Valida que a recomendação cita a vencedora oficial.
+        """
+        if not isinstance(candidate, dict):
+            logger.warning("[Guardrail] Resposta do LLM não é um objeto JSON válido.")
+            return False
+
+        required_keys = [
+            "recomendacao_compra",
+            "primeiro_lugar",
+            "alerta_critico",
+            "economia_potencial_texto",
+            "justificativa_executiva",
+        ]
+        if not all(k in candidate for k in required_keys):
+            logger.warning("[Guardrail] Chaves obrigatórias ausentes no retorno do LLM: esperadas %s", required_keys)
+            return False
+
+        primeiro_llm = str(candidate.get("primeiro_lugar") or "").strip().upper()
+        esperado = expected_first_place.strip().upper()
+
+        if not primeiro_llm or primeiro_llm != esperado:
+            logger.warning(
+                "[Guardrail Anti-Alucinação] Divergência no 1º colocado: LLM='%s', esperado='%s'. Descartando parecer.",
+                primeiro_llm,
+                esperado,
+            )
+            return False
+
+        rec_texto = str(candidate.get("recomendacao_compra") or "").upper()
+        if esperado not in rec_texto:
+            logger.warning("[Guardrail] Recomendação de compra não cita a vencedora '%s'.", esperado)
+            return False
+
+        return True
+
+    def _build_comparative_prompt(
+        self,
+        ranked_companies: List[Dict[str, Any]],
+        cnae_info: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Constrói o prompt executivo injetando o ranking fechado e guardrails anti-alucinação."""
+        vencedora = ranked_companies[0].get("empresa", "")
+        summary_items = []
+        for c in ranked_companies:
+            summary_items.append({
+                "posicao_ranking": c.get("posicao_ranking"),
+                "empresa": c.get("empresa"),
+                "cnpj": c.get("cnpj"),
+                "risco_subsidiario_pct": c.get("risco_subsidiario"),
+                "probabilidade_condenacao_bayes_pct": c.get("probabilidade_condenacao"),
+                "capital_social": c.get("capital_social"),
+                "cenario": c.get("cenario"),
+                "faixa_decisao": c.get("faixa_decisao"),
+                "previsao_bloqueada": c.get("previsao_bloqueada", False),
+            })
+
+        cnae_str = (
+            f"CNAE Comum: {cnae_info.get('descricao', '')} ({cnae_info.get('codigo', '')})"
+            if isinstance(cnae_info, dict) and cnae_info.get("codigo")
+            else "Segmentos econômicos distintos."
+        )
+
+        return (
+            "Você é o radarjusAgent, consultor executivo sênior especialista em Direito do Trabalho, "
+            "Súmula 331 do TST e governança de risco com terceiros (RiskTech).\n"
+            "Analise os fornecedores abaixo, já matematicamente ranqueados por menor risco subsidiário e solvência:\n\n"
+            f"Segmento: {cnae_str}\n"
+            f"Dados consolidados: {json.dumps(summary_items, ensure_ascii=False, indent=2)}\n\n"
+            "DIRETRIZES E GUARDRAILS ANTI-ALUCINAÇÃO:\n"
+            f"1. A empresa em 1º lugar DEVE SER EXATAMENTE '{vencedora}'. É estritamente proibido alterar o ranking ou trocar a vencedora.\n"
+            "2. Não invente números, percentuais ou valores financeiros diferentes dos informados nos dados acima.\n"
+            "3. Se uma empresa estiver na faixa 'REPROVAR' ou 'CENARIO_B', gere o alerta crítico correspondente apontando os riscos da Súmula 331.\n"
+            "4. Se a empresa vencedora possuir 0.0% de risco subsidiário ou ausência de condenações, preserve essa condição sem supor condenações inexistentes.\n"
+            "5. Retorne EXCLUSIVAMENTE um objeto JSON válido com as seguintes 5 chaves:\n"
+            "{\n"
+            f'  "recomendacao_compra": "Recomenda-se a contratação prioritária de {vencedora}, classificada em 1º lugar.",\n'
+            f'  "primeiro_lugar": "{vencedora}",\n'
+            '  "alerta_critico": "Alerta sobre empresa reprovada/Cenário B ou null se todas forem seguras",\n'
+            '  "economia_potencial_texto": "Texto explicando a mitigação do risco subsidiário em pontos percentuais",\n'
+            '  "justificativa_executiva": "Parecer executivo detalhado fundamentando a decisão de compra"\n'
+            "}"
+        )
+
+    def _call_adk_agent_comparative(
+        self,
+        ranked_companies: List[Dict[str, Any]],
+        cnae_info: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Nível 1: Invoca o radarjusAgent via Google ADK in-process ou serviço externo."""
+        if self.agent_service_url:
+            try:
+                url = f"{self.agent_service_url.rstrip('/')}/comparar-empresas"
+                resp = requests.post(
+                    url,
+                    json={"empresas_ranqueadas": ranked_companies, "cnae_info": cnae_info},
+                    timeout=2.0,
+                )
+                if resp.ok:
+                    payload = resp.json()
+                    if isinstance(payload, dict):
+                        return payload.get("parecer_comparativo") or payload
+            except Exception as exc:
+                logger.warning("Falha ao contatar radarjusAgent comparativo externo: %s", exc)
+
+        if ADK_AGENT_AVAILABLE:
+            try:
+                import agents.clients_agent as _clients_agent
+                if hasattr(_clients_agent, "gerar_parecer_comparativo_adk"):
+                    adk_func = getattr(_clients_agent, "gerar_parecer_comparativo_adk")
+                    return asyncio.run(adk_func(ranked_companies, cnae_info))
+            except Exception as exc:
+                logger.debug("radarjusAgent comparativo in-process indisponível: %s", exc)
+
+        return None
+
+    def _call_gemini_api_comparative(
+        self,
+        prompt: str,
+        timeout: float = 2.0,
+    ) -> Optional[Dict[str, Any]]:
+        """Nível 2: Chamada REST à API do Gemini com timeout estrito (<= 2.0s) para manter a rota < 2,5s."""
+        if not self.gemini_api_key:
+            return None
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent?key={self.gemini_api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.2,
+                "responseMimeType": "application/json",
+            },
+        }
+
+        try:
+            resp = requests.post(url, json=payload, timeout=timeout)
+            if resp.ok:
+                data = resp.json()
+                raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                return json.loads(raw_text)
+            else:
+                logger.warning("Falha na chamada Gemini comparativa (Status %d): %s", resp.status_code, resp.text[:200])
+        except Exception as exc:
+            logger.warning("Erro/timeout na API do Gemini comparativo: %s. Utilizando fallback heurístico.", exc)
+
+        return None
+
+    def _generate_local_comparative_opinion(
+        self,
+        ranked_companies: List[Dict[str, Any]],
+        cnae_info: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Nível 3 (Fallback Heurístico Local):
+        Motor 100% determinístico e de custo zero para parecer comparativo executivo.
+        Preserva rigorosamente a Regra Zero Condenações (0.0%) e paridade com US-13.
+        """
+        if not ranked_companies:
+            return {
+                "recomendacao_compra": "",
+                "primeiro_lugar": None,
+                "alerta_critico": None,
+                "economia_potencial_texto": "",
+                "justificativa_executiva": "",
+            }
+
+        melhor = ranked_companies[0]
+        pior = ranked_companies[-1]
+
+        r_sub_melhor = float(melhor.get("risco_subsidiario", 0.0) or 0.0)
+        r_sub_pior = float(pior.get("risco_subsidiario", 0.0) or 0.0)
+        diff_pts = round(r_sub_pior - r_sub_melhor, 1)
+
+        # Alerta Crítico para Cenário B ou Reprovação
+        if r_sub_pior >= 40.0 or pior.get("faixa_decisao") == "REPROVAR" or pior.get("cenario") == "CENARIO_B":
+            alerta_critico = (
+                f"Alerta crítico: {pior['empresa']} apresenta risco subsidiário de {r_sub_pior:.1f}%, "
+                f"classificada na faixa de REPROVAÇÃO com alta probabilidade de calote e redirecionamento (Súmula 331 TST)."
+            )
+        else:
+            alerta_critico = None
+
+        # Economia Potencial
+        if diff_pts > 0:
+            economia_texto = (
+                f"A contratação prioritária de {melhor['empresa']} em relação à última colocada "
+                f"mitiga a exposição ao passivo trabalhista em até {diff_pts} pontos percentuais de risco subsidiário."
+            )
+        else:
+            economia_texto = "Todas as empresas avaliadas possuem risco subsidiário equivalente."
+
+        # Justificativa Executiva
+        faixa_melhor = melhor.get("faixa_decisao", "APROVAR")
+        if r_sub_melhor == 0.0 or melhor.get("previsao_bloqueada"):
+            detalhe_melhor = "com 0.0% de risco subsidiário (sem passivo condenatório anterior)"
+        else:
+            detalhe_melhor = f"com risco subsidiário de {r_sub_melhor:.1f}%"
+
+        justificativa = (
+            f"Comparativo técnico entre {len(ranked_companies)} fornecedores com base em inferência bayesiana e solvência patrimonial. "
+            f"A empresa {melhor['empresa']} obteve a melhor qualificação ({faixa_melhor}) {detalhe_melhor}. "
+        )
+
+        if pior.get("faixa_decisao") == "REPROVAR" or r_sub_pior >= 40.0:
+            justificativa += (
+                f"Recomenda-se reprovação ou exigência de garantia fidejussória para {pior['empresa']} "
+                f"devido ao elevado risco subsidiário ({r_sub_pior:.1f}%)."
+            )
+
+        if isinstance(cnae_info, dict) and cnae_info.get("descricao"):
+            justificativa += f" Fornecedores avaliados no segmento de {cnae_info['descricao']}."
+
+        return {
+            "recomendacao_compra": f"Recomenda-se a contratação prioritária de {melhor['empresa']}, classificada em 1º lugar.",
+            "primeiro_lugar": melhor["empresa"],
+            "alerta_critico": alerta_critico,
+            "economia_potencial_texto": economia_texto,
+            "justificativa_executiva": justificativa.strip(),
+        }
+
+    def generate_comparative_analysis(
+        self,
+        ranked_companies: List[Dict[str, Any]],
+        cnae_info: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Gera parecer comparativo executivo de IA usando cascata resiliente de 3 níveis:
+        1. Google ADK (radarjusAgent)
+        2. REST API Gemini (temperature=0.2, timeout <= 2.0s)
+        3. Motor Heurístico Local (100% determinístico, zero custo, fallback resiliente)
+
+        Inclui:
+        - Cache em memória indexado por hash SHA-256 das empresas e scores (< 50ms).
+        - Guardrail Anti-Alucinação para impedir troca de vencedor ou distorções.
+        - Preservação da Regra de Zero Condenações (0.0%).
+        """
+        if not ranked_companies:
+            return self._generate_local_comparative_opinion([], cnae_info)
+
+        expected_first = ranked_companies[0].get("empresa", "")
+
+        # 0. Verificação de Cache por Hash Determinístico
+        cache_key = generate_comparative_cache_key(ranked_companies, cnae_info)
+        with COMPARATIVE_CACHE_LOCK:
+            if cache_key in COMPARATIVE_CACHE:
+                cached_ts, cached_result = COMPARATIVE_CACHE[cache_key]
+                if (time.time() - cached_ts) < COMPARATIVE_CACHE_TTL:
+                    logger.debug("Hit de cache comparativo para hash %s", cache_key[:12])
+                    return dict(cached_result)
+
+        # 1. Nível 1: radarjusAgent (Google ADK)
+        adk_result = self._call_adk_agent_comparative(ranked_companies, cnae_info)
+        if adk_result and self._validate_comparative_guardrails(adk_result, expected_first):
+            with COMPARATIVE_CACHE_LOCK:
+                COMPARATIVE_CACHE[cache_key] = (time.time(), adk_result)
+                _prune_comparative_cache_if_needed()
+            return adk_result
+
+        # 2. Nível 2: REST API Gemini
+        if self.gemini_api_key:
+            prompt = self._build_comparative_prompt(ranked_companies, cnae_info)
+            cloud_result = self._call_gemini_api_comparative(prompt, timeout=2.0)
+            if cloud_result and self._validate_comparative_guardrails(cloud_result, expected_first):
+                with COMPARATIVE_CACHE_LOCK:
+                    COMPARATIVE_CACHE[cache_key] = (time.time(), cloud_result)
+                    _prune_comparative_cache_if_needed()
+                return cloud_result
+
+        # 3. Nível 3: Fallback Heurístico Local
+        local_result = self._generate_local_comparative_opinion(ranked_companies, cnae_info)
+        with COMPARATIVE_CACHE_LOCK:
+            COMPARATIVE_CACHE[cache_key] = (time.time(), local_result)
+            _prune_comparative_cache_if_needed()
+        return local_result
