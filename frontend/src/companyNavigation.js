@@ -1,29 +1,23 @@
-const COMPANY_PAGES = new Set(['overview', 'processes', 'predictions']);
-const PAGES = new Set(['search', 'catalog', 'overview', 'processes', 'predictions', 'history']);
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App.jsx';
+import { AuthProvider } from './context/AuthContext.jsx';
+import './styles.css';
+import './auth.css';
 
-export function isCompanyPage(page) {
-  return COMPANY_PAGES.has(page);
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) { console.error('RadarJud: erro ao renderizar a tela', error, info); }
+  render() {
+    if (this.state.error) return <div style={{padding:32,fontFamily:'Inter,Arial,sans-serif',background:'#f8f7f5',minHeight:'100vh',color:'#142335'}}>
+      <h1>Não foi possível exibir esta página</h1>
+      <p>Ocorreu um erro na interface. Nenhum arquivo do backend foi alterado.</p>
+      <pre style={{whiteSpace:'pre-wrap',background:'#fff',padding:20,borderRadius:8,border:'1px solid #ddd'}}>{String(this.state.error.message || this.state.error)}</pre>
+      <button style={{padding:12,background:'#245a81',color:'white',border:0,borderRadius:8,cursor:'pointer'}} onClick={()=>window.location.reload()}>Recarregar página</button>
+    </div>;
+    return this.props.children;
+  }
 }
 
-export function validSearchId(value) {
-  return /^[1-9]\d*$/.test(String(value ?? '')) && Number.isSafeInteger(Number(value))
-    ? String(value) : null;
-}
-
-export function parseRoute(hash) {
-  const [page, id] = hash.replace(/^#\/?/, '').split('/');
-  if (!PAGES.has(page)) return { page: 'search', searchId: null };
-  return { page, searchId: isCompanyPage(page) ? validSearchId(id) : null };
-}
-
-export function companyHash(page, id) {
-  const searchId = isCompanyPage(page) ? validSearchId(id) : null;
-  return `#/${page}${searchId ? `/${searchId}` : ''}`;
-}
-
-export function companyShareUrl(location, id) {
-  if (!validSearchId(id)) throw new Error('Consulta não salva.');
-  const url = new URL(location.href);
-  url.hash = companyHash('overview', id);
-  return url.href;
-}
+createRoot(document.getElementById('root')).render(<ErrorBoundary><AuthProvider><App /></AuthProvider></ErrorBoundary>);

@@ -1,0 +1,52 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  checkPassword, isValidCnpj, maskCnpj, validateCnpj, validateCompany, validateEmail, validateFullName, validatePassword,
+} from './authValidation.js';
+
+test('e-mail: formato e domínio corporativo', () => {
+  assert.equal(validateEmail('ana@empresa.com.br', { corporate: true }), '');
+  assert.match(validateEmail(''), /Informe seu e-mail/);
+  assert.match(validateEmail('ana@empresa'), /e-mail válido/);
+  assert.match(validateEmail('ana@gmail.com', { corporate: true }), /corporativo/);
+  assert.match(validateEmail('ana@Hotmail.com.br', { corporate: true }), /corporativo/);
+  assert.equal(validateEmail('ana@gmail.com'), '', 'o login não bloqueia provedores gratuitos');
+});
+
+test('nome completo exige nome e sobrenome', () => {
+  assert.equal(validateFullName('Ana Souza'), '');
+  assert.match(validateFullName('Ana'), /nome e sobrenome/);
+  assert.match(validateFullName('   '), /nome completo/);
+  assert.match(validateFullName('A B'), /nome e sobrenome/);
+});
+
+test('empresa é obrigatória', () => {
+  assert.equal(validateCompany('Radar Ltda'), '');
+  assert.match(validateCompany(''), /nome da empresa/);
+  assert.match(validateCompany('X'), /ao menos 2/);
+});
+
+test('senha forte: 8+ caracteres, maiúscula, minúscula, número e símbolo', () => {
+  assert.equal(validatePassword('Radar#2026'), '');
+  assert.match(validatePassword(''), /Crie uma senha/);
+  for (const weak of ['radar2026', 'RADAR#2026', 'Radar#abcd', 'Rad#1', 'radarradar']) {
+    assert.match(validatePassword(weak), /requisitos/, weak);
+  }
+  const result = checkPassword('Radar#2026');
+  assert.equal(result.ok, true);
+  assert.equal(result.level, 4);
+  assert.equal(checkPassword('').levelLabel, '');
+});
+
+test('CNPJ opcional, com máscara e dígitos verificadores', () => {
+  assert.equal(maskCnpj('11222333000181'), '11.222.333/0001-81');
+  assert.equal(maskCnpj('1122'), '11.22');
+  assert.equal(maskCnpj('112223330001819999'), '11.222.333/0001-81');
+  assert.equal(isValidCnpj('11.222.333/0001-81'), true);
+  assert.equal(isValidCnpj('11.222.333/0001-82'), false);
+  assert.equal(isValidCnpj('11111111111111'), false);
+  assert.equal(validateCnpj(''), '');
+  assert.match(validateCnpj('1122'), /14 dígitos/);
+  assert.match(validateCnpj('11.222.333/0001-82'), /inválido/);
+  assert.equal(validateCnpj('11.222.333/0001-81'), '');
+});

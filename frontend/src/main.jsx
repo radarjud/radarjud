@@ -1,7 +1,9 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App.jsx';
+import { AuthProvider } from './context/AuthContext.jsx';
 import './styles.css';
+import './auth.css';
 
 class ErrorBoundary extends React.Component {
   constructor(props) { super(props); this.state = { error: null }; }
@@ -18,4 +20,4 @@ class ErrorBoundary extends React.Component {
   }
 }
 
-createRoot(document.getElementById('root')).render(<ErrorBoundary><App /></ErrorBoundary>);
+createRoot(document.getElementById('root')).render(<ErrorBoundary><AuthProvider><App /></AuthProvider></ErrorBoundary>);
