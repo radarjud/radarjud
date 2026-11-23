@@ -1,12 +1,27 @@
 import io
 import re
+import gc
+import os
 import html
 import logging
 import unicodedata
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+from app.services.pdf_svg_charts import (
+    generate_bayes_vs_sumula331_svg,
+    generate_comparative_bars_svg,
+    generate_outcomes_simplex_svg,
+)
 
 logger = logging.getLogger(__name__)
+
+_TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates")
+_jinja_env = Environment(
+    loader=FileSystemLoader(_TEMPLATES_DIR),
+    autoescape=select_autoescape(["html", "xml"]),
+)
 
 
 def _format_cnpj(raw: Optional[str]) -> str:
@@ -754,15 +769,279 @@ def _generate_pdf_pure_python(report: Dict[str, Any]) -> bytes:
     return bytes(pdf)
 
 
+def _generate_comparative_pdf_reportlab(companies: List[Dict[str, Any]]) -> bytes:
+    """Gera o relatório comparativo em PDF usando ReportLab como fallback estruturado."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=16 * mm,
+        rightMargin=16 * mm,
+        topMargin=14 * mm,
+        bottomMargin=14 * mm,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "CompTitle",
+        parent=styles["Heading1"],
+        fontName="Helvetica-Bold",
+        fontSize=16,
+        leading=20,
+        textColor=colors.HexColor("#142335"),
+        spaceAfter=6,
+    )
+    sub_style = ParagraphStyle(
+        "CompSub",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=8.5,
+        leading=12,
+        textColor=colors.HexColor("#64748b"),
+        spaceAfter=12,
+    )
+    cell_head = ParagraphStyle(
+        "CellHead",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=8,
+        leading=10,
+        textColor=colors.HexColor("#475569"),
+    )
+    cell_body = ParagraphStyle(
+        "CellBody",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=7.5,
+        leading=10,
+        textColor=colors.HexColor("#1e293b"),
+    )
+
+    story = [
+        Paragraph("RadarJus — Relatório Comparativo de Empresas", title_style),
+        Paragraph(
+            f"Emissão: {datetime.now().strftime('%d/%m/%Y %H:%M')} • "
+            f"Total de Empresas Analisadas: {len(companies)} • Due Diligence Trabalhista (Súmula 331 TST)",
+            sub_style,
+        ),
+        Spacer(1, 4 * mm),
+    ]
+
+    # Tabela Comparativa Consolidada
+    table_data = [[
+        Paragraph("<b>EMPRESA</b>", cell_head),
+        Paragraph("<b>CNPJ</b>", cell_head),
+        Paragraph("<b>PROCESSOS</b>", cell_head),
+        Paragraph("<b>SCORE RISCO</b>", cell_head),
+        Paragraph("<b>CENÁRIO</b>", cell_head),
+        Paragraph("<b>RECOMENDAÇÃO</b>", cell_head),
+    ]]
+
+    for comp in companies:
+        c_badge = "Cenário A" if comp["economic"]["is_cenario_a"] else "Cenário B"
+        recom = comp["compliance"]["recomendacao"]
+        table_data.append([
+            Paragraph(comp["company_name"][:28], cell_body),
+            Paragraph(comp["cnpj_formatted"], cell_body),
+            Paragraph(str(comp["total_processes"]), cell_body),
+            Paragraph(f"{comp['exposure_score']:.1f}%", cell_body),
+            Paragraph(c_badge, cell_body),
+            Paragraph(recom[:26], cell_body),
+        ])
+
+    table = Table(table_data, colWidths=[52 * mm, 36 * mm, 20 * mm, 22 * mm, 22 * mm, 26 * mm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f1f5f9")),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+    ]))
+    story.append(table)
+    story.append(Spacer(1, 6 * mm))
+
+    # Detalhes das empresas
+    for comp in companies:
+        c_name = comp["company_name"]
+        econ_summary = (
+            f"<b>{_xml_escape(c_name)}</b> — {comp['cnpj_formatted']}<br/>"
+            f"Capital Social: {comp['economic']['capital_fmt']} | Situação RFB: {comp['economic']['situacao_rfb']} | "
+            f"Risco Subsidiário: {comp['economic']['risco_sub'] or 0.0:.1f}% | Grau Confiança: {comp['conf_label']}<br/>"
+            f"Resumo Executivo: {_xml_escape(comp['compliance']['resumo_executivo'])}"
+        )
+        story.append(Paragraph(econ_summary, cell_body))
+        story.append(Spacer(1, 3 * mm))
+
+    doc.build(story)
+    pdf_bytes = buf.getvalue()
+    buf.close()
+    return pdf_bytes
+
+
+def _generate_comparative_pdf_pure_python(companies: List[Dict[str, Any]]) -> bytes:
+    """Fallback para PDF 1.4 puro sem dependências externas para relatório comparativo."""
+    lines = [
+        "RadarJus - Relatorio Comparativo de Due Diligence (Fallback Puro)",
+        f"Emissao: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+        f"Total de Empresas Analisadas: {len(companies)}",
+        "----------------------------------------------------------------------",
+    ]
+    for comp in companies:
+        lines.append(f"Empresa: {_ascii_latin1(comp['company_name'])}")
+        lines.append(f"CNPJ: {comp['cnpj_formatted']} | Processos: {comp['total_processes']} | Score: {comp['exposure_score']:.1f}%")
+        lines.append(f"Cenario: {_ascii_latin1(comp['economic']['cenario_badge'])}")
+        lines.append(f"Recomendacao: {_ascii_latin1(comp['compliance']['recomendacao'])}")
+        lines.append("----------------------------------------------------------------------")
+
+    wrapped: List[str] = []
+    for line in lines:
+        for chunk in [line[i:i + 80] for i in range(0, max(len(line), 1), 80)]:
+            wrapped.append(chunk)
+
+    content_ops = ["BT", "/F1 9 Tf", "40 800 Td", "13 TL"]
+    for i, ln in enumerate(wrapped[:56]):
+        if i == 0:
+            content_ops.append(f"({_pdf_escape(ln)}) Tj")
+        else:
+            content_ops.append(f"T* ({_pdf_escape(ln)}) Tj")
+    content_ops.append("ET")
+    stream_bytes = "\n".join(content_ops).encode("latin-1", "ignore")
+
+    objects = [
+        b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+        b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n",
+        b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n",
+        b"4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >> endobj\n",
+        f"5 0 obj << /Length {len(stream_bytes)} >> stream\n".encode("ascii") + stream_bytes + b"\nendstream endobj\n",
+    ]
+
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf.extend(obj)
+
+    xref_pos = len(pdf)
+    pdf.extend(f"xref\n0 {len(offsets)}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for off in offsets[1:]:
+        pdf.extend(f"{off:010d} 00000 n \n".encode("ascii"))
+
+    trailer = (
+        f"trailer << /Size {len(offsets)} /Root 1 0 R >>\n"
+        f"startxref\n{xref_pos}\n%%EOF\n"
+    ).encode("ascii")
+    pdf.extend(trailer)
+    return bytes(pdf)
+
+
 def generate_company_report_pdf(raw_data: Dict[str, Any]) -> bytes:
     """
-    Gera o PDF executivo v2.0 (RiskTech + Solvência) para uma empresa.
-    Utiliza ReportLab quando disponível e cai automaticamente para o gerador PDF 1.4 puro.
+    Gera o PDF executivo v3.0 (HTML/CSS-to-PDF com WeasyPrint, Jinja2 e gráficos SVG).
+    Cai com resiliência total para ReportLab e gerador PDF puro caso WeasyPrint falhe.
     """
     report = normalize_report_payload(raw_data)
+    outcomes_svg = generate_outcomes_simplex_svg(report.get("outcomes"))
+
+    is_cenario_b = not report.get("economic", {}).get("is_cenario_a", True)
+    condenacoes = int(report.get("outcomes", {}).get("condenacoes") or 0)
+    is_blocked = is_cenario_b or (condenacoes == 0 and report.get("total_processes", 0) > 0)
+
+    bayes_svg = generate_bayes_vs_sumula331_svg(
+        score_bayes=report.get("exposure_score", 0.0),
+        risco_sumula=report.get("economic", {}).get("risco_sub") or 0.0,
+        is_blocked=is_blocked,
+    )
+
     try:
-        return _generate_pdf_reportlab(report)
-    except Exception as exc:
-        logger.warning("Fallback para gerador PDF puro (ReportLab indisponível/erro): %s", exc)
-        return _generate_pdf_pure_python(report)
+        template = _jinja_env.get_template("pdf/report_single.html")
+        html_str = template.render(
+            report=report,
+            outcomes_svg=outcomes_svg,
+            bayes_svg=bayes_svg,
+        )
+        from weasyprint import HTML
+
+        doc = HTML(string=html_str)
+        pdf_bytes = doc.write_pdf()
+        del doc, html_str
+        return pdf_bytes
+    except (ImportError, OSError, Exception) as exc:
+        logger.warning(
+            "WeasyPrint indisponível ou falhou na renderização de relatório individual (%s). Executando fallback para ReportLab.",
+            exc,
+        )
+        try:
+            return _generate_pdf_reportlab(report)
+        except Exception as r_exc:
+            logger.warning(
+                "ReportLab falhou na geração do PDF (%s). Executando fallback para gerador PDF puro.",
+                r_exc,
+            )
+            return _generate_pdf_pure_python(report)
+    finally:
+        gc.collect()
+
+
+def generate_comparative_report_pdf(raw_data: Any) -> bytes:
+    """
+    Gera o PDF comparativo v3.0 para 2 a 5 empresas via WeasyPrint, Jinja2 e gráficos SVG.
+    Cai com resiliência total para ReportLab e gerador PDF puro caso WeasyPrint falhe.
+    """
+    companies_raw: List[Dict[str, Any]] = []
+    if isinstance(raw_data, list):
+        companies_raw = raw_data
+    elif isinstance(raw_data, dict):
+        companies_raw = (
+            raw_data.get("companies")
+            or raw_data.get("empresas")
+            or raw_data.get("items")
+            or []
+        )
+        if not companies_raw:
+            companies_raw = [raw_data]
+
+    normalized_companies = [normalize_report_payload(c) for c in companies_raw[:5]]
+    comp_chart_data = [
+        {
+            "nome": c["company_name"],
+            "score": c["exposure_score"],
+            "processos": c["total_processes"],
+        }
+        for c in normalized_companies
+    ]
+    comparative_svg = generate_comparative_bars_svg(comp_chart_data)
+
+    try:
+        template = _jinja_env.get_template("pdf/report_compare.html")
+        html_str = template.render(
+            companies=normalized_companies,
+            comparative_svg=comparative_svg,
+            generated_at=datetime.now().strftime("%d/%m/%Y %H:%M"),
+        )
+        from weasyprint import HTML
+
+        doc = HTML(string=html_str)
+        pdf_bytes = doc.write_pdf()
+        del doc, html_str
+        return pdf_bytes
+    except (ImportError, OSError, Exception) as exc:
+        logger.warning(
+            "WeasyPrint indisponível ou falhou na renderização de relatório comparativo (%s). Executando fallback para ReportLab.",
+            exc,
+        )
+        try:
+            return _generate_comparative_pdf_reportlab(normalized_companies)
+        except Exception as r_exc:
+            logger.warning(
+                "ReportLab falhou no relatório comparativo (%s). Executando fallback para gerador PDF puro.",
+                r_exc,
+            )
+            return _generate_comparative_pdf_pure_python(normalized_companies)
+    finally:
+        gc.collect()
 

@@ -12,6 +12,7 @@ import asyncio
 import logging
 import threading
 from pathlib import Path
+import gc
 from datetime import datetime, timezone
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,7 +26,7 @@ from app.extensions import db
 from app.models.company_search import CompanySearch, get_utc_now
 from app.models.process_record import ProcessRecord
 from app.services.orchestrator import CNJMetadataOrchestrator
-from app.services.pdf_report import generate_company_report_pdf
+from app.services.pdf_report import generate_company_report_pdf, generate_comparative_report_pdf
 from app.services.economic_service import (
     EconomicStandingService,
     aggregate_group_capital,
@@ -2157,20 +2158,43 @@ def _find_company_payload_for_pdf(term: str) -> Optional[dict]:
 
 
 def _build_pdf_response(payload: dict, filename_hint: str = "relatorio") -> Response:
-    """Renderiza os bytes do PDF executivo v2.0 e retorna a resposta HTTP application/pdf."""
+    """Renderiza os bytes do PDF executivo v3.0 e retorna a resposta HTTP application/pdf."""
     pdf_bytes = generate_company_report_pdf(payload)
     base_name = _strip_visual_company_suffixes(filename_hint) or "relatorio"
     norm_ascii = unicodedata.normalize("NFKD", base_name).encode("ascii", "ignore").decode("ascii")
     slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", norm_ascii).strip("-").lower()[:48] or "relatorio"
-    return Response(
+    safe_filename = re.sub(r'[\r\n/\\"]+', "_", f"radarjus-{slug}.pdf")
+    resp = Response(
         pdf_bytes,
         status=200,
         mimetype="application/pdf",
         headers={
-            "Content-Disposition": f'attachment; filename="radarjus-{slug}.pdf"',
+            "Content-Disposition": f'attachment; filename="{safe_filename}"',
             "Cache-Control": "no-store",
         },
     )
+    gc.collect()
+    return resp
+
+
+def _build_compare_pdf_response(payload: dict, filename_hint: str = "comparativo") -> Response:
+    """Renderiza os bytes do PDF comparativo v3.0 e retorna a resposta HTTP application/pdf."""
+    pdf_bytes = generate_comparative_report_pdf(payload)
+    base_name = _strip_visual_company_suffixes(filename_hint) or "comparativo"
+    norm_ascii = unicodedata.normalize("NFKD", base_name).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", norm_ascii).strip("-").lower()[:48] or "comparativo"
+    safe_filename = re.sub(r'[\r\n/\\"]+', "_", f"radarjus-{slug}.pdf")
+    resp = Response(
+        pdf_bytes,
+        status=200,
+        mimetype="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+    gc.collect()
+    return resp
 
 
 def handle_pdf_export_request(
@@ -2318,6 +2342,7 @@ def export_history_summary_pdf(search_id: int):
     return handle_pdf_export_request(search_id=search_id)
 
 
+@api_bp.route("/export-pdf", methods=["GET", "POST"])
 @api_bp.route("/report/pdf", methods=["GET", "POST"])
 @api_bp.route("/export/pdf", methods=["GET", "POST"])
 def export_report_pdf_query_or_post():
@@ -2325,11 +2350,95 @@ def export_report_pdf_query_or_post():
     return handle_pdf_export_request()
 
 
+@api_bp.route("/export-pdf/<path:company_name>", methods=["GET"])
 @api_bp.route("/report/pdf/<path:company_name>", methods=["GET"])
 @api_bp.route("/export/pdf/<path:company_name>", methods=["GET"])
 def export_report_pdf_by_path(company_name: str):
     """Exporta o relatório executivo em PDF por nome/CNPJ no path (suporta barras como CNPJ e GRUPO CONSOLIDADO / FILIAIS)."""
     return handle_pdf_export_request(company_name=company_name)
+
+
+@api_bp.route("/export-compare-pdf", methods=["GET", "POST"])
+@api_bp.route("/compare-pdf", methods=["GET", "POST"])
+@api_bp.route("/export/compare-pdf", methods=["GET", "POST"])
+def export_compare_pdf():
+    """
+    Exporta o relatório comparativo de 2 a 5 empresas em PDF (v3.0).
+    Aceita POST com JSON contendo 'companies', 'empresas', 'search_ids' ou lista de empresas.
+    Aceita GET com query string contendo ?search_ids=1,2,3 ou ?empresas=A,B ou ?q=A,B.
+    """
+    body = request.get_json(silent=True) if request.method == "POST" else None
+    if not isinstance(body, dict):
+        if isinstance(body, list):
+            body = {"companies": body}
+        else:
+            body = {}
+
+    current_user = get_current_user_optional()
+    resolved_companies: List[dict] = []
+
+    # 1. Se vieram search_ids
+    search_ids = body.get("search_ids") or body.get("ids")
+    if not search_ids and request.args.get("search_ids"):
+        raw_sids = request.args.get("search_ids", "").split(",")
+        search_ids = [int(s.strip()) for s in raw_sids if s.strip().isdigit()]
+    elif not search_ids and request.args.get("ids"):
+        raw_sids = request.args.get("ids", "").split(",")
+        search_ids = [int(s.strip()) for s in raw_sids if s.strip().isdigit()]
+
+    if search_ids and isinstance(search_ids, list):
+        for sid in search_ids:
+            try:
+                s_rec = db.session.get(CompanySearch, int(sid))
+            except Exception:
+                s_rec = None
+            if s_rec:
+                if s_rec.tenant_id is not None:
+                    if not current_user or current_user.tenant_id != s_rec.tenant_id:
+                        return jsonify({"error": f"Acesso negado: a busca ID {sid} pertence a outra organização."}), 403
+                resolved_companies.append(_search_record_to_pdf_payload(s_rec))
+
+    # 2. Se vieram objetos de empresa diretamente no POST
+    if not resolved_companies:
+        raw_list = body.get("companies") or body.get("empresas") or body.get("items")
+        if isinstance(raw_list, list) and raw_list:
+            for item in raw_list:
+                if isinstance(item, dict):
+                    if any(k in item for k in ("idoneidade_economica", "outcomes", "desfechos_sentencas", "total_processos", "total_processes")):
+                        resolved_companies.append(item)
+                    else:
+                        term = str(item.get("empresa") or item.get("company_name") or item.get("cnpj") or "").strip()
+                        if term:
+                            payload = _find_company_payload_for_pdf(term)
+                            if payload:
+                                resolved_companies.append(payload)
+                            else:
+                                resolved_companies.append({"company_name": term})
+                elif isinstance(item, str) and item.strip():
+                    payload = _find_company_payload_for_pdf(item.strip())
+                    if payload:
+                        resolved_companies.append(payload)
+                    else:
+                        resolved_companies.append({"company_name": item.strip()})
+
+    # 3. Se vieram nomes de empresas por query string
+    if not resolved_companies:
+        names_param = request.args.get("empresas") or request.args.get("companies") or request.args.get("q")
+        if names_param:
+            raw_names = [n.strip() for n in names_param.split(",") if n.strip()]
+            for name in raw_names:
+                payload = _find_company_payload_for_pdf(name)
+                if payload:
+                    resolved_companies.append(payload)
+                else:
+                    resolved_companies.append({"company_name": name})
+
+    if not resolved_companies:
+        return jsonify({
+            "error": "Informe pelo menos 2 empresas (máximo 5) via 'companies', 'empresas' ou 'search_ids' para exportação comparativa."
+        }), 400
+
+    return _build_compare_pdf_response({"companies": resolved_companies[:5]}, filename_hint="comparativo-empresas")
 
 
 @api_bp.route("/cnj-proxy", methods=["GET", "POST", "OPTIONS"])
