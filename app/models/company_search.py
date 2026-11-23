@@ -16,6 +16,7 @@ class CompanySearch(db.Model):
     __tablename__ = "company_searches"
 
     id = db.Column(db.Integer, primary_key=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="SET NULL"), nullable=True, index=True)
     company_name = db.Column(db.String(255), nullable=False, index=True)
     normalized_name = db.Column(db.String(255), nullable=False, index=True)
     total_processes = db.Column(db.Integer, default=0, nullable=False)
@@ -96,6 +97,7 @@ class CompanySearch(db.Model):
 
         return {
             "id": self.id,
+            "tenant_id": self.tenant_id,
             "company_name": self.company_name,
             "normalized_name": self.normalized_name,
             "total_processes": self.total_processes,

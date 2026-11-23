@@ -12,3 +12,11 @@ app/services/orchestrator.py:generic-api-key:276
 app/services/cnj_searcher.py:generic-api-key:213
 .env.example:generic-api-key:19
 app/config.py:generic-api-key:58
+docs/API_CONTRACTS_V3.md:generic-api-key:39
+docs/API_CONTRACTS_V3.md:generic-api-key:61
+docs/API_CONTRACTS_V3.md:generic-api-key:89
+c83416698191fcef71ba9f51a40f5626921ff7cc:docs/API_CONTRACTS_V3.md:generic-api-key:39
+c83416698191fcef71ba9f51a40f5626921ff7cc:docs/API_CONTRACTS_V3.md:generic-api-key:61
+c83416698191fcef71ba9f51a40f5626921ff7cc:docs/API_CONTRACTS_V3.md:generic-api-key:89
+df60d8616cbccda1d614e9061dc14c51b918c15b:tests/test_auth_and_multitenancy.py:generic-api-key:65
+tests/test_auth_and_multitenancy.py:generic-api-key:65
