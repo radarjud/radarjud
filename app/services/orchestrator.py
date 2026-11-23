@@ -483,7 +483,7 @@ class CNJMetadataOrchestrator:
         official_name = ""
         if is_cnpj(company_query):
             official_name = fetch_cnpj_brasilapi(company_query) or ""
-        else:
+        elif not fast_path:
             from app.services.economic_service import find_company_cnpj_by_name
             reg = find_company_cnpj_by_name(company_query)
             if reg and reg.get("razao_social"):

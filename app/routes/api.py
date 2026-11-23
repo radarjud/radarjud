@@ -12,8 +12,10 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Blueprint, Response, request, jsonify, current_app
+from flask import Blueprint, Response, request, jsonify, current_app, g
 from sqlalchemy import text
+
+from app.services.prediction_engine import build_sector_benchmark
 
 from app.extensions import db
 from app.models.company_search import CompanySearch, get_utc_now
@@ -45,6 +47,21 @@ logger = logging.getLogger(__name__)
 CNPJ_REGEX = re.compile(r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b")
 SEARCH_CACHE = {}  # {brand_term.upper(): (timestamp, dict_result)}
 CACHE_TTL = 900    # 15 minutos
+MAX_CACHE_ENTRIES = 200  # Proteção estrita de memória para Render Free (512 MB RAM)
+
+
+def _prune_search_cache_if_needed(max_entries: int = MAX_CACHE_ENTRIES) -> None:
+    """Purga entradas expiradas ou mais antigas do SEARCH_CACHE para mitigar memory leaks no Render Free."""
+    now = time.time()
+    # 1. Purga por TTL
+    expired = [k for k, v in SEARCH_CACHE.items() if (now - v[0]) > CACHE_TTL]
+    for k in expired:
+        SEARCH_CACHE.pop(k, None)
+    # 2. Se ainda exceder o limite máximo, remove as entradas mais antigas
+    if len(SEARCH_CACHE) > max_entries:
+        sorted_keys = sorted(SEARCH_CACHE.keys(), key=lambda k: SEARCH_CACHE[k][0])
+        for k in sorted_keys[: len(SEARCH_CACHE) - max_entries]:
+            SEARCH_CACHE.pop(k, None)
 
 ACTIVE_SEARCH_LOCK = threading.Lock()
 ACTIVE_SEARCH_JOB_ID = None
@@ -1294,6 +1311,203 @@ def get_search_detail(search_id: int):
     except Exception as exc:
         logger.error("Erro ao obter detalhes da pesquisa ID %d: %s", search_id, exc)
         return jsonify({"error": "Registro não encontrado."}), 404
+
+
+@api_bp.route("/compare-companies", methods=["POST"])
+def compare_companies():
+    """
+    Endpoint canônico para benchmarking setorial comparativo entre 2 e 5 empresas.
+
+    Formatos de entrada suportados via JSON:
+    1. { "search_ids": [12, 15] }
+    2. { "cnpjs": ["11.222.333/0001-44", "55.666.777/0001-88"] }
+    3. { "items": [{ "search_id": 12 }, { "cnpj": "55.666.777/0001-88" }] }
+    4. { "companies": ["Nome Empresa 1", "Nome Empresa 2"] }
+
+    Validações e Segurança:
+    - Exige entre 2 e 5 empresas distintas (HTTP 400 em caso de < 2 ou > 5).
+    - Valida e sanitiza todos os termos de entrada via sanitizer.py.
+    - Isolamento de multitenancy defensivo (Anti-IDOR): se g.tenant_id estiver ativo,
+      impede acesso a buscas pertencentes a outros tenants.
+    - Reutiliza 100% dos dados já computados pelo /overview (L0_MEMORY_CACHE ou L1_DATABASE),
+      executando consulta sob demanda apenas para termos inéditos.
+    """
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Payload JSON inválido. Envie um objeto com search_ids, cnpjs ou items."}), 400
+
+    raw_items = []
+    if "search_ids" in data and isinstance(data["search_ids"], list):
+        for sid in data["search_ids"]:
+            raw_items.append({"search_id": sid})
+    elif "cnpjs" in data and isinstance(data["cnpjs"], list):
+        for c in data["cnpjs"]:
+            raw_items.append({"cnpj": c})
+    elif "items" in data and isinstance(data["items"], list):
+        for it in data["items"]:
+            if isinstance(it, dict):
+                raw_items.append(it)
+            elif isinstance(it, int) or (isinstance(it, str) and str(it).isdigit() and len(str(it)) < 10):
+                raw_items.append({"search_id": int(it)})
+            elif isinstance(it, str):
+                raw_items.append({"cnpj": str(it)})
+    elif "companies" in data and isinstance(data["companies"], list):
+        for comp in data["companies"]:
+            if isinstance(comp, dict):
+                raw_items.append(comp)
+            else:
+                raw_items.append({"company_name": str(comp)})
+
+    if len(raw_items) < 2:
+        return jsonify({"error": "É necessário informar entre 2 e 5 empresas para realizar o comparativo setorial."}), 400
+    if len(raw_items) > 5:
+        return jsonify({"error": "O limite máximo para comparação simultânea é de 5 empresas."}), 400
+
+    # Verificação de duplicatas no payload de entrada
+    seen_identifiers = set()
+    for item in raw_items:
+        sid = item.get("search_id") or item.get("id")
+        cnpj_val = item.get("cnpj") or item.get("cnpj_utilizado")
+        name_val = item.get("company_name") or item.get("name") or item.get("empresa")
+        if sid is not None and str(sid).isdigit():
+            key = f"id:{sid}"
+        elif cnpj_val:
+            d_val = re.sub(r"\D", "", str(cnpj_val))
+            key = f"cnpj:{d_val}" if len(d_val) == 14 else f"name:{str(cnpj_val).upper()}"
+        elif name_val:
+            key = f"name:{sanitize_company_name(str(name_val)).upper()}"
+        else:
+            key = f"raw:{str(item)}"
+        seen_identifiers.add(key)
+
+    if len(seen_identifiers) < 2:
+        return jsonify({"error": "Forneça pelo menos 2 empresas distintas para comparação."}), 400
+
+    resolved_payloads: list = [None] * len(raw_items)
+    on_demand_queue: list = []
+
+    for idx, item in enumerate(raw_items):
+        # Se já for um payload completo pré-calculado
+        if isinstance(item, dict) and (
+            item.get("risco_subsidiario") is not None
+            or item.get("score_risco_terceirizacao") is not None
+            or item.get("plus_previsao_condenacao") is not None
+        ) and not (item.get("search_id") and not item.get("empresa")):
+            resolved_payloads[idx] = item
+            continue
+
+        sid = item.get("search_id") or item.get("id")
+        if sid is not None and str(sid).isdigit():
+            sid_int = int(sid)
+            search_record = db.session.get(CompanySearch, sid_int)
+            if not search_record:
+                return jsonify({"error": f"Empresa com ID {sid_int} não encontrada."}), 404
+
+            # Defesa Anti-IDOR contra acesso cruzado de tenants
+            req_tenant_id = getattr(g, "tenant_id", None)
+            if req_tenant_id is None and request.headers.get("X-Tenant-ID"):
+                req_tenant_id = request.headers.get("X-Tenant-ID")
+
+            if (hasattr(CompanySearch, "tenant_id") or hasattr(search_record, "tenant_id")) and req_tenant_id is not None:
+                rec_tenant_id = getattr(search_record, "tenant_id", None)
+                if rec_tenant_id is not None and str(rec_tenant_id) != str(req_tenant_id):
+                    return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
+
+            resolved_payloads[idx] = _search_record_to_pdf_payload(search_record)
+            continue
+
+        raw_term = str(item.get("cnpj") or item.get("company_name") or item.get("name") or "").strip()
+        if not raw_term:
+            return jsonify({"error": "Item de busca vazio ou sem identificador válido."}), 400
+
+        # Sanitização da entrada
+        if not is_valid_company_search_input(raw_term):
+            return jsonify({"error": f"Identificador de empresa inválido: '{raw_term}'. Forneça Razão Social ou CNPJ válido."}), 400
+
+        # Busca no L0 (Memory Cache) ou L1 (Database)
+        cached_payload = _find_company_payload_for_pdf(raw_term)
+        if cached_payload:
+            resolved_payloads[idx] = cached_payload
+            continue
+
+        on_demand_queue.append((idx, raw_term))
+
+    # Execução concorrente via ThreadPoolExecutor para termos inéditos fora de cache (baixa latência no Render Free)
+    if on_demand_queue:
+        def _fetch_company_on_demand(term: str) -> dict:
+            def _brasil_api_fetcher_with_timeout(cnpj: str) -> Optional[str]:
+                return fetch_cnpj_brasilapi(cnpj, timeout=5)
+
+            strat = resolve_search_strategy(term, brasil_api_fetcher=_brasil_api_fetcher_with_timeout)
+            q_term = strat["comunica_query_term"]
+            d_title = strat["display_title"]
+            target_cnpj = strat.get("target_cnpj")
+
+            fast_res = orchestrator.analyze_company_by_name(
+                company_name=q_term,
+                target_cnpj=target_cnpj,
+                max_items_first_page=50,
+                search_strategy=strat,
+            )
+            fast_res["empresa"] = d_title
+            fast_res["is_broad_brand"] = strat.get("is_broad_brand", False)
+            fast_res["search_strategy"] = strat
+
+            econ = economic_service.evaluate_economic_standing(
+                company_name=d_title,
+                cnpj=target_cnpj,
+                company_processes=fast_res.get("processos", []),
+                p_condenacao_trabalhista=fast_res.get("probabilidade_condenacao_geral_pct") or 0.0,
+                search_strategy=strat,
+            )
+            fast_res["idoneidade_economica"] = econ
+            if econ.get("indice_exposicao_financeira") is not None:
+                fast_res["indice_exposicao_financeira"] = econ["indice_exposicao_financeira"]
+                fast_res["score_risco_terceirizacao"] = econ["indice_exposicao_financeira"]
+                fast_res["overall_risk_score"] = econ["indice_exposicao_financeira"]
+
+            ckey = strat.get("cache_key") or f"{strat['mode']}::{q_term}::{target_cnpj or ''}"
+            _prune_search_cache_if_needed()
+            SEARCH_CACHE[ckey] = (time.time(), fast_res)
+            return fast_res
+
+        if len(on_demand_queue) == 1:
+            idx, term = on_demand_queue[0]
+            try:
+                resolved_payloads[idx] = _fetch_company_on_demand(term)
+            except Exception as search_err:
+                logger.error("Erro na busca sob demanda para comparativo ('%s'): %s", term, search_err)
+                return jsonify({"error": f"Não foi possível processar a empresa '{term}' para o comparativo."}), 500
+        else:
+            with ThreadPoolExecutor(max_workers=min(len(on_demand_queue), 4)) as executor:
+                future_to_item = {
+                    executor.submit(_fetch_company_on_demand, term): (idx, term)
+                    for idx, term in on_demand_queue
+                }
+                for future in as_completed(future_to_item, timeout=15.0):
+                    idx, term = future_to_item[future]
+                    try:
+                        resolved_payloads[idx] = future.result(timeout=15.0)
+                    except Exception as search_err:
+                        logger.error("Erro na busca concorrente sob demanda ('%s'): %s", term, search_err)
+                        return jsonify({"error": f"Não foi possível processar a empresa '{term}' para o comparativo."}), 500
+
+    # Validação de unicidade das empresas resolvidas
+    unique_resolved = set()
+    for p in resolved_payloads:
+        p_cnpj = re.sub(r"\D", "", str(p.get("cnpj") or (p.get("idoneidade_economica") or {}).get("cnpj_utilizado") or ""))
+        p_name = sanitize_company_name(str(p.get("empresa") or p.get("company_name") or "")).upper()
+        unique_resolved.add(p_cnpj if p_cnpj else p_name)
+
+    if len(unique_resolved) < 2:
+        return jsonify({"error": "Forneça pelo menos 2 empresas distintas para comparação."}), 400
+
+    try:
+        benchmark = build_sector_benchmark(resolved_payloads)
+        return jsonify(benchmark), 200
+    except Exception as bench_err:
+        logger.exception("Erro ao gerar benchmarking setorial: %s", bench_err)
+        return jsonify({"error": "Erro interno ao processar o comparativo setorial."}), 500
 
 
 # =============================================================================
