@@ -1,10 +1,13 @@
 # Copyright (c) 2026 Equipe RadarJus - Todos os direitos reservados (Lei nº 9.609/1998).
 # Proibida a reprodução, distribuição ou uso comercial sem autorização expressa dos autores.
 
+import os
 import re
 import sys
 import time
 import uuid
+import math
+import hmac
 import asyncio
 import logging
 import threading
@@ -16,6 +19,7 @@ from flask import Blueprint, Response, request, jsonify, current_app, g
 from sqlalchemy import text
 
 from app.services.prediction_engine import build_sector_benchmark
+from app.utils.rate_limiter import limit_rate
 
 from app.extensions import db
 from app.models.company_search import CompanySearch, get_utc_now
@@ -417,6 +421,7 @@ def run_agent_pipeline():
 @api_bp.route("/company-dashboard", methods=["POST"])
 @api_bp.route("/search-company", methods=["POST", "GET"])
 @api_bp.route("/search", methods=["POST", "GET"])
+@limit_rate(max_requests=60, window_seconds=60)
 def search_company():
     """
     Endpoint principal para pesquisa e diagnóstico de risco de fornecedores/terceiros.
@@ -1410,6 +1415,304 @@ def incremental_sync(search_id: int):
         return jsonify({"error": "Falha na sincronização incremental."}), 500
 
 
+@api_bp.route("/ingest-deep-scan", methods=["POST"])
+@limit_rate(max_requests=30, window_seconds=60)
+def ingest_deep_scan():
+    """
+    Endpoint canônico para ingestão em lote de varredura profunda (Deep Scan)
+    proveniente do navegador ou robôs assíncronos.
+    - Validação de payload e limite de 2.000 itens (HTTP 413 se excedido).
+    - Deduplicação inteligente por número CNJ normalizado (20 dígitos).
+    - Preserva processos já existentes e mescla novas ocorrências.
+    - Reavaliação estatística completa sobre 100% dos processos (sem fatiamento artificial [:50]/[:100]).
+    - Invariante estrita: soma dos desfechos == total de processos consolidados.
+    - Regra estrita de bloqueio para zero condenações (0.0%).
+    - Isolamento de Multitenancy defensivo (Anti-IDOR).
+    - Atualização dos caches L0 (SEARCH_CACHE) e banco L1.
+    """
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Payload JSON inválido. Um objeto JSON é esperado."}), 400
+
+    search_id = data.get("search_id")
+    if search_id is None or not isinstance(search_id, int):
+        return jsonify({"error": "Campo 'search_id' obrigatório e deve ser um número inteiro."}), 400
+
+    items = data.get("items")
+    if items is None or not isinstance(items, list) or len(items) == 0:
+        return jsonify({"error": "Campo 'items' obrigatório e deve ser uma lista não vazia."}), 400
+
+    if len(items) > 2000:
+        return jsonify({"error": "O lote de ingestão excede o limite máximo de 2.000 itens por requisição."}), 413
+
+    is_final_batch = bool(data.get("is_final_batch", True))
+
+    try:
+        search = db.session.get(CompanySearch, search_id) if hasattr(db.session, "get") else CompanySearch.query.get(search_id)
+        if not search:
+            return jsonify({"error": f"Registro de busca ID {search_id} não encontrado."}), 404
+
+        # Isolamento de Multitenancy defensivo (Anti-IDOR)
+        req_tenant_id = getattr(g, "tenant_id", None)
+        if req_tenant_id is None and request.headers.get("X-Tenant-ID"):
+            req_tenant_id = request.headers.get("X-Tenant-ID")
+
+        if req_tenant_id is not None:
+            rec_tenant_id = getattr(CompanySearch, "tenant_id", None)
+            if isinstance(rec_tenant_id, (int, str)):
+                tenant_val = rec_tenant_id
+            else:
+                tenant_val = getattr(search, "tenant_id", None)
+
+            if tenant_val is not None and str(tenant_val) != str(req_tenant_id):
+                return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
+
+        existing_records = {p.numero_processo: p for p in search.processes if p.numero_processo}
+
+        new_records = []
+        discovered_entities = set()
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            raw_num = (
+                item.get("numero_processo")
+                or item.get("numeroProcesso")
+                or item.get("numeroprocessocommascara")
+            )
+            cnj = orchestrator.searcher.normalize_cnj(raw_num) if raw_num else None
+            if not cnj:
+                continue
+
+            if cnj in existing_records:
+                existing_p = existing_records[cnj]
+                item_outcome = item.get("sentence_outcome") or item.get("statusDesfecho")
+                if existing_p.sentence_outcome == "em_aberto" and item_outcome and item_outcome != "em_aberto":
+                    existing_p.sentence_outcome = item_outcome
+                continue
+
+            if item.get("primary_subject") or item.get("sentence_outcome"):
+                tribunal = str(item.get("tribunal") or item.get("siglaTribunal") or "N/A")[:50]
+                grau = str(item.get("grau") or "G1")[:50]
+                sigilo_raw = item.get("nivel_sigilo") if item.get("nivel_sigilo") is not None else item.get("nivelSigilo", 0)
+                try:
+                    nivel_sigilo = int(sigilo_raw)
+                except (ValueError, TypeError):
+                    nivel_sigilo = 0
+                primary_sub = item.get("primary_subject") or "Obrigação / Reclamação em Apuração Inicial"
+                subjects_list = item.get("subjects") or [primary_sub]
+                outcome = item.get("sentence_outcome") or "em_aberto"
+                has_expert = bool(item.get("has_expert_report", False))
+                obs = item.get("observation")
+                parsed_proc = item
+            else:
+                single_map = {}
+                orchestrator.searcher._parse_comunica_items([item], single_map, discovered_entities)
+                com_data = single_map.get(cnj, {})
+                parsed_proc = orchestrator.searcher._merge_process_data_fast(cnj, com_data, None)
+                tribunal = str(parsed_proc.get("tribunal") or "N/A")[:50]
+                grau = str(parsed_proc.get("grau") or "G1")[:50]
+                nivel_sigilo = int(parsed_proc.get("nivel_sigilo") or 0)
+                primary_sub = parsed_proc.get("primary_subject")
+                subjects_list = [s.get("nome") for s in parsed_proc.get("assuntos", []) if isinstance(s, dict) and s.get("nome")]
+                outcome = parsed_proc.get("sentence_outcome") or "em_aberto"
+                has_expert = bool(parsed_proc.get("has_expert_report", False))
+                obs = parsed_proc.get("observation")
+
+            record = ProcessRecord(
+                company_search_id=search.id,
+                numero_processo=cnj,
+                tribunal=tribunal,
+                grau=grau,
+                nivel_sigilo=nivel_sigilo,
+                primary_subject=primary_sub,
+                subjects_json=subjects_list,
+                observation=obs,
+                sentence_outcome=outcome,
+                has_expert_report=has_expert,
+                raw_metadata=parsed_proc,
+            )
+            new_records.append(record)
+            existing_records[cnj] = record
+
+        if new_records:
+            for i in range(0, len(new_records), 50):
+                db.session.bulk_save_objects(new_records[i : i + 50])
+                db.session.commit()
+
+        # Recarrega a totalidade dos processos consolidados (100% da base sem truncamentos)
+        all_processes = ProcessRecord.query.filter_by(company_search_id=search.id).all()
+        proc_dicts = []
+        for p in all_processes:
+            d = p.to_dict()
+            if isinstance(p.raw_metadata, dict):
+                for k, v in p.raw_metadata.items():
+                    if k not in d:
+                        d[k] = v
+            proc_dicts.append(d)
+
+        fresh_metrics = orchestrator.predictor.generate_dashboard_metrics(search.company_name, proc_dicts)
+
+        p_cond = fresh_metrics.get("probabilidade_condenacao_geral_pct") or fresh_metrics.get("score_risco_terceirizacao") or 0.0
+        econ_data = economic_service.evaluate_economic_standing(
+            company_name=search.company_name,
+            company_processes=proc_dicts,
+            p_condenacao_trabalhista=p_cond,
+        )
+
+        ai_payload = {**fresh_metrics, "empresa": search.company_name, "processos": proc_dicts}
+        ai_res = orchestrator.ai_analyzer.analyze_company(ai_payload)
+
+        search.total_processes = len(all_processes)
+        secrecy_count = sum(1 for p in all_processes if p.nivel_sigilo and p.nivel_sigilo > 0)
+        search.secrecy_count = secrecy_count
+        search.secrecy_rate = round(secrecy_count / len(all_processes), 4) if all_processes else 0.0
+        search.outcomes_summary = fresh_metrics.get("desfechos_sentencas", {})
+        search.ranking_motivos = fresh_metrics.get("ranking_motivos", [])
+        search.ranking_motivos_condenacao = fresh_metrics.get("ranking_motivos_condenacao", [])
+        search.predictions_summary = fresh_metrics.get("plus_previsao_condenacao", [])
+        search.overall_risk_score = fresh_metrics.get("score_risco_terceirizacao", 0.0)
+        search.economic_standing = econ_data
+        search.ai_analysis = ai_res
+        search.scan_status = "COMPLETED" if is_final_batch else "PARTIAL_FAST_PATH"
+        search.movements_hash = generate_movements_hash(proc_dicts)
+        search.last_checked_at = get_utc_now()
+        db.session.commit()
+
+        cache_key = search.normalized_name.upper()
+        SEARCH_CACHE[cache_key] = (time.time(), search.to_dict())
+        _prune_search_cache_if_needed()
+
+        condenacoes = search.outcomes_summary.get("condenacoes", 0) if search.outcomes_summary else 0
+        previsao_bloqueada = (condenacoes == 0)
+        prob_pct = None if previsao_bloqueada else fresh_metrics.get("probabilidade_condenacao_geral_pct")
+
+        return jsonify({
+            "status": "success",
+            "search_id": search.id,
+            "company_name": search.company_name,
+            "scan_status": search.scan_status,
+            "total_processes": search.total_processes,
+            "ingested_count": len(new_records),
+            "desfechos_sentencas": search.outcomes_summary or {},
+            "score_risco_terceirizacao": search.overall_risk_score,
+            "probabilidade_condenacao_geral_pct": prob_pct,
+            "previsao_bloqueada": previsao_bloqueada,
+        }), 200
+
+    except Exception as exc:
+        db.session.rollback()
+        logger.exception("Erro durante ingest-deep-scan para search_id %d: %s", search_id, exc)
+        return jsonify({"error": f"Erro interno ao processar ingestão: {str(exc)}"}), 500
+
+
+@api_bp.route("/searches/<int:search_id>/processes", methods=["GET"])
+def get_search_processes(search_id: int):
+    """
+    Retorna a listagem paginada e filtrada dos processos consolidados de uma empresa.
+    Query parameters:
+    - page: int (padrão 1)
+    - per_page: int (padrão 20, máximo 100)
+    - tribunal: string opcional (ex: TRT2, TST)
+    - outcome: string opcional (condenacao, acordo, improcedente, em_aberto)
+    - search: string opcional (busca textual por CNJ, assunto ou observação)
+    """
+    try:
+        search = db.session.get(CompanySearch, search_id) if hasattr(db.session, "get") else CompanySearch.query.get(search_id)
+        if not search:
+            return jsonify({"error": f"Pesquisa ID {search_id} não encontrada."}), 404
+
+        req_tenant_id = getattr(g, "tenant_id", None)
+        if req_tenant_id is None and request.headers.get("X-Tenant-ID"):
+            req_tenant_id = request.headers.get("X-Tenant-ID")
+
+        if req_tenant_id is not None:
+            rec_tenant_id = getattr(CompanySearch, "tenant_id", None)
+            if isinstance(rec_tenant_id, (int, str)):
+                tenant_val = rec_tenant_id
+            else:
+                tenant_val = getattr(search, "tenant_id", None)
+
+            if tenant_val is not None and str(tenant_val) != str(req_tenant_id):
+                return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
+
+        try:
+            page = max(1, int(request.args.get("page", 1)))
+        except (ValueError, TypeError):
+            page = 1
+
+        try:
+            per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+        except (ValueError, TypeError):
+            per_page = 20
+
+        query = ProcessRecord.query.filter_by(company_search_id=search.id)
+
+        tribunal = request.args.get("tribunal")
+        if tribunal and tribunal.strip():
+            query = query.filter(ProcessRecord.tribunal.ilike(f"%{tribunal.strip()}%"))
+
+        outcome = request.args.get("outcome")
+        if outcome and outcome.strip():
+            o = outcome.strip().lower()
+            if o in ("condenacao", "condenacoes", "condenação", "condenações"):
+                query = query.filter(ProcessRecord.sentence_outcome.in_(["condenacoes", "condenacao"]))
+            elif o in ("acordo", "acordos"):
+                query = query.filter(ProcessRecord.sentence_outcome.in_(["acordos", "acordo"]))
+            elif o in ("improcedente", "improcedentes"):
+                query = query.filter(ProcessRecord.sentence_outcome.in_(["improcedentes", "improcedente"]))
+            elif o in ("em_aberto", "aberto"):
+                query = query.filter(ProcessRecord.sentence_outcome.in_(["em_aberto", "aberto"]))
+            else:
+                query = query.filter(ProcessRecord.sentence_outcome == o)
+
+        search_query = request.args.get("search")
+        if search_query and search_query.strip():
+            sq = f"%{search_query.strip()}%"
+            query = query.filter(
+                db.or_(
+                    ProcessRecord.numero_processo.ilike(sq),
+                    ProcessRecord.primary_subject.ilike(sq),
+                    ProcessRecord.observation.ilike(sq),
+                )
+            )
+
+        total_matches = query.count()
+        total_pages = max(1, math.ceil(total_matches / per_page))
+        offset = (page - 1) * per_page
+        records = query.order_by(ProcessRecord.id.asc()).offset(offset).limit(per_page).all()
+
+        processes_data = [
+            {
+                "id": r.id,
+                "numero_processo": r.numero_processo,
+                "tribunal": r.tribunal,
+                "grau": r.grau,
+                "primary_subject": r.primary_subject,
+                "sentence_outcome": r.sentence_outcome,
+                "has_expert_report": r.has_expert_report,
+                "observation": r.observation,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in records
+        ]
+
+        return jsonify({
+            "search_id": search.id,
+            "company_name": search.company_name,
+            "page": page,
+            "per_page": per_page,
+            "total": total_matches,
+            "total_pages": total_pages,
+            "processes": processes_data,
+        }), 200
+
+    except Exception as exc:
+        logger.exception("Erro ao listar processos da busca ID %d: %s", search_id, exc)
+        return jsonify({"error": f"Erro interno ao listar processos: {str(exc)}"}), 500
+
+
 @api_bp.route("/history", methods=["GET", "DELETE"])
 def get_search_history():
     """
@@ -1524,6 +1827,7 @@ def get_search_detail(search_id: int):
 
 
 @api_bp.route("/compare-companies", methods=["POST"])
+@limit_rate(max_requests=60, window_seconds=60)
 def compare_companies():
     """
     Endpoint canônico para benchmarking setorial comparativo entre 2 e 5 empresas.
@@ -2036,8 +2340,18 @@ def cnj_proxy():
         resp = Response("", status=204)
         resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, chave-api-dados, X-Target-Url"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, chave-api-dados, X-Target-Url, x-proxy-secret"
         return resp
+
+    expected_secret = (os.getenv("PROXY_SHARED_SECRET") or os.getenv("CNJ_PROXY_SECRET") or "").strip()
+    if expected_secret:
+        auth_header = flask_req.headers.get("Authorization", "").strip()
+        bearer_secret = auth_header[7:].strip() if auth_header.startswith("Bearer ") else auth_header
+        provided_secret = (flask_req.headers.get("x-proxy-secret") or bearer_secret or "").strip()
+        if not hmac.compare_digest(provided_secret, expected_secret):
+            return jsonify({"error": "Unauthorized proxy access"}), 401
+    else:
+        logger.warning("[Proxy Warning] PROXY_SHARED_SECRET não configurado. Modo aberto para desenvolvimento.")
 
     target_url = flask_req.args.get("target") or flask_req.headers.get("X-Target-Url")
     if not target_url:

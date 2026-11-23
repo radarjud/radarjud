@@ -2,7 +2,9 @@ import time
 import random
 import logging
 import threading
-from typing import Callable, Any, Optional
+import math
+from typing import Callable, Any, Dict, List, Tuple
+from functools import wraps
 import requests
 
 logger = logging.getLogger(__name__)
@@ -119,3 +121,97 @@ def with_exponential_backoff(
             )
             time.sleep(wait_time)
 
+
+class SlidingWindowRateLimiter:
+    """
+    Controlador de taxa de requisições inbound baseado em Janela Deslizante (Sliding Window).
+    Leve, thread-safe e seguro para o limite de 512 MB RAM do Render Free.
+    Segmenta chamadas por IP e por tenant_id (quando autenticado).
+    """
+
+    def __init__(self, max_requests: int = 60, window_seconds: int = 60):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._history: Dict[str, List[float]] = {}
+        self._lock = threading.Lock()
+
+    def check(self, client_key: str) -> Tuple[bool, int]:
+        """
+        Avalia se a requisição é permitida na janela atual.
+        Retorna (permitido: bool, retry_after: int em segundos).
+        """
+        now = time.time()
+        cutoff = now - self.window_seconds
+
+        with self._lock:
+            # Purga periódica para prevenir memory leaks quando o mapa acumula muitas chaves
+            if len(self._history) > 500:
+                self._prune_stale(cutoff)
+
+            timestamps = self._history.get(client_key, [])
+            valid_timestamps = [ts for ts in timestamps if ts > cutoff]
+
+            if len(valid_timestamps) >= self.max_requests:
+                earliest = valid_timestamps[0]
+                retry_after = max(1, int(math.ceil(earliest + self.window_seconds - now)))
+                self._history[client_key] = valid_timestamps
+                return False, retry_after
+
+            valid_timestamps.append(now)
+            self._history[client_key] = valid_timestamps
+            return True, 0
+
+    def _prune_stale(self, cutoff: float) -> None:
+        stale_keys = [k for k, v in self._history.items() if not v or v[-1] <= cutoff]
+        for k in stale_keys:
+            self._history.pop(k, None)
+
+    def reset(self) -> None:
+        """Limpa todo o histórico em memória (útil para testes unitários)."""
+        with self._lock:
+            self._history.clear()
+
+
+def get_client_rate_limit_key() -> str:
+    """Gera chave única do cliente para rate limiting baseada em tenant_id ou IP de origem."""
+    try:
+        from flask import request as flask_req, g
+        tenant_id = getattr(g, "tenant_id", None) or flask_req.headers.get("X-Tenant-ID")
+        if tenant_id:
+            return f"tenant:{tenant_id}"
+        forwarded = flask_req.headers.get("X-Forwarded-For")
+        if forwarded:
+            ip = forwarded.split(",")[0].strip()
+            return f"ip:{ip}"
+        return f"ip:{flask_req.remote_addr or '127.0.0.1'}"
+    except Exception:
+        return "ip:127.0.0.1"
+
+
+def limit_rate(max_requests: int = 60, window_seconds: int = 60):
+    """
+    Decorator para proteção contra abuso/bots em rotas críticas da API.
+    Retorna HTTP 429 com cabeçalho 'Retry-After' em caso de excedente.
+    """
+    limiter = SlidingWindowRateLimiter(max_requests=max_requests, window_seconds=window_seconds)
+
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            from flask import jsonify
+            client_key = f"{f.__name__}:{get_client_rate_limit_key()}"
+            allowed, retry_after = limiter.check(client_key)
+            if not allowed:
+                response = jsonify({
+                    "error": "Limite de requisições excedido. Por favor, aguarde antes de tentar novamente.",
+                    "retry_after": retry_after
+                })
+                response.status_code = 429
+                response.headers["Retry-After"] = str(retry_after)
+                return response
+            return f(*args, **kwargs)
+
+        wrapper.limiter = limiter
+        return wrapper
+
+    return decorator
