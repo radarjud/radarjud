@@ -6,7 +6,7 @@ import math
 import logging
 import unicodedata
 from collections import Counter, defaultdict
-from typing import Dict, List, Any, Optional, Tuple, Union
+from typing import Dict, List, Any, Optional, Tuple, Union, TypedDict
 
 from app.services.tpu_constants import (
     TPU_SUBJECT_BASELINES,
@@ -930,7 +930,35 @@ def _format_capital_brl(num: Union[int, float]) -> str:
     return f"R$ {float(num):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def build_sector_benchmark(company_payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+class RankedCompanySummary(TypedDict, total=False):
+    posicao_ranking: int
+    empresa: str
+    cnpj: str
+    capital_social: str
+    capital_social_num: float
+    risco_subsidiario: float
+    probabilidade_condenacao: float
+    faixa_decisao: str
+    recomendacao: str
+    ic_90: Dict[str, float]
+    ic_90_inferior: float
+    ic_90_superior: float
+    cenario: str
+    cenario_tipo: str
+    total_processos: int
+    previsao_bloqueada: bool
+    cnae_codigo: Optional[str]
+    cnae_descricao: Optional[str]
+
+
+class SectorBenchmarkResponse(TypedDict):
+    empresas_ranqueadas: List[RankedCompanySummary]
+    resumo_setorial: Dict[str, Any]
+    grafico_comparativo: Dict[str, Any]
+    parecer_comparativo: Dict[str, Any]
+
+
+def build_sector_benchmark(company_payloads: List[Dict[str, Any]]) -> SectorBenchmarkResponse:
     """
     Motor de Benchmarking Setorial com Ranqueamento Bayesiano, Classificação em 3 Faixas e IC 90%.
 

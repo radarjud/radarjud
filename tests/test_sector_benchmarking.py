@@ -464,3 +464,38 @@ def test_mixed_payload_inputs_combining_ids_cnpjs_and_names(client, app):
     assert ranks == [1, 2, 3]
     assert data["empresas_ranqueadas"][0]["empresa"] == "Empresa Cadastrada Banco LTDA"
 
+
+def test_endpoint_error_handling_edge_cases(client):
+    """
+    Cobre cenários defensivos adicionais de erro no endpoint /compare-companies:
+    - Payload JSON inválido (não-objeto ou malformado)
+    - Lista vazia de itens
+    - Search_id inexistente no banco (retorno 404)
+    - Itens vazios ou nulos
+    """
+    # 1. Payload não-dicionário
+    res_list = client.post("/api/v1/compare-companies", json=["item1", "item2"])
+    assert res_list.status_code == 400
+    assert "Payload JSON inválido" in res_list.get_json()["error"]
+
+    # 2. Lista vazia
+    res_empty = client.post("/api/v1/compare-companies", json={"items": []})
+    assert res_empty.status_code == 400
+    assert "entre 2 e 5 empresas" in res_empty.get_json()["error"]
+
+    # 3. Search ID inexistente
+    res_404 = client.post(
+        "/api/v1/compare-companies",
+        json={"search_ids": [99999999, 88888888]},
+    )
+    assert res_404.status_code == 404
+    assert "não encontrada" in res_404.get_json()["error"]
+
+    # 4. Item com identificador vazio
+    res_blank = client.post(
+        "/api/v1/compare-companies",
+        json={"items": [{"cnpj": ""}, {"company_name": "Empresa Teste"}]},
+    )
+    assert res_blank.status_code == 400
+    assert "vazio ou sem identificador" in res_blank.get_json()["error"]
+

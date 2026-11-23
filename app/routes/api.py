@@ -47,6 +47,21 @@ logger = logging.getLogger(__name__)
 CNPJ_REGEX = re.compile(r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b")
 SEARCH_CACHE = {}  # {brand_term.upper(): (timestamp, dict_result)}
 CACHE_TTL = 900    # 15 minutos
+MAX_CACHE_ENTRIES = 200  # Proteção estrita de memória para Render Free (512 MB RAM)
+
+
+def _prune_search_cache_if_needed(max_entries: int = MAX_CACHE_ENTRIES) -> None:
+    """Purga entradas expiradas ou mais antigas do SEARCH_CACHE para mitigar memory leaks no Render Free."""
+    now = time.time()
+    # 1. Purga por TTL
+    expired = [k for k, v in SEARCH_CACHE.items() if (now - v[0]) > CACHE_TTL]
+    for k in expired:
+        SEARCH_CACHE.pop(k, None)
+    # 2. Se ainda exceder o limite máximo, remove as entradas mais antigas
+    if len(SEARCH_CACHE) > max_entries:
+        sorted_keys = sorted(SEARCH_CACHE.keys(), key=lambda k: SEARCH_CACHE[k][0])
+        for k in sorted_keys[: len(SEARCH_CACHE) - max_entries]:
+            SEARCH_CACHE.pop(k, None)
 
 ACTIVE_SEARCH_LOCK = threading.Lock()
 ACTIVE_SEARCH_JOB_ID = None
@@ -1420,7 +1435,10 @@ def compare_companies():
     # Execução concorrente via ThreadPoolExecutor para termos inéditos fora de cache (baixa latência no Render Free)
     if on_demand_queue:
         def _fetch_company_on_demand(term: str) -> dict:
-            strat = resolve_search_strategy(term, brasil_api_fetcher=fetch_cnpj_brasilapi)
+            def _brasil_api_fetcher_with_timeout(cnpj: str) -> Optional[str]:
+                return fetch_cnpj_brasilapi(cnpj, timeout=5)
+
+            strat = resolve_search_strategy(term, brasil_api_fetcher=_brasil_api_fetcher_with_timeout)
             q_term = strat["comunica_query_term"]
             d_title = strat["display_title"]
             target_cnpj = strat.get("target_cnpj")
@@ -1449,6 +1467,7 @@ def compare_companies():
                 fast_res["overall_risk_score"] = econ["indice_exposicao_financeira"]
 
             ckey = strat.get("cache_key") or f"{strat['mode']}::{q_term}::{target_cnpj or ''}"
+            _prune_search_cache_if_needed()
             SEARCH_CACHE[ckey] = (time.time(), fast_res)
             return fast_res
 
@@ -1465,10 +1484,10 @@ def compare_companies():
                     executor.submit(_fetch_company_on_demand, term): (idx, term)
                     for idx, term in on_demand_queue
                 }
-                for future in as_completed(future_to_item):
+                for future in as_completed(future_to_item, timeout=15.0):
                     idx, term = future_to_item[future]
                     try:
-                        resolved_payloads[idx] = future.result()
+                        resolved_payloads[idx] = future.result(timeout=15.0)
                     except Exception as search_err:
                         logger.error("Erro na busca concorrente sob demanda ('%s'): %s", term, search_err)
                         return jsonify({"error": f"Não foi possível processar a empresa '{term}' para o comparativo."}), 500
