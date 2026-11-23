@@ -673,6 +673,10 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
     return buf.getvalue()
 
 
+def _pdf_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
 def _generate_pdf_pure_python(report: Dict[str, Any]) -> bytes:
     """
     Gerador PDF 1.4 puro em Python (zero dependências externas).
@@ -728,9 +732,6 @@ def _generate_pdf_pure_python(report: Dict[str, Any]) -> bytes:
             wrapped_lines.append(clean[:cut])
             clean = "   " + clean[cut:].lstrip()
         wrapped_lines.append(clean)
-
-    def _pdf_escape(s: str) -> str:
-        return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
     content_ops = ["BT", "/F1 9 Tf", "40 800 Td", "13 TL"]
     for i, ln in enumerate(wrapped_lines[:56]):

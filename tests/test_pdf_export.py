@@ -1,6 +1,6 @@
 import time
 import tracemalloc
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 from urllib.parse import quote
 
 from app.extensions import db
@@ -8,7 +8,6 @@ from app.models.company_search import CompanySearch, get_utc_now
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.routes.api import SEARCH_CACHE
-from app.utils.jwt import create_access_token
 from app.services.pdf_report import (
     _generate_pdf_pure_python,
     generate_company_report_pdf,
@@ -20,6 +19,7 @@ from app.services.pdf_svg_charts import (
     generate_comparative_bars_svg,
     generate_outcomes_simplex_svg,
 )
+from app.utils.jwt import create_access_token
 
 
 def _sample_bradesco_payload():
@@ -418,7 +418,7 @@ def test_pdf_export_memory_profile_under_render_limits():
             p2 = generate_comparative_report_pdf([payload, payload])
             assert len(p2) > 0
 
-        current, peak = tracemalloc.get_traced_memory()
+        _current, peak = tracemalloc.get_traced_memory()
         # 420 MB em bytes
         max_limit_bytes = 420 * 1024 * 1024
         assert peak < max_limit_bytes, f"Pico de memória ({peak / 1024 / 1024:.2f} MB) excedeu o teto de 420 MB."

@@ -5,7 +5,7 @@ Gera strings XML SVG limpas, determinísticas e compatíveis com WeasyPrint e na
 """
 
 import html
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 
 def _clamp(val: float, min_val: float = 0.0, max_val: float = 100.0) -> float:
@@ -27,7 +27,7 @@ def _to_float(val: Any, default: float = 0.0) -> float:
 
 
 def generate_outcomes_simplex_svg(
-    outcomes: Optional[Dict[str, Any]] = None,
+    outcomes: dict[str, Any] | None = None,
     width: int = 520,
     height: int = 68,
 ) -> str:
@@ -77,7 +77,7 @@ def generate_outcomes_simplex_svg(
     x_aberto = x_improc + w_improc
 
     # Monta os segmentos da barra empilhada com clip-path para bordas arredondadas perfeitas
-    segments: List[str] = []
+    segments: list[str] = []
     if w_cond > 0:
         segments.append(
             f'    <rect x="0" y="{bar_y}" width="{w_cond:.2f}" height="{bar_h}" fill="#dc2626"/>'
@@ -107,7 +107,7 @@ def generate_outcomes_simplex_svg(
         ("#64748b", f"Em Aberto: {aberto} ({p_aberto:.1f}%)", 3),
     ]
 
-    legends_svg: List[str] = []
+    legends_svg: list[str] = []
     for color, text, idx in items:
         lx = idx * col_w
         escaped_txt = html.escape(text)
@@ -158,9 +158,11 @@ def generate_bayes_vs_sumula331_svg(
     else:
         val_bayes = _clamp(raw_bayes)
 
-    svg_lines: List[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
-        f'width="{width}" height="{height}" class="bayes-comparison-chart">'
+    svg_lines: list[str] = [
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
+            f'width="{width}" height="{height}" class="bayes-comparison-chart">'
+        )
     ]
 
     track_x = 180.0
@@ -234,7 +236,7 @@ def generate_bayes_vs_sumula331_svg(
         # Escala de referência (0%, 25%, 50%, 75%, 100%)
         scale_y = 78.0
         ticks = [0, 25, 50, 75, 100]
-        svg_lines.append(f'  <!-- Escala Numérica -->\n  <g opacity="0.6">')
+        svg_lines.append('  <!-- Escala Numérica -->\n  <g opacity="0.6">')
         for t in ticks:
             tx = track_x + (t / 100.0) * track_w
             svg_lines.append(
@@ -242,16 +244,16 @@ def generate_bayes_vs_sumula331_svg(
                 f'    <text x="{tx:.1f}" y="{scale_y + 14}" text-anchor="middle" fill="#64748b" '
                 f'font-family="Inter, -apple-system, sans-serif" font-size="8.5">{t}%</text>'
             )
-        svg_lines.append(f'  </g>')
+        svg_lines.append('  </g>')
 
     svg_lines.append("</svg>")
     return "\n".join(svg_lines)
 
 
 def generate_comparative_bars_svg(
-    companies: List[Dict[str, Any]],
+    companies: list[dict[str, Any]],
     width: int = 540,
-    height: Optional[int] = None,
+    height: int | None = None,
 ) -> str:
     """
     Gera gráfico de barras horizontais comparando de 2 a 5 empresas.
@@ -273,9 +275,11 @@ def generate_comparative_bars_svg(
     header_height = 20
     calc_h = height or (header_height + len(selected) * row_height + 15)
 
-    svg_lines: List[str] = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {calc_h}" '
-        f'width="{width}" height="{calc_h}" class="comparative-bars-chart">'
+    svg_lines: list[str] = [
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {calc_h}" '
+            f'width="{width}" height="{calc_h}" class="comparative-bars-chart">'
+        )
     ]
 
     label_w = 160.0

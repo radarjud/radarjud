@@ -14,7 +14,7 @@ import threading
 from pathlib import Path
 import gc
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Blueprint, Response, request, jsonify, current_app, g
 from sqlalchemy import text
