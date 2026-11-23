@@ -356,6 +356,8 @@ def test_pdf_export_comparative_endpoints(client, app):
         db.session.add(search_t2)
         db.session.commit()
         sid_t2 = search_t2.id
+        t1_id = t1.id
+        t2_id = t2.id
         token_u1 = create_access_token(user1)
 
     headers = {"Authorization": f"Bearer {token_u1}"}
@@ -367,6 +369,31 @@ def test_pdf_export_comparative_endpoints(client, app):
         headers=headers,
     )
     assert resp_idor.status_code == 403
+
+    # Tenta exportar enviando objeto com tenant_id de outro tenant -> 403 Forbidden
+    resp_idor_body = client.post(
+        "/api/v1/export-compare-pdf",
+        json={"companies": [{"company_name": "Invasora", "tenant_id": t2_id}]},
+        headers=headers,
+    )
+    assert resp_idor_body.status_code == 403
+
+    # 4. Validação de erro 400 quando menos de 2 empresas são fornecidas
+    resp_insufficient = client.post(
+        "/api/v1/export-compare-pdf",
+        json={"companies": [comp1]},
+        headers=headers,
+    )
+    assert resp_insufficient.status_code == 400
+    assert "pelo menos 2 empresas" in resp_insufficient.get_json().get("error", "")
+
+    # 5. Isolamento em _find_company_payload_for_pdf
+    from app.routes.api import _find_company_payload_for_pdf
+    with app.app_context():
+        # Tenant 1 não enxerga busca do Tenant 2
+        assert _find_company_payload_for_pdf("CONFIDENCIAL BETA LTDA", tenant_id=t1_id) is None
+        # Tenant 2 enxerga normalmente
+        assert _find_company_payload_for_pdf("CONFIDENCIAL BETA LTDA", tenant_id=t2_id) is not None
 
 
 def test_pdf_export_weasyprint_mock_and_fallback(monkeypatch):

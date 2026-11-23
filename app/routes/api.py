@@ -2066,10 +2066,11 @@ def _search_record_to_pdf_payload(search: CompanySearch) -> dict:
     return result
 
 
-def _find_company_payload_for_pdf(term: str) -> Optional[dict]:
+def _find_company_payload_for_pdf(term: str, tenant_id: Optional[int] = None) -> Optional[dict]:
     """
     Procura os dados consolidados da empresa primeiro no L0_MEMORY_CACHE (SEARCH_CACHE)
-    e depois no banco (CompanySearch), limpando sufixos visuais e suportando CNPJs com barra.
+    e depois no banco (CompanySearch), aplicando isolamento multitenant (anti-IDOR),
+    limpando sufixos visuais e suportando CNPJs com barra.
     """
     raw = str(term or "").strip()
     if not raw:
@@ -2090,6 +2091,9 @@ def _find_company_payload_for_pdf(term: str) -> Optional[dict]:
     # 1. Busca no L0_MEMORY_CACHE (SEARCH_CACHE)
     for cache_key, (_ts, cached_data) in list(SEARCH_CACHE.items()):
         if not isinstance(cached_data, dict):
+            continue
+        cached_tenant = cached_data.get("tenant_id")
+        if cached_tenant is not None and tenant_id is not None and str(cached_tenant) != str(tenant_id):
             continue
         key_upper = str(cache_key).upper()
         emp_upper = str(cached_data.get("empresa") or cached_data.get("company_name") or "").upper()
@@ -2119,12 +2123,15 @@ def _find_company_payload_for_pdf(term: str) -> Optional[dict]:
         ):
             return dict(cached_data)
 
-    # 2. Busca no banco de dados (SQLite / PostgreSQL - CompanySearch)
+    # 2. Busca no banco de dados (SQLite / PostgreSQL - CompanySearch) com isolamento multitenant
     try:
-        recent_rows = (
-            CompanySearch.query.order_by(CompanySearch.updated_at.desc()).limit(50).all()
-        )
+        query = CompanySearch.query
+        if tenant_id is not None:
+            query = query.filter((CompanySearch.tenant_id == tenant_id) | (CompanySearch.tenant_id.is_(None)))
+        recent_rows = query.order_by(CompanySearch.updated_at.desc()).limit(50).all()
         for row in recent_rows:
+            if row.tenant_id is not None and tenant_id is not None and str(row.tenant_id) != str(tenant_id):
+                continue
             row_name_up = str(row.company_name or "").upper()
             row_norm_up = str(row.normalized_name or "").upper()
             row_clean_up = _strip_visual_company_suffixes(row_name_up).upper()
@@ -2200,17 +2207,26 @@ def _build_compare_pdf_response(payload: dict, filename_hint: str = "comparativo
 def handle_pdf_export_request(
     search_id: Optional[int] = None,
     company_name: Optional[str] = None,
-):
+) -> Response:
     """
     Manipulador unificado de exportação de PDF:
     1. Aceita POST com o objeto de resultado já carregado na tela (nunca dá 404).
     2. Aceita search_id (via path /history/<id>/summary.pdf ou query ?search_id=).
     3. Aceita nome/CNPJ via query string (?empresa=, ?q=, ?company_name=) ou <path:company_name> (suportando '/').
     4. Busca em L0_MEMORY_CACHE -> banco CompanySearch -> geração sob demanda para empresa/CNPJ válido.
+    Garante estrito isolamento multitenant (anti-IDOR).
     """
     body = request.get_json(silent=True) if request.method == "POST" else None
     if not isinstance(body, dict):
         body = {}
+
+    current_user = get_current_user_optional()
+    user_tenant_id = current_user.tenant_id if current_user else None
+
+    # Validação Anti-IDOR se o body trouxer tenant_id explícito
+    body_tenant = body.get("tenant_id")
+    if body_tenant is not None and (not current_user or current_user.tenant_id != body_tenant):
+        return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
 
     # 1. Payload já carregado na sessão do Front-end (via POST)
     live_name = body.get("empresa") or body.get("company_name") or body.get("name")
@@ -2235,11 +2251,18 @@ def handle_pdf_export_request(
         payload = dict(body)
         # Se houver search_id e faltar idoneidade ou IA, enriquece com o registro salvo
         body_sid = body.get("search_id") or body.get("searchId") or body.get("id")
-        if body_sid and (not payload.get("idoneidade_economica") and not payload.get("idoneidadeEconomica")):
+        if body_sid:
             try:
                 saved = db.session.get(CompanySearch, int(body_sid))
-                if saved and isinstance(saved.economic_standing, dict):
-                    payload["idoneidade_economica"] = saved.economic_standing
+                if saved:
+                    if saved.tenant_id is not None and (not current_user or current_user.tenant_id != saved.tenant_id):
+                        return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
+                    if (
+                        not payload.get("idoneidade_economica")
+                        and not payload.get("idoneidadeEconomica")
+                        and isinstance(saved.economic_standing, dict)
+                    ):
+                        payload["idoneidade_economica"] = saved.economic_standing
             except Exception:
                 pass
         return _build_pdf_response(payload, filename_hint=str(live_name))
@@ -2257,6 +2280,8 @@ def handle_pdf_export_request(
         except Exception:
             search = None
         if search:
+            if search.tenant_id is not None and (not current_user or current_user.tenant_id != search.tenant_id):
+                return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
             payload = _search_record_to_pdf_payload(search)
             return _build_pdf_response(payload, filename_hint=f"empresa-{search.id}")
         # Se veio somente search_id e não existe no banco, verifica se veio nome de fallback
@@ -2286,7 +2311,7 @@ def handle_pdf_export_request(
             "error": "Informe 'empresa', 'q', 'search_id' ou envie os dados da análise via POST para gerar o PDF."
         }), 400
 
-    payload = _find_company_payload_for_pdf(term)
+    payload = _find_company_payload_for_pdf(term, tenant_id=user_tenant_id)
     if payload:
         return _build_pdf_response(payload, filename_hint=term)
 
@@ -2345,7 +2370,7 @@ def export_history_summary_pdf(search_id: int):
 @api_bp.route("/export-pdf", methods=["GET", "POST"])
 @api_bp.route("/report/pdf", methods=["GET", "POST"])
 @api_bp.route("/export/pdf", methods=["GET", "POST"])
-def export_report_pdf_query_or_post():
+def export_report_pdf_query_or_post() -> Response:
     """Exporta o relatório executivo em PDF via query string (?empresa=... / ?q=...) ou POST com JSON da tela."""
     return handle_pdf_export_request()
 
@@ -2353,7 +2378,7 @@ def export_report_pdf_query_or_post():
 @api_bp.route("/export-pdf/<path:company_name>", methods=["GET"])
 @api_bp.route("/report/pdf/<path:company_name>", methods=["GET"])
 @api_bp.route("/export/pdf/<path:company_name>", methods=["GET"])
-def export_report_pdf_by_path(company_name: str):
+def export_report_pdf_by_path(company_name: str) -> Response:
     """Exporta o relatório executivo em PDF por nome/CNPJ no path (suporta barras como CNPJ e GRUPO CONSOLIDADO / FILIAIS)."""
     return handle_pdf_export_request(company_name=company_name)
 
@@ -2361,11 +2386,12 @@ def export_report_pdf_by_path(company_name: str):
 @api_bp.route("/export-compare-pdf", methods=["GET", "POST"])
 @api_bp.route("/compare-pdf", methods=["GET", "POST"])
 @api_bp.route("/export/compare-pdf", methods=["GET", "POST"])
-def export_compare_pdf():
+def export_compare_pdf() -> Response:
     """
     Exporta o relatório comparativo de 2 a 5 empresas em PDF (v3.0).
     Aceita POST com JSON contendo 'companies', 'empresas', 'search_ids' ou lista de empresas.
     Aceita GET com query string contendo ?search_ids=1,2,3 ou ?empresas=A,B ou ?q=A,B.
+    Garante estrito isolamento multitenant (anti-IDOR).
     """
     body = request.get_json(silent=True) if request.method == "POST" else None
     if not isinstance(body, dict):
@@ -2375,6 +2401,7 @@ def export_compare_pdf():
             body = {}
 
     current_user = get_current_user_optional()
+    user_tenant_id = current_user.tenant_id if current_user else None
     resolved_companies: List[dict] = []
 
     # 1. Se vieram search_ids
@@ -2404,18 +2431,24 @@ def export_compare_pdf():
         if isinstance(raw_list, list) and raw_list:
             for item in raw_list:
                 if isinstance(item, dict):
-                    if any(k in item for k in ("idoneidade_economica", "outcomes", "desfechos_sentencas", "total_processos", "total_processes")):
+                    item_tenant = item.get("tenant_id")
+                    if item_tenant is not None and (not current_user or current_user.tenant_id != item_tenant):
+                        return jsonify({"error": "Acesso negado: um ou mais itens enviados pertencem a outra organização."}), 403
+                    if any(
+                        k in item
+                        for k in ("idoneidade_economica", "outcomes", "desfechos_sentencas", "total_processos", "total_processes")
+                    ):
                         resolved_companies.append(item)
                     else:
                         term = str(item.get("empresa") or item.get("company_name") or item.get("cnpj") or "").strip()
                         if term:
-                            payload = _find_company_payload_for_pdf(term)
+                            payload = _find_company_payload_for_pdf(term, tenant_id=user_tenant_id)
                             if payload:
                                 resolved_companies.append(payload)
                             else:
                                 resolved_companies.append({"company_name": term})
                 elif isinstance(item, str) and item.strip():
-                    payload = _find_company_payload_for_pdf(item.strip())
+                    payload = _find_company_payload_for_pdf(item.strip(), tenant_id=user_tenant_id)
                     if payload:
                         resolved_companies.append(payload)
                     else:
@@ -2427,13 +2460,14 @@ def export_compare_pdf():
         if names_param:
             raw_names = [n.strip() for n in names_param.split(",") if n.strip()]
             for name in raw_names:
-                payload = _find_company_payload_for_pdf(name)
+                payload = _find_company_payload_for_pdf(name, tenant_id=user_tenant_id)
                 if payload:
                     resolved_companies.append(payload)
                 else:
                     resolved_companies.append({"company_name": name})
 
-    if not resolved_companies:
+    # Regra estrita: relatório comparativo exige ao menos 2 empresas (máximo 5)
+    if len(resolved_companies) < 2:
         return jsonify({
             "error": "Informe pelo menos 2 empresas (máximo 5) via 'companies', 'empresas' ou 'search_ids' para exportação comparativa."
         }), 400
