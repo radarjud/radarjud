@@ -1368,15 +1368,17 @@ def compare_companies():
     if len(seen_identifiers) < 2:
         return jsonify({"error": "Forneça pelo menos 2 empresas distintas para comparação."}), 400
 
-    resolved_payloads = []
-    for item in raw_items:
+    resolved_payloads: list = [None] * len(raw_items)
+    on_demand_queue: list = []
+
+    for idx, item in enumerate(raw_items):
         # Se já for um payload completo pré-calculado
         if isinstance(item, dict) and (
             item.get("risco_subsidiario") is not None
             or item.get("score_risco_terceirizacao") is not None
             or item.get("plus_previsao_condenacao") is not None
         ) and not (item.get("search_id") and not item.get("empresa")):
-            resolved_payloads.append(item)
+            resolved_payloads[idx] = item
             continue
 
         sid = item.get("search_id") or item.get("id")
@@ -1396,7 +1398,7 @@ def compare_companies():
                 if rec_tenant_id is not None and str(rec_tenant_id) != str(req_tenant_id):
                     return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
 
-            resolved_payloads.append(_search_record_to_pdf_payload(search_record))
+            resolved_payloads[idx] = _search_record_to_pdf_payload(search_record)
             continue
 
         raw_term = str(item.get("cnpj") or item.get("company_name") or item.get("name") or "").strip()
@@ -1410,12 +1412,15 @@ def compare_companies():
         # Busca no L0 (Memory Cache) ou L1 (Database)
         cached_payload = _find_company_payload_for_pdf(raw_term)
         if cached_payload:
-            resolved_payloads.append(cached_payload)
+            resolved_payloads[idx] = cached_payload
             continue
 
-        # Busca sob demanda caso não exista em cache (compatível com 512 MB RAM)
-        try:
-            strat = resolve_search_strategy(raw_term, brasil_api_fetcher=fetch_cnpj_brasilapi)
+        on_demand_queue.append((idx, raw_term))
+
+    # Execução concorrente via ThreadPoolExecutor para termos inéditos fora de cache (baixa latência no Render Free)
+    if on_demand_queue:
+        def _fetch_company_on_demand(term: str) -> dict:
+            strat = resolve_search_strategy(term, brasil_api_fetcher=fetch_cnpj_brasilapi)
             q_term = strat["comunica_query_term"]
             d_title = strat["display_title"]
             target_cnpj = strat.get("target_cnpj")
@@ -1445,10 +1450,28 @@ def compare_companies():
 
             ckey = strat.get("cache_key") or f"{strat['mode']}::{q_term}::{target_cnpj or ''}"
             SEARCH_CACHE[ckey] = (time.time(), fast_res)
-            resolved_payloads.append(fast_res)
-        except Exception as search_err:
-            logger.error("Erro na busca sob demanda para comparativo ('%s'): %s", raw_term, search_err)
-            return jsonify({"error": f"Não foi possível processar a empresa '{raw_term}' para o comparativo."}), 500
+            return fast_res
+
+        if len(on_demand_queue) == 1:
+            idx, term = on_demand_queue[0]
+            try:
+                resolved_payloads[idx] = _fetch_company_on_demand(term)
+            except Exception as search_err:
+                logger.error("Erro na busca sob demanda para comparativo ('%s'): %s", term, search_err)
+                return jsonify({"error": f"Não foi possível processar a empresa '{term}' para o comparativo."}), 500
+        else:
+            with ThreadPoolExecutor(max_workers=min(len(on_demand_queue), 4)) as executor:
+                future_to_item = {
+                    executor.submit(_fetch_company_on_demand, term): (idx, term)
+                    for idx, term in on_demand_queue
+                }
+                for future in as_completed(future_to_item):
+                    idx, term = future_to_item[future]
+                    try:
+                        resolved_payloads[idx] = future.result()
+                    except Exception as search_err:
+                        logger.error("Erro na busca concorrente sob demanda ('%s'): %s", term, search_err)
+                        return jsonify({"error": f"Não foi possível processar a empresa '{term}' para o comparativo."}), 500
 
     # Validação de unicidade das empresas resolvidas
     unique_resolved = set()

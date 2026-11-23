@@ -409,3 +409,58 @@ def test_security_sanitization_and_defensive_tenant_isolation(client, app, monke
     assert res_cross_tenant.status_code == 403
     assert "Acesso não autorizado" in res_cross_tenant.get_json()["error"]
 
+
+def test_mixed_payload_inputs_combining_ids_cnpjs_and_names(client, app):
+    """
+    Valida suporte a payloads mistos combinando simultaneamente:
+    - Empresa por search_id (banco de dados)
+    - Empresa por CNPJ pré-computado ou objeto direto
+    - Empresa por objeto com métricas e Razão Social
+    """
+    with app.app_context():
+        s_db = CompanySearch(
+            company_name="Empresa Cadastrada Banco LTDA",
+            normalized_name="EMPRESA CADASTRADA BANCO LTDA",
+            total_processes=10,
+            overall_risk_score=5.0,
+            outcomes_summary={"condenacoes": 1, "acordos": 3, "improcedentes": 6},
+            economic_standing={
+                "cenario_tipo": "CENARIO_A",
+                "capital_social_num": 20_000_000.0,
+                "capital_social_formatado": "R$ 20.000.000,00",
+            },
+            scan_status="COMPLETED",
+            last_checked_at=get_utc_now(),
+        )
+        db.session.add(s_db)
+        db.session.commit()
+        db_id = s_db.id
+
+    payload_mixed = {
+        "items": [
+            {"search_id": db_id},
+            {
+                "empresa": "Fornecedor Objeto Direto LTDA",
+                "cnpj": "44.555.666/0001-77",
+                "risco_subsidiario": 22.0,
+                "capital_social_num": 5_000_000.0,
+                "probabilidade_condenacao": 30.0,
+            },
+            {
+                "empresa": "Fornecedor Terceiro Cautela S/A",
+                "cnpj": "88.999.000/0001-11",
+                "risco_subsidiario": 45.0,
+                "capital_social_num": 500_000.0,
+                "probabilidade_condenacao": 60.0,
+            },
+        ]
+    }
+
+    res = client.post("/api/v1/compare-companies", json=payload_mixed)
+    assert res.status_code == 200
+    data = res.get_json()
+    assert len(data["empresas_ranqueadas"]) == 3
+    ranks = [c["posicao_ranking"] for c in data["empresas_ranqueadas"]]
+    assert ranks == [1, 2, 3]
+    assert data["empresas_ranqueadas"][0]["empresa"] == "Empresa Cadastrada Banco LTDA"
+

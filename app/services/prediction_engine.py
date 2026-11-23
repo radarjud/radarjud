@@ -6,7 +6,7 @@ import math
 import logging
 import unicodedata
 from collections import Counter, defaultdict
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Union
 
 from app.services.tpu_constants import (
     TPU_SUBJECT_BASELINES,
@@ -908,7 +908,7 @@ class BayesianRiskPredictor:
         return metrics
 
 
-def _parse_capital_social_num(val: Any) -> float:
+def _parse_capital_social_num(val: Optional[Any]) -> float:
     """Extrai valor numérico de capital social a partir de float, int ou string formatada em BRL."""
     if val is None:
         return 0.0
@@ -925,9 +925,9 @@ def _parse_capital_social_num(val: Any) -> float:
         return 0.0
 
 
-def _format_capital_brl(num: float) -> str:
+def _format_capital_brl(num: Union[int, float]) -> str:
     """Formata valor numérico no padrão monetário brasileiro R$ 0.000,00."""
-    return f"R$ {num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {float(num):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 def build_sector_benchmark(company_payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
