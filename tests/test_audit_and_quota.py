@@ -154,6 +154,13 @@ def test_audit_log_immutability_and_api_mutation_block(client, app):
             db.session.commit()
         db.session.rollback()
 
+    # 4. Bloqueia também exclusão em lote no ORM (query.delete)
+    with app.app_context():
+        with pytest.raises(PermissionError, match="AuditLog é imutável: exclusões não são permitidas"):
+            AuditLog.query.filter_by(id=audit_id).delete()
+            db.session.commit()
+        db.session.rollback()
+
 
 def test_audit_log_tenant_isolation_and_anti_idor(client, app):
     """
@@ -268,9 +275,38 @@ def test_quota_service_monthly_limits_and_reopen_cache_exemption(client, app):
         assert res3.status_code == 402
         body = res3.get_json()
         assert "Cota mensal de consultas esgotada" in body["error"]
+        assert body["code"] == "QUOTA_EXCEEDED"
         assert body["used"] == 2
         assert body["limit"] == 2
+        assert body["plan"] == Tenant.PLAN_ESSENCIAL
         assert res3.headers.get("X-Quota-Remaining") == "0"
+
+
+def test_quota_exceeded_explicit_status_and_payload(client, app):
+    """
+    Validação adicional explícita de estouro de cota (HTTP 402):
+    Garante que tentativas consecutivas mantêm HTTP 402 e payload descritivo.
+    """
+    user_info = _create_authenticated_user_and_tenant(
+        client, name="Analista Bloqueado", email="bloqueado@empresa.com", plan=Tenant.PLAN_ESSENCIAL, quota=1
+    )
+    headers = user_info["headers"]
+    mock_metrics = {
+        "empresa": "EMPRESA UNICA LTDA",
+        "total_processos": 1,
+        "scan_status": "COMPLETED",
+    }
+    with patch("app.routes.api.orchestrator.analyze_company_by_name", return_value=mock_metrics):
+        # 1ª consome a única cota
+        res1 = client.post("/api/v1/search-company", json={"company_name": "EMPRESA UNICA LTDA"}, headers=headers)
+        assert res1.status_code == 200
+        assert res1.headers.get("X-Quota-Remaining") == "0"
+
+        # 2ª tenta consumir além da cota -> 402
+        res2 = client.post("/api/v1/search-company", json={"company_name": "OUTRA EMPRESA BLOQUEADA LTDA"}, headers=headers)
+        assert res2.status_code == 402
+        assert res2.get_json()["code"] == "QUOTA_EXCEEDED"
+        assert res2.headers.get("X-Quota-Remaining") == "0"
 
 
 def test_enterprise_plan_has_unlimited_quota(client, app):

@@ -57,6 +57,9 @@ class AuditLog(db.Model):
         }
 
 
+from sqlalchemy.orm import Session
+
+
 # Imutabilidade estrita na camada ORM (Append-Only Enforcement)
 @event.listens_for(AuditLog, "before_update")
 def block_audit_log_update(mapper, connection, target):
@@ -66,3 +69,19 @@ def block_audit_log_update(mapper, connection, target):
 @event.listens_for(AuditLog, "before_delete")
 def block_audit_log_delete(mapper, connection, target):
     raise PermissionError("AuditLog é imutável: exclusões não são permitidas.")
+
+
+@event.listens_for(Session, "do_orm_execute")
+def block_audit_log_bulk_mutation(orm_execute_state):
+    if (
+        orm_execute_state.is_delete
+        and orm_execute_state.bind_mapper
+        and issubclass(orm_execute_state.bind_mapper.class_, AuditLog)
+    ):
+        raise PermissionError("AuditLog é imutável: exclusões não são permitidas.")
+    if (
+        orm_execute_state.is_update
+        and orm_execute_state.bind_mapper
+        and issubclass(orm_execute_state.bind_mapper.class_, AuditLog)
+    ):
+        raise PermissionError("AuditLog é imutável: atualizações não são permitidas.")
