@@ -1287,9 +1287,14 @@ def ingest_deep_scan():
         if req_tenant_id is None and request.headers.get("X-Tenant-ID"):
             req_tenant_id = request.headers.get("X-Tenant-ID")
 
-        if (hasattr(CompanySearch, "tenant_id") or hasattr(search, "tenant_id")) and req_tenant_id is not None:
-            rec_tenant_id = getattr(search, "tenant_id", None)
-            if rec_tenant_id is not None and str(rec_tenant_id) != str(req_tenant_id):
+        if req_tenant_id is not None:
+            rec_tenant_id = getattr(CompanySearch, "tenant_id", None)
+            if isinstance(rec_tenant_id, (int, str)):
+                tenant_val = rec_tenant_id
+            else:
+                tenant_val = getattr(search, "tenant_id", None)
+
+            if tenant_val is not None and str(tenant_val) != str(req_tenant_id):
                 return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
 
         existing_records = {p.numero_processo: p for p in search.processes if p.numero_processo}
@@ -1452,9 +1457,14 @@ def get_search_processes(search_id: int):
         if req_tenant_id is None and request.headers.get("X-Tenant-ID"):
             req_tenant_id = request.headers.get("X-Tenant-ID")
 
-        if (hasattr(CompanySearch, "tenant_id") or hasattr(search, "tenant_id")) and req_tenant_id is not None:
-            rec_tenant_id = getattr(search, "tenant_id", None)
-            if rec_tenant_id is not None and str(rec_tenant_id) != str(req_tenant_id):
+        if req_tenant_id is not None:
+            rec_tenant_id = getattr(CompanySearch, "tenant_id", None)
+            if isinstance(rec_tenant_id, (int, str)):
+                tenant_val = rec_tenant_id
+            else:
+                tenant_val = getattr(search, "tenant_id", None)
+
+            if tenant_val is not None and str(tenant_val) != str(req_tenant_id):
                 return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
 
         try:
