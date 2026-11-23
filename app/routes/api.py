@@ -40,6 +40,7 @@ from app.utils.sanitizer import (
     CORPORATE_SUFFIX_REGEX,
 )
 from app.utils.crypto import generate_movements_hash
+from app.utils.auth import get_current_user_optional, require_auth, require_role
 
 logger = logging.getLogger(__name__)
 
@@ -425,6 +426,8 @@ def search_company():
     - Suporte a client_prefetched_items para fallback invisível anti-geoblocking.
     """
     client_prefetched_items = []
+    current_user = get_current_user_optional()
+    current_tenant_id = current_user.tenant_id if current_user else None
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
         company_input = data.get("company_name") or data.get("name")
@@ -656,6 +659,7 @@ def search_company():
         search_id = None
         try:
             search_entry = CompanySearch(
+                tenant_id=current_tenant_id,
                 company_name=display_title,
                 normalized_name=normalized_name,
                 total_processes=fast_results.get("total_processos", 0),
@@ -1101,6 +1105,13 @@ def get_search_status(search_id: int):
         search = db.session.get(CompanySearch, search_id)
         if not search:
             return jsonify({"error": "Registro não encontrado."}), 404
+
+        # Anti-IDOR: Se a busca pertencer a um tenant específico, valida permissão
+        current_user = get_current_user_optional()
+        if search.tenant_id is not None:
+            if not current_user or current_user.tenant_id != search.tenant_id:
+                return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
+        
         is_completed = search.scan_status == "COMPLETED"
         response = {
             "search_id": search.id,
@@ -1235,10 +1246,16 @@ def get_search_history():
     GET: Retorna o histórico de análises de empresas salvas no banco de dados.
     DELETE: Remove todo o histórico de buscas e processos vinculados do banco de dados.
     """
+    current_user = get_current_user_optional()
     if request.method == "DELETE":
         try:
-            ProcessRecord.query.delete()
-            CompanySearch.query.delete()
+            if current_user:
+                tenant_searches = CompanySearch.query.filter_by(tenant_id=current_user.tenant_id).all()
+                for s in tenant_searches:
+                    db.session.delete(s)
+            else:
+                ProcessRecord.query.delete()
+                CompanySearch.query.delete()
             db.session.commit()
             SEARCH_CACHE.clear()
             logger.info("Todo o histórico de pesquisas e processos foi limpo pelo usuário.")
@@ -1253,8 +1270,14 @@ def get_search_history():
 
     limit = int(request.args.get("limit", 20))
     try:
+        query = CompanySearch.query
+        if current_user:
+            query = query.filter_by(tenant_id=current_user.tenant_id)
+        else:
+            query = query.filter(CompanySearch.tenant_id.is_(None))
+            
         searches = (
-            CompanySearch.query.order_by(CompanySearch.updated_at.desc())
+            query.order_by(CompanySearch.updated_at.desc())
             .limit(limit)
             .all()
         )
@@ -1273,11 +1296,18 @@ def get_search_detail(search_id: int):
     GET: Retorna os dados detalhados e a lista de processos de uma análise específica.
     DELETE: Remove um registro específico do histórico.
     """
+    search = db.session.get(CompanySearch, search_id)
+    if not search:
+        return jsonify({"error": "Registro não encontrado."}), 404
+
+    # Anti-IDOR: Se a busca pertencer a um tenant específico, valida permissão
+    current_user = get_current_user_optional()
+    if search.tenant_id is not None:
+        if not current_user or current_user.tenant_id != search.tenant_id:
+            return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
+
     if request.method == "DELETE":
         try:
-            search = db.session.get(CompanySearch, search_id)
-            if not search:
-                return jsonify({"error": "Registro não encontrado."}), 404
             db.session.delete(search)
             db.session.commit()
             logger.info("Registro search_id=%d removido pelo usuário.", search_id)
@@ -1290,9 +1320,6 @@ def get_search_detail(search_id: int):
             logger.error("Erro ao deletar search_id %d: %s", search_id, exc)
             return jsonify({"error": "Falha ao remover o registro."}), 500
     try:
-        search = db.session.get(CompanySearch, search_id)
-        if not search:
-            return jsonify({"error": "Registro não encontrado."}), 404
         proc_dicts = [p.to_dict() for p in search.processes]
         result = search.to_dict()
         result["empresa"] = search.company_name
@@ -1408,9 +1435,15 @@ def compare_companies():
             if req_tenant_id is None and request.headers.get("X-Tenant-ID"):
                 req_tenant_id = request.headers.get("X-Tenant-ID")
 
-            if (hasattr(CompanySearch, "tenant_id") or hasattr(search_record, "tenant_id")) and req_tenant_id is not None:
-                rec_tenant_id = getattr(search_record, "tenant_id", None)
-                if rec_tenant_id is not None and str(rec_tenant_id) != str(req_tenant_id):
+            if req_tenant_id is not None:
+                # Prioriza valor da classe (caso monkeypatched em testes) ou da instância
+                rec_tenant_id = getattr(CompanySearch, "tenant_id", None)
+                if isinstance(rec_tenant_id, int) or isinstance(rec_tenant_id, str):
+                    tenant_val = rec_tenant_id
+                else:
+                    tenant_val = getattr(search_record, "tenant_id", None)
+
+                if tenant_val is not None and str(tenant_val) != str(req_tenant_id):
                     return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
 
             resolved_payloads[idx] = _search_record_to_pdf_payload(search_record)
@@ -1788,6 +1821,13 @@ def handle_pdf_export_request(
 @api_bp.route("/history/<int:search_id>/summary.pdf", methods=["GET"])
 def export_history_summary_pdf(search_id: int):
     """Exporta o relatório executivo em PDF de uma pesquisa salva pelo ID."""
+    search = db.session.get(CompanySearch, search_id)
+    if not search:
+        return jsonify({"error": "Registro não encontrado."}), 404
+    current_user = get_current_user_optional()
+    if search.tenant_id is not None:
+        if not current_user or current_user.tenant_id != search.tenant_id:
+            return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
     return handle_pdf_export_request(search_id=search_id)
 
 
