@@ -242,3 +242,4 @@ def test_build_sector_benchmark_integration_with_ai_analyzer():
     assert parecer["alerta_critico"] is not None
     assert "60.4 pontos percentuais" in parecer["economia_potencial_texto"]
     assert "Comparativo técnico" in parecer["justificativa_executiva"]
+
