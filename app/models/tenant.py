@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from app.extensions import db
 
 
-def get_utc_now():
+def get_utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 

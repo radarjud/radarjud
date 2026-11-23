@@ -1254,8 +1254,21 @@ def get_search_history():
                 for s in tenant_searches:
                     db.session.delete(s)
             else:
-                ProcessRecord.query.delete()
-                CompanySearch.query.delete()
+                # Exclusão em lote (batch deletes) para evitar table lock ou alto consumo de RAM
+                batch_size = 500
+                while True:
+                    proc_ids = [p.id for p in ProcessRecord.query.with_entities(ProcessRecord.id).limit(batch_size).all()]
+                    if not proc_ids:
+                        break
+                    ProcessRecord.query.filter(ProcessRecord.id.in_(proc_ids)).delete(synchronize_session=False)
+                    db.session.commit()
+
+                while True:
+                    search_ids = [s.id for s in CompanySearch.query.with_entities(CompanySearch.id).limit(batch_size).all()]
+                    if not search_ids:
+                        break
+                    CompanySearch.query.filter(CompanySearch.id.in_(search_ids)).delete(synchronize_session=False)
+                    db.session.commit()
             db.session.commit()
             SEARCH_CACHE.clear()
             logger.info("Todo o histórico de pesquisas e processos foi limpo pelo usuário.")

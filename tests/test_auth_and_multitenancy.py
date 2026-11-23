@@ -222,3 +222,21 @@ def test_tenant_isolation_and_anti_idor(client, app):
     assert res_a_list.status_code == 200
     assert res_a_list.get_json()["total"] == 1
     assert res_a_list.get_json()["items"][0]["id"] == search_a_id
+
+    # 8. Usuário anônimo sem token -> Histórico público não vaza registros confidenciais de nenhum tenant
+    res_anon_list = client.get("/api/v1/history")
+    assert res_anon_list.status_code == 200
+    anon_items = res_anon_list.get_json()["items"]
+    assert all(item.get("tenant_id") is None for item in anon_items)
+    assert not any(item["id"] == search_a_id for item in anon_items)
+
+    # 9. Usuário anônimo tentando acessar diretamente busca protegida por IDOR -> 403 Forbidden
+    res_anon_detail = client.get(f"/api/v1/history/{search_a_id}")
+    assert res_anon_detail.status_code == 403
+    assert "Acesso negado" in res_anon_detail.get_json()["error"]
+
+    res_anon_status = client.get(f"/api/v1/search_status/{search_a_id}")
+    assert res_anon_status.status_code == 403
+
+    res_anon_pdf = client.get(f"/api/v1/history/{search_a_id}/summary.pdf")
+    assert res_anon_pdf.status_code == 403

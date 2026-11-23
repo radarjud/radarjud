@@ -1,3 +1,4 @@
+from typing import Optional, Callable
 from functools import wraps
 from flask import request, jsonify, g
 from app.extensions import db
@@ -15,7 +16,7 @@ def get_token_from_header() -> str:
     return ""
 
 
-def get_current_user_optional():
+def get_current_user_optional() -> Optional[User]:
     """Identifica o usuário atual pelo JWT se presente no header, sem bloquear se ausente."""
     g.current_user = None
     g.current_tenant_id = None
@@ -44,7 +45,7 @@ def get_current_user_optional():
     return None
 
 
-def require_auth(f):
+def require_auth(f: Callable) -> Callable:
     """
     Decorator que exige autenticação via JWT Bearer Token válido.
     Injeta `g.current_user` e `g.current_tenant_id` no contexto da requisição.
@@ -67,7 +68,12 @@ def require_auth(f):
         if not user_id:
             return jsonify({"error": "Payload de token incompleto."}), 401
 
-        user = db.session.get(User, user_id)
+        try:
+            uid_int = int(user_id)
+        except (ValueError, TypeError):
+            uid_int = user_id
+
+        user = db.session.get(User, uid_int)
         if not user or not user.is_active:
             return jsonify({"error": "Usuário inexistente ou inativo."}), 401
 
@@ -78,12 +84,12 @@ def require_auth(f):
     return decorated
 
 
-def require_role(*allowed_roles):
+def require_role(*allowed_roles: str) -> Callable:
     """
     Decorator RBAC que valida se o usuário autenticado possui o perfil requerido (ex: 'ADMIN', 'ANALISTA').
     Sempre re-valida o token da requisição atual para garantir isolamento seguro.
     """
-    def decorator(f):
+    def decorator(f: Callable) -> Callable:
         @wraps(f)
         def decorated(*args, **kwargs):
             token = get_token_from_header()
@@ -97,7 +103,13 @@ def require_role(*allowed_roles):
             if payload.get("type") != "access":
                 return jsonify({"error": "Tipo de token inválido para esta operação."}), 401
 
-            user = db.session.get(User, payload.get("sub"))
+            user_id = payload.get("sub")
+            try:
+                uid_int = int(user_id)
+            except (ValueError, TypeError):
+                uid_int = user_id
+
+            user = db.session.get(User, uid_int)
             if not user or not user.is_active:
                 return jsonify({"error": "Usuário inexistente ou inativo."}), 401
 
