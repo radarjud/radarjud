@@ -4,6 +4,7 @@ from flask import Flask, jsonify, render_template
 from app.config import config_by_name
 from app.extensions import db, cors
 from app.routes import api_bp
+from app.routes.auth import auth_bp
 
 
 def create_app(config_name: str = None) -> Flask:
@@ -30,6 +31,7 @@ def create_app(config_name: str = None) -> Flask:
 
     # Registro de Blueprints
     app.register_blueprint(api_bp)
+    app.register_blueprint(auth_bp)
 
     # Aliases de exportação PDF sob /api/... (além de /api/v1/...)
     from app.routes.api import handle_pdf_export_request
@@ -74,12 +76,15 @@ def create_app(config_name: str = None) -> Flask:
     # Cria tabelas no banco de dados se não existirem
     with app.app_context():
         try:
+            from app.models.tenant import Tenant  # noqa: F401
+            from app.models.user import User  # noqa: F401
             from app.models.company_search import CompanySearch  # noqa: F401
             from app.models.process_record import ProcessRecord  # noqa: F401
             from app.models.CompanyRegistry import CompanyRegistry  # noqa: F401
             db.create_all()
             if db.engine.dialect.name == "postgresql":
                 with db.engine.connect() as conn:
+                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS tenant_id INTEGER;"))
                     conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS movements_hash VARCHAR(64);"))
                     conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;"))
                     conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS scan_status VARCHAR(20) DEFAULT 'COMPLETED';"))
