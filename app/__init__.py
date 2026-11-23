@@ -34,17 +34,25 @@ def create_app(config_name: str = None) -> Flask:
     app.register_blueprint(auth_bp)
 
     # Aliases de exportação PDF sob /api/... (além de /api/v1/...)
-    from app.routes.api import handle_pdf_export_request
+    from app.routes.api import handle_pdf_export_request, export_compare_pdf
 
+    @app.route("/api/export-pdf", methods=["GET", "POST"])
     @app.route("/api/report/pdf", methods=["GET", "POST"])
     @app.route("/api/export/pdf", methods=["GET", "POST"])
     def _api_pdf_query_or_post():
         return handle_pdf_export_request()
 
+    @app.route("/api/export-pdf/<path:company_name>", methods=["GET"])
     @app.route("/api/report/pdf/<path:company_name>", methods=["GET"])
     @app.route("/api/export/pdf/<path:company_name>", methods=["GET"])
     def _api_pdf_by_path(company_name: str):
         return handle_pdf_export_request(company_name=company_name)
+
+    @app.route("/api/export-compare-pdf", methods=["GET", "POST"])
+    @app.route("/api/compare-pdf", methods=["GET", "POST"])
+    @app.route("/api/export/compare-pdf", methods=["GET", "POST"])
+    def _api_compare_pdf():
+        return export_compare_pdf()
 
     @app.route("/api/history/<int:search_id>/summary.pdf", methods=["GET"])
     def _api_pdf_by_history_id(search_id: int):
