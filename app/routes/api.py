@@ -9,7 +9,7 @@ import asyncio
 import logging
 import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Blueprint, Response, request, jsonify, current_app, g
@@ -41,6 +41,9 @@ from app.utils.sanitizer import (
 )
 from app.utils.crypto import generate_movements_hash
 from app.utils.auth import get_current_user_optional, require_auth, require_role
+from app.models.tenant import Tenant
+from app.models.audit_log import AuditLog
+from app.services.quota_service import QuotaService
 
 logger = logging.getLogger(__name__)
 
@@ -478,7 +481,13 @@ def search_company():
                 res_copy = dict(cached_data)
                 res_copy["cached"] = True
                 res_copy["cache_level"] = "L0_MEMORY_CACHE"
-                return jsonify(res_copy), 200
+                resp = jsonify(res_copy)
+                if current_user and current_user.tenant_id:
+                    tenant_for_quota = db.session.get(Tenant, current_user.tenant_id)
+                    if tenant_for_quota:
+                        q_stat = QuotaService.check_quota(tenant_for_quota)
+                        resp.headers["X-Quota-Remaining"] = q_stat["header_value"]
+                return resp, 200
 
     # =========================================================================
     # CURTO-CIRCUITO NÍVEL 1 (Antes do CNJ): Busca instantânea no PostgreSQL
@@ -568,9 +577,37 @@ def search_company():
                 except Exception:
                     pass
 
-                return jsonify(res), 200
+                resp = jsonify(res)
+                if current_user and current_user.tenant_id:
+                    tenant_for_quota = db.session.get(Tenant, current_user.tenant_id)
+                    if tenant_for_quota:
+                        q_stat = QuotaService.check_quota(tenant_for_quota)
+                        resp.headers["X-Quota-Remaining"] = q_stat["header_value"]
+                return resp, 200
         except Exception as db_err:
             logger.debug("Falha na checagem de cache L1 no banco: %s", db_err)
+
+    # =========================================================================
+    # CONTROLE DE COTA MENSAL (QuotaService - US-02)
+    # Apenas novas consultas externas consomem cota.
+    # =========================================================================
+    tenant_obj = None
+    quota_header_val = None
+    if current_user and current_user.tenant_id:
+        tenant_obj = db.session.get(Tenant, current_user.tenant_id)
+        if tenant_obj:
+            quota_status = QuotaService.check_quota(tenant_obj)
+            quota_header_val = quota_status["header_value"]
+            if not quota_status["allowed"]:
+                resp = jsonify({
+                    "error": "Cota mensal de consultas esgotada para o seu plano. Entre em contato para realizar upgrade ou aguarde a renovação no próximo mês.",
+                    "code": "QUOTA_EXCEEDED",
+                    "used": quota_status["used"],
+                    "limit": quota_status["limit"],
+                    "plan": tenant_obj.plan,
+                })
+                resp.headers["X-Quota-Remaining"] = quota_header_val
+                return resp, 402
 
     if force_refresh:
         orchestrator._cache.pop(raw_query.lower(), None)
@@ -721,7 +758,15 @@ def search_company():
 
         fast_results["scan_status"] = initial_status
         SEARCH_CACHE[cache_key] = (time.time(), fast_results)
-        return jsonify(fast_results), 200
+        resp = jsonify(fast_results)
+        if quota_header_val is not None:
+            # Recalcula o saldo restante após a persistência da nova consulta
+            if tenant_obj:
+                updated_quota = QuotaService.check_quota(tenant_obj)
+                resp.headers["X-Quota-Remaining"] = updated_quota["header_value"]
+            else:
+                resp.headers["X-Quota-Remaining"] = quota_header_val
+        return resp, 200
 
     except Exception as exc:
         logger.exception("Erro ao processar busca de empresa: %s", exc)
@@ -729,7 +774,132 @@ def search_company():
 
 
 # =============================================================================
-# CATÁLOGO DE EMPRESAS  ->  GET /api/v1/company-catalog?q=sauter&limit=100[&debug=1]
+# DECISÕES DE COMPLIANCE E TRILHA DE AUDITORIA (US-02)
+# =============================================================================
+
+@api_bp.route("/searches/<int:company_search_id>/decision", methods=["POST"])
+@require_auth
+def register_search_decision(company_search_id: int):
+    """
+    Registra decisão de compliance (APROVADO, REPROVADO, RETENCAO) sobre uma empresa analisada.
+    Congela o snapshot de risco (score de risco e Cenário A/B) e garante trilha de auditoria append-only.
+    """
+    search = db.session.get(CompanySearch, company_search_id)
+    if not search:
+        return jsonify({"error": "Registro de pesquisa não encontrado."}), 404
+
+    # Anti-IDOR: Usuário só pode registrar decisão em buscas do seu próprio tenant
+    current_user = g.current_user
+    if search.tenant_id is not None and search.tenant_id != current_user.tenant_id:
+        return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
+
+    data = request.get_json(silent=True) or {}
+    decision = str(data.get("decision") or "").strip().upper()
+    justification = str(data.get("justification") or "").strip()
+
+    if decision not in AuditLog.VALID_DECISIONS:
+        return jsonify({
+            "error": f"Decisão inválida: '{decision}'. Valores permitidos: {sorted(list(AuditLog.VALID_DECISIONS))}."
+        }), 400
+
+    if not justification:
+        return jsonify({"error": "O campo 'justification' é obrigatório."}), 400
+
+    # Captura snapshot congelado de score e Cenário A/B
+    econ = search.economic_standing if isinstance(search.economic_standing, dict) else {}
+    cenario = econ.get("cenario") or ("CENARIO_A" if (search.overall_risk_score or 0) < 50 else "CENARIO_B")
+    
+    risk_snapshot = {
+        "overall_risk_score": float(search.overall_risk_score or 0.0),
+        "cenario": cenario,
+        "total_processes": search.total_processes,
+        "score_risco_terceirizacao": float(search.overall_risk_score or 0.0),
+        "company_name": search.company_name,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        audit_entry = AuditLog(
+            tenant_id=current_user.tenant_id,
+            user_id=current_user.id,
+            company_search_id=search.id,
+            decision=decision,
+            justification=justification,
+            risk_score_snapshot=risk_snapshot,
+        )
+        db.session.add(audit_entry)
+        db.session.commit()
+
+        logger.info(
+            "Decisão de auditoria registrada: user_id=%d, tenant_id=%d, search_id=%d, decision=%s",
+            current_user.id, current_user.tenant_id, search.id, decision
+        )
+        return jsonify({
+            "status": "success",
+            "message": "Decisão de compliance registrada com sucesso.",
+            "audit_log": audit_entry.to_dict(),
+        }), 201
+
+    except Exception as exc:
+        db.session.rollback()
+        logger.exception("Erro ao registrar decisão de auditoria: %s", exc)
+        return jsonify({"error": "Falha interna ao registrar decisão de auditoria."}), 500
+
+
+@api_bp.route("/audit-logs", methods=["GET"])
+@require_auth
+def list_audit_logs():
+    """
+    Lista registros da trilha de auditoria imutável do tenant autenticado.
+    Suporta paginação e filtros opcionais por company_search_id e decision.
+    """
+    current_user = g.current_user
+    tenant_id = current_user.tenant_id
+
+    page = max(1, int(request.args.get("page", 1)))
+    per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+    search_id_filter = request.args.get("company_search_id")
+    decision_filter = request.args.get("decision")
+
+    try:
+        query = AuditLog.query.filter_by(tenant_id=tenant_id)
+
+        if search_id_filter and str(search_id_filter).isdigit():
+            query = query.filter_by(company_search_id=int(search_id_filter))
+
+        if decision_filter:
+            dec_up = str(decision_filter).strip().upper()
+            if dec_up in AuditLog.VALID_DECISIONS:
+                query = query.filter_by(decision=dec_up)
+
+        total = query.count()
+        logs = (
+            query.order_by(AuditLog.created_at.desc())
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+            .all()
+        )
+
+        return jsonify({
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "items": [log.to_dict() for log in logs],
+        }), 200
+
+    except Exception as exc:
+        logger.exception("Erro ao listar trilha de auditoria: %s", exc)
+        return jsonify({"error": "Falha ao recuperar logs de auditoria."}), 500
+
+
+@api_bp.route("/audit-logs/<int:audit_id>", methods=["PUT", "PATCH", "DELETE"])
+@require_auth
+def block_audit_log_mutations(audit_id: int):
+    """Bloqueio explícito de mutação ou deleção de logs de auditoria via API."""
+    return jsonify({
+        "error": "Operação não permitida: a trilha de auditoria é estritamente imutável (append-only)."
+    }), 405
+
 #   (alias: /api/v1/companies/search)
 #
 # COLE ESTE BLOCO no mesmo arquivo do `api_bp` (o que contém search_company),
