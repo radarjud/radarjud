@@ -2024,7 +2024,7 @@ def compare_companies():
         return jsonify({"error": "Forneça pelo menos 2 empresas distintas para comparação."}), 400
 
     try:
-        benchmark = build_sector_benchmark(resolved_payloads)
+        benchmark = build_sector_benchmark(resolved_payloads, ai_analyzer=orchestrator.ai_analyzer)
         return jsonify(benchmark), 200
     except Exception as bench_err:
         logger.exception("Erro ao gerar benchmarking setorial: %s", bench_err)

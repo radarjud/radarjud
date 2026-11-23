@@ -958,7 +958,10 @@ class SectorBenchmarkResponse(TypedDict):
     parecer_comparativo: Dict[str, Any]
 
 
-def build_sector_benchmark(company_payloads: List[Dict[str, Any]]) -> SectorBenchmarkResponse:
+def build_sector_benchmark(
+    company_payloads: List[Dict[str, Any]],
+    ai_analyzer: Optional[Any] = None,
+) -> SectorBenchmarkResponse:
     """
     Motor de Benchmarking Setorial com Ranqueamento Bayesiano, Classificação em 3 Faixas e IC 90%.
 
@@ -1280,37 +1283,57 @@ def build_sector_benchmark(company_payloads: List[Dict[str, Any]]) -> SectorBenc
         },
     }
 
-    diff_pts = round(pior_opcao["risco_subsidiario"] - melhor_opcao["risco_subsidiario"], 1)
-    alerta_critico = (
-        f"Alerta crítico: {pior_opcao['empresa']} apresenta risco subsidiário de {pior_opcao['risco_subsidiario']}%, "
-        f"classificada na faixa de REPROVAÇÃO com alta probabilidade de calote e redirecionamento (Súmula 331 TST)."
-        if pior_opcao["risco_subsidiario"] >= 40.0
-        else None
-    )
-    economia_texto = (
-        f"A contratação prioritária de {melhor_opcao['empresa']} em relação à última colocada "
-        f"mitiga a exposição ao passivo trabalhista em até {diff_pts} pontos percentuais de risco subsidiário."
-        if diff_pts > 0
-        else "Todas as empresas avaliadas possuem risco subsidiário equivalente."
-    )
-    justificativa = (
-        f"Comparativo técnico entre {len(processed_companies)} fornecedores com base em inferência bayesiana e solvência patrimonial. "
-        f"A empresa {melhor_opcao['empresa']} obteve a melhor qualificação ({melhor_opcao['faixa_decisao']}) "
-        f"com risco subsidiário de {melhor_opcao['risco_subsidiario']}%. "
-    )
-    if pior_opcao["faixa_decisao"] == "REPROVAR":
-        justificativa += (
-            f"Recomenda-se reprovação ou exigência de garantia fidejussória para {pior_opcao['empresa']} "
-            f"devido ao elevado risco subsidiário ({pior_opcao['risco_subsidiario']}%)."
-        )
+    # Parecer Comparativo com IA (US-12) via LegalAIAnalyzer (ADK -> Gemini -> Fallback Heurístico Local)
+    parecer_comparativo = None
+    if ai_analyzer is None:
+        try:
+            from app.services.ai_analyzer import LegalAIAnalyzer
+            ai_analyzer = LegalAIAnalyzer()
+        except Exception:
+            ai_analyzer = None
 
-    parecer_comparativo = {
-        "recomendacao_compra": f"Recomenda-se a contratação prioritária de {melhor_opcao['empresa']}, classificada em 1º lugar.",
-        "primeiro_lugar": melhor_opcao["empresa"],
-        "alerta_critico": alerta_critico,
-        "economia_potencial_texto": economia_texto,
-        "justificativa_executiva": justificativa,
-    }
+    if ai_analyzer is not None and hasattr(ai_analyzer, "generate_comparative_analysis"):
+        try:
+            parecer_comparativo = ai_analyzer.generate_comparative_analysis(
+                processed_companies,
+                cnae_info=cnae_comum,
+            )
+        except Exception as ai_err:
+            logger.warning("Falha ao invocar LegalAIAnalyzer no benchmark setorial: %s", ai_err)
+            parecer_comparativo = None
+
+    if not parecer_comparativo:
+        diff_pts = round(pior_opcao["risco_subsidiario"] - melhor_opcao["risco_subsidiario"], 1)
+        alerta_critico = (
+            f"Alerta crítico: {pior_opcao['empresa']} apresenta risco subsidiário de {pior_opcao['risco_subsidiario']}%, "
+            f"classificada na faixa de REPROVAÇÃO com alta probabilidade de calote e redirecionamento (Súmula 331 TST)."
+            if pior_opcao["risco_subsidiario"] >= 40.0
+            else None
+        )
+        economia_texto = (
+            f"A contratação prioritária de {melhor_opcao['empresa']} em relação à última colocada "
+            f"mitiga a exposição ao passivo trabalhista em até {diff_pts} pontos percentuais de risco subsidiário."
+            if diff_pts > 0
+            else "Todas as empresas avaliadas possuem risco subsidiário equivalente."
+        )
+        justificativa = (
+            f"Comparativo técnico entre {len(processed_companies)} fornecedores com base em inferência bayesiana e solvência patrimonial. "
+            f"A empresa {melhor_opcao['empresa']} obteve a melhor qualificação ({melhor_opcao['faixa_decisao']}) "
+            f"com risco subsidiário de {melhor_opcao['risco_subsidiario']}%. "
+        )
+        if pior_opcao["faixa_decisao"] == "REPROVAR":
+            justificativa += (
+                f"Recomenda-se reprovação ou exigência de garantia fidejussória para {pior_opcao['empresa']} "
+                f"devido ao elevado risco subsidiário ({pior_opcao['risco_subsidiario']}%)."
+            )
+
+        parecer_comparativo = {
+            "recomendacao_compra": f"Recomenda-se a contratação prioritária de {melhor_opcao['empresa']}, classificada em 1º lugar.",
+            "primeiro_lugar": melhor_opcao["empresa"],
+            "alerta_critico": alerta_critico,
+            "economia_potencial_texto": economia_texto,
+            "justificativa_executiva": justificativa,
+        }
 
     return {
         "empresas_ranqueadas": processed_companies,
