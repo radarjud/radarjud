@@ -65,7 +65,7 @@ def create_access_token(user, expires_in_minutes: int = 30) -> str:
     """Gera um JWT de curta duração (30 min) para acesso autenticado às rotas."""
     now = int(time.time())
     payload = {
-        "sub": user.id,
+        "sub": str(user.id),
         "tenant_id": user.tenant_id,
         "email": user.email,
         "role": user.role,
@@ -75,7 +75,8 @@ def create_access_token(user, expires_in_minutes: int = 30) -> str:
     }
     secret = _get_secret_key()
     if _pyjwt:
-        return _pyjwt.encode(payload, secret, algorithm="HS256")
+        token = _pyjwt.encode(payload, secret, algorithm="HS256")
+        return token.decode("utf-8") if isinstance(token, bytes) else str(token)
     return _native_hs256_encode(payload, secret)
 
 
@@ -83,7 +84,7 @@ def create_refresh_token(user, expires_in_days: int = 7) -> str:
     """Gera um refresh token de longa duração (7 dias) para renovação do access token."""
     now = int(time.time())
     payload = {
-        "sub": user.id,
+        "sub": str(user.id),
         "tenant_id": user.tenant_id,
         "type": "refresh",
         "iat": now,
@@ -91,13 +92,15 @@ def create_refresh_token(user, expires_in_days: int = 7) -> str:
     }
     secret = _get_secret_key()
     if _pyjwt:
-        return _pyjwt.encode(payload, secret, algorithm="HS256")
+        token = _pyjwt.encode(payload, secret, algorithm="HS256")
+        return token.decode("utf-8") if isinstance(token, bytes) else str(token)
     return _native_hs256_encode(payload, secret)
 
 
 def decode_token(token: str) -> Dict[str, Any]:
     """Decodifica e valida assinatura e expiração do JWT."""
     secret = _get_secret_key()
+    token_str = token.decode("utf-8") if isinstance(token, bytes) else str(token)
     if _pyjwt:
-        return _pyjwt.decode(token, secret, algorithms=["HS256"])
-    return _native_hs256_decode(token, secret)
+        return _pyjwt.decode(token_str, secret, algorithms=["HS256"])
+    return _native_hs256_decode(token_str, secret)

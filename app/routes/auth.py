@@ -143,7 +143,11 @@ def refresh():
         return jsonify({"error": "Tipo de token incorreto para renovação."}), 401
 
     user_id = payload.get("sub")
-    user = db.session.get(User, user_id)
+    try:
+        uid_int = int(user_id)
+    except (ValueError, TypeError):
+        uid_int = user_id
+    user = db.session.get(User, uid_int)
     if not user or not user.is_active:
         return jsonify({"error": "Usuário inexistente ou inativo."}), 401
 

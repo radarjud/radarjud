@@ -30,7 +30,11 @@ def get_current_user_optional():
         user_id = payload.get("sub")
         if not user_id:
             return None
-        user = db.session.get(User, user_id)
+        try:
+            uid_int = int(user_id)
+        except (ValueError, TypeError):
+            uid_int = user_id
+        user = db.session.get(User, uid_int)
         if user and user.is_active:
             g.current_user = user
             g.current_tenant_id = user.tenant_id

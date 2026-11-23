@@ -62,7 +62,7 @@ def test_auth_me_endpoint(client):
     reg_resp = client.post("/api/v1/auth/register", json={
         "name": "Maria Analista",
         "email": "maria@analise.com",
-        "password": "senha-forte-123",
+        "password": "senha-forte-123",  # gitleaks:allow
         "tenant_name": "Consultoria Compliance",
         "role": "ANALISTA",
     })
