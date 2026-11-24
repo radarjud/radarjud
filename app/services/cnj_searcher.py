@@ -273,34 +273,46 @@ GENERIC_SUBJECT_TERMS = {
 # Mapa léxico determinístico de altíssima precisão para extração em microssegundos (0.01ms)
 DETAILED_CAUSE_PATTERNS = [
     # Bancário / Cível / Consumidor
-    (7780, "Fraude Bancária / Golpe do PIX / Contestação de Transação", re.compile(r"golpe\s+do\s+pix|fraude|transa[cç][aã]o\s+n[aã]o\s+reconhecida|bloqueio\s+indevido|bloqueio\s+de\s+conta|med\s+pix|invas[aã]o\s+de\s+conta|engenharia\s+social|fortuito\s+interno|s[uú]mula\s*479", re.I)),
-    (7779, "Negativação Indevida (SPC / Serasa)", re.compile(r"negativa[cç][aã]o\s+indevida|inscri[cç][aã]o\s+indevida|serasa|spc|cadastro\s+de\s+inadimplentes|apontamento\s+desabonador", re.I)),
-    (9587, "Tarifas Bancárias e Cobrança Indevida", re.compile(r"tarifa\s+banc[aá]ria|cesta\s+de\s+servi[cç]os|pacote\s+de\s+servi[cç]os|cobran[cç]a\s+indevida|falha\s+na\s+presta[cç][aã]o|repeti[cç][aã]o\s+do\s+ind[eé]bito|taxa\s+de\s+manuten[cç][aã]o", re.I)),
-    (4960, "Revisão de Contrato e Juros Abusivos", re.compile(r"revis[aã]o\s+de\s+contrato|juros\s+abusivos|anatocismo|taxa\s+de\s+juros|tabela\s+price|cl[aá]usula\s+abusiva|capitaliza[cç][aã]o\s+de\s+juros", re.I)),
-    (997, "Busca e Apreensão em Alienação Fiduciária", re.compile(r"busca\s+e\s+apreens[aã]o|aliena[cç][aã]o\s+fiduci[aá]ria|decreto[\s-]lei\s*911|apreens[aã]o\s+de\s+ve[ií]culo|purga[cç][aã]o\s+da\s+mora", re.I)),
-    (4970, "Empréstimo Consignado e Reserva de Margem (RMC)", re.compile(r"empr[eé]stimo\s+consignado|reserva\s+de\s+margem|rmc|rcc|desconto\s+em\s+folha|cart[aã]o\s+consignado|margem\s+consign[aá]vel", re.I)),
-    (7771, "Cartão de Crédito e Anuidade", re.compile(r"cart[aã]o\s+de\s+cr[eé]dito|anuidade|limite\s+do\s+cart[aã]o|fatura\s+do\s+cart[aã]o", re.I)),
-    (4980, "Superendividamento e Repactuação de Dívidas", re.compile(r"superendividamento|lei\s*14\.?181|repactua[cç][aã]o\s+de\s+d[ií]vidas|m[ií]nimo\s+existencial|renegocia[cç][aã]o", re.I)),
-    (10433, "Indenização por Danos Morais (Direito do Consumidor)", re.compile(r"dano\s+moral\s+ao\s+consumidor|cdc|c[oó]digo\s+de\s+defesa\s+do\s+consumidor|rela[cç][aã]o\s+de\s+consumo", re.I)),
+    (7780, "Fraude Bancária / Golpe do PIX / Contestação de Transação", re.compile(r"golpe\s+do\s+pix|fraude|transa[cç][aã]o\s+n[aã]o\s+reconhecida|bloqueio\s+indevido|bloqueio\s+de\s+conta|med\s+pix|invas[aã]o\s+de\s+conta|engenharia\s+social|fortuito\s+interno|s[uú]mula\s*479")),
+    (7779, "Negativação Indevida (SPC / Serasa)", re.compile(r"negativa[cç][aã]o\s+indevida|inscri[cç][aã]o\s+indevida|serasa|spc|cadastro\s+de\s+inadimplentes|apontamento\s+desabonador")),
+    (9587, "Tarifas Bancárias e Cobrança Indevida", re.compile(r"tarifa\s+banc[aá]ria|cesta\s+de\s+servi[cç]os|pacote\s+de\s+servi[cç]os|cobran[cç]a\s+indevida|falha\s+na\s+presta[cç][aã]o|repeti[cç][aã]o\s+do\s+ind[eé]bito|taxa\s+de\s+manuten[cç][aã]o")),
+    (4960, "Revisão de Contrato e Juros Abusivos", re.compile(r"revis[aã]o\s+de\s+contrato|juros\s+abusivos|anatocismo|taxa\s+de\s+juros|tabela\s+price|cl[aá]usula\s+abusiva|capitaliza[cç][aã]o\s+de\s+juros")),
+    (997, "Busca e Apreensão em Alienação Fiduciária", re.compile(r"busca\s+e\s+apreens[aã]o|aliena[cç][aã]o\s+fiduci[aá]ria|decreto[\s-]lei\s*911|apreens[aã]o\s+de\s+ve[ií]culo|purga[cç][aã]o\s+da\s+mora")),
+    (4970, "Empréstimo Consignado e Reserva de Margem (RMC)", re.compile(r"empr[eé]stimo\s+consignado|reserva\s+de\s+margem|rmc|rcc|desconto\s+em\s+folha|cart[aã]o\s+consignado|margem\s+consign[aá]vel")),
+    (7771, "Cartão de Crédito e Anuidade", re.compile(r"cart[aã]o\s+de\s+cr[eé]dito|anuidade|limite\s+do\s+cart[aã]o|fatura\s+do\s+cart[aã]o")),
+    (4980, "Superendividamento e Repactuação de Dívidas", re.compile(r"superendividamento|lei\s*14\.?181|repactua[cç][aã]o\s+de\s+d[ií]vidas|m[ií]nimo\s+existencial|renegocia[cç][aã]o")),
+    (10433, "Indenização por Danos Morais (Direito do Consumidor)", re.compile(r"dano\s+moral\s+ao\s+consumidor|cdc|c[oó]digo\s+de\s+defesa\s+do\s+consumidor|rela[cç][aã]o\s+de\s+consumo")),
 
     # Trabalhista Bancário e Geral
-    (224, "Direitos da Categoria Bancária (7ª e 8ª Horas / Cargo de Confiança)", re.compile(r"banc[aá]ri[ao]|cargo\s+de\s+confian[cç]a|7[aª]\s+hora|8[aª]\s+hora|s[eé]tima\s+e\s+oitava|enquadramento\s+banc[aá]rio|gratifica[cç][aã]o\s+de\s+fun[cç][aã]o|jornada\s+de\s+seis\s+horas|art\.\s*224", re.I)),
-    (2550, "Equiparação Salarial e Desvio de Função", re.compile(r"equipara[cç][aã]o\s+salarial|desvio\s+de\s+fun[cç][aã]o|paradigma|diferen[cç]as?\s+salariais?|ac[uú]mulo\s+de\s+fun[cç][aã]o", re.I)),
-    (2551, "Participação nos Lucros e Resultados (PLR) e Bônus", re.compile(r"\bplr\b|participa[cç][aã]o\s+nos\s+lucros|b[oô]nus|pr[eé]mio\s+produ[cç][aã]o|programa\s+de\s+remunera[cç][aã]o", re.I)),
-    (2552, "Cobrança de Metas e Estorno de Comissões", re.compile(r"estorno\s+de\s+comiss[oõ]es|cobran[cç]a\s+de\s+metas|metas\s+abusivas|diferen[cç]as?\s+de\s+comiss|comiss[oõ]es\s+por\s+vendas", re.I)),
-    (1694, "Horas Extras e Intervalo Intrajornada", re.compile(r"horas?\s+extras?|sobrejornada|intrajornada|banco\s+de\s+horas|art\.\s*71|controle\s+de\s+ponto|cart[aã]o\s+de\s+ponto|jornada\s+de\s+trabalho|dsr|sobreaviso", re.I)),
-    (2546, "Inadimplemento de Verbas Rescisórias e Multa 40%", re.compile(r"verbas\s+rescis[oó]rias|multa\s+do\s+art\.\s*477|multa\s+de\s+40%|aviso\s+pr[eé]vio\s+indenizado|saldo\s+de\s+sal[aá]rio|13[oº]\s+sal[aá]rio|f[eé]rias\s+proporcionais|trct|rescis[aã]o\s+indireta", re.I)),
-    (2029, "Irregularidade / Ausência de Depósitos de FGTS", re.compile(r"dep[oó]sitos?\s+do\s+fgts|extrato\s+anal[ií]tico\s+do\s+fgts|diferen[cç]as\s+de\s+fgts|fundo\s+de\s+garantia|saque\s+do\s+fgts|guias\s+de\s+fgts", re.I)),
-    (1855, "Assédio Moral e Danos Morais Trabalhistas", re.compile(r"ass[eé]dio\s+moral|dano\s+moral|danos\s+morais|indeniza[cç][aã]o\s+por\s+dano|humilha[cç][aã]o|tratamento\s+degradante", re.I)),
-    (1656, "Adicional de Insalubridade (NR-15)", re.compile(r"insalubridade|agente\s+insalubre|nr[\s-]*15|laudo\s+pericial\s+insalub", re.I)),
-    (1681, "Adicional de Periculosidade (NR-16)", re.compile(r"periculosidade|inflam[aá]veis|energia\s+el[eé]trica|nr[\s-]*16|risco\s+acentuado", re.I)),
-    (1904, "Responsabilidade Subsidiária / Terceirização (Súmula 331 TST)", re.compile(r"responsabilidade\s+subsidi[aá]ria|s[uú]mula\s*331|tomadora?\s+de\s+servi[cç]os|culpa\s+in\s+vigilando|terceiriza[cç][aã]o|prestadora\s+de\s+servi[cç]os", re.I)),
-    (1998, "Reconhecimento de Vínculo Empregatício (Pejotização)", re.compile(r"v[ií]nculo\s+de\s+emprego|v[ií]nculo\s+empregat[ií]cio|anota[cç][aã]o\s+da\s+ctps|subordina[cç][aã]o\s+jur[ií]dica|pejotiza[cç][aã]o", re.I)),
-    (8801, "Acidente de Trabalho / Doença Ocupacional", re.compile(r"acidente\s+de\s+trabalho|doen[cç]a\s+ocupacional|ler\s*\/?\s*dort|nexo\s+causal|estabilidade\s+acident[aá]ria", re.I)),
-    (1682, "Adicional Noturno", re.compile(r"adicional\s+noturno|jornada\s+noturna|hora\s+noturna", re.I)),
-    (2555, "Reintegração e Estabilidade Provisória", re.compile(r"reintegra[cç][aã]o|estabilidade\s+provis[oó]ria|estabilidade\s+gestante|cipeir[ao]|acidente\s+de\s+trabalho", re.I)),
-    (10000, "Execução e Cumprimento de Sentença Trabalhista", re.compile(r"sisbajud|penhora|bloqueio|c[aá]lculos\s+de\s+liquida[cç][aã]o|cumprimento\s+de\s+senten[cç]a|execu[cç][aã]o\s+trabalhista|execu[cç][aã]o\s+de\s+t[ií]tulo", re.I)),
+    (224, "Direitos da Categoria Bancária (7ª e 8ª Horas / Cargo de Confiança)", re.compile(r"banc[aá]ri[ao]|cargo\s+de\s+confian[cç]a|7[aª]\s+hora|8[aª]\s+hora|s[eé]tima\s+e\s+oitava|enquadramento\s+banc[aá]rio|gratifica[cç][aã]o\s+de\s+fun[cç][aã]o|jornada\s+de\s+seis\s+horas|art\.\s*224")),
+    (2550, "Equiparação Salarial e Desvio de Função", re.compile(r"equipara[cç][aã]o\s+salarial|desvio\s+de\s+fun[cç][aã]o|paradigma|diferen[cç]as?\s+salariais?|ac[uú]mulo\s+de\s+fun[cç][aã]o")),
+    (2551, "Participação nos Lucros e Resultados (PLR) e Bônus", re.compile(r"\bplr\b|participa[cç][aã]o\s+nos\s+lucros|b[oô]nus|pr[eé]mio\s+produ[cç][aã]o|programa\s+de\s+remunera[cç][aã]o")),
+    (2552, "Cobrança de Metas e Estorno de Comissões", re.compile(r"estorno\s+de\s+comiss[oõ]es|cobran[cç]a\s+de\s+metas|metas\s+abusivas|diferen[cç]as?\s+de\s+comiss|comiss[oõ]es\s+por\s+vendas")),
+    (1694, "Horas Extras e Intervalo Intrajornada", re.compile(r"horas?\s+extras?|sobrejornada|intrajornada|banco\s+de\s+horas|art\.\s*71|controle\s+de\s+ponto|cart[aã]o\s+de\s+ponto|jornada\s+de\s+trabalho|dsr|sobreaviso")),
+    (2546, "Inadimplemento de Verbas Rescisórias e Multa 40%", re.compile(r"verbas\s+rescis[oó]rias|multa\s+do\s+art\.\s*477|multa\s+de\s+40%|aviso\s+pr[eé]vio\s+indenizado|saldo\s+de\s+sal[aá]rio|13[oº]\s+sal[aá]rio|f[eé]rias\s+proporcionais|trct|rescis[aã]o\s+indireta")),
+    (2029, "Irregularidade / Ausência de Depósitos de FGTS", re.compile(r"dep[oó]sitos?\s+do\s+fgts|extrato\s+anal[ií]tico\s+do\s+fgts|diferen[cç]as\s+de\s+fgts|fundo\s+de\s+garantia|saque\s+do\s+fgts|guias\s+de\s+fgts")),
+    (1855, "Assédio Moral e Danos Morais Trabalhistas", re.compile(r"ass[eé]dio\s+moral|dano\s+moral|danos\s+morais|indeniza[cç][aã]o\s+por\s+dano|humilha[cç][aã]o|tratamento\s+degradante")),
+    (1656, "Adicional de Insalubridade (NR-15)", re.compile(r"insalubridade|agente\s+insalubre|nr[\s-]*15|laudo\s+pericial\s+insalub")),
+    (1681, "Adicional de Periculosidade (NR-16)", re.compile(r"periculosidade|inflam[aá]veis|energia\s+el[eé]trica|nr[\s-]*16|risco\s+acentuado")),
+    (1904, "Responsabilidade Subsidiária / Terceirização (Súmula 331 TST)", re.compile(r"responsabilidade\s+subsidi[aá]ria|s[uú]mula\s*331|tomadora?\s+de\s+servi[cç]os|culpa\s+in\s+vigilando|terceiriza[cç][aã]o|prestadora\s+de\s+servi[cç]os")),
+    (1998, "Reconhecimento de Vínculo Empregatício (Pejotização)", re.compile(r"v[ií]nculo\s+de\s+emprego|v[ií]nculo\s+empregat[ií]cio|anota[cç][aã]o\s+da\s+ctps|subordina[cç][aã]o\s+jur[ií]dica|pejotiza[cç][aã]o")),
+    (8801, "Acidente de Trabalho / Doença Ocupacional", re.compile(r"acidente\s+de\s+trabalho|doen[cç]a\s+ocupacional|ler\s*\/?\s*dort|nexo\s+causal|estabilidade\s+acident[aá]ria")),
+    (1682, "Adicional Noturno", re.compile(r"adicional\s+noturno|jornada\s+noturna|hora\s+noturna")),
+    (2555, "Reintegração e Estabilidade Provisória", re.compile(r"reintegra[cç][aã]o|estabilidade\s+provis[oó]ria|estabilidade\s+gestante|cipeir[ao]|acidente\s+de\s+trabalho")),
+    (10000, "Execução e Cumprimento de Sentença Trabalhista", re.compile(r"sisbajud|penhora|bloqueio|c[aá]lculos\s+de\s+liquida[cç][aã]o|cumprimento\s+de\s+senten[cç]a|execu[cç][aã]o\s+trabalhista|execu[cç][aã]o\s+de\s+t[ií]tulo")),
 ]
+
+_CAUSE_FILTERS = [
+    (
+        code,
+        label,
+        p,
+        tuple({w for part in p.pattern.split("|") for w in re.findall(r"[a-z0-9]{3,}", part)}),
+    )
+    for code, label, p in DETAILED_CAUSE_PATTERNS
+]
+
+_CAUSE_CACHE: Dict[str, list] = {}
 
 
 def extract_real_cause_fast(
@@ -319,9 +331,17 @@ def extract_real_cause_fast(
     matched_causes = []
 
     if full_text:
-        for code, label, pattern in DETAILED_CAUSE_PATTERNS:
-            if pattern.search(full_text):
-                matched_causes.append({"codigo": code, "nome": label})
+        full_text_lower = full_text.lower()
+        if full_text_lower in _CAUSE_CACHE:
+            matched_causes = [dict(c) for c in _CAUSE_CACHE[full_text_lower]]
+        else:
+            for code, label, pattern, kws in _CAUSE_FILTERS:
+                if (not kws or any(kw in full_text_lower for kw in kws)) and pattern.search(full_text_lower):
+                    matched_causes.append({"codigo": code, "nome": label})
+                    if len(matched_causes) >= 3:
+                        break
+            if len(_CAUSE_CACHE) < 2048:
+                _CAUSE_CACHE[full_text_lower] = [dict(c) for c in matched_causes]
 
     # Se achou causas específicas no texto da publicação/sentença, usa elas prioritariamente!
     if matched_causes:

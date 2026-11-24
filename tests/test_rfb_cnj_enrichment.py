@@ -1,30 +1,31 @@
 # Copyright (c) 2026 Equipe RadarJus - Todos os direitos reservados (Lei nº 9.609/1998).
 # Proibida a reprodução, distribuição ou uso comercial sem autorização expressa dos autores.
 
-import pytest
 from datetime import date
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from app import create_app
 from app.extensions import db
-from app.models.CompanyRegistry import CompanyRegistry
 from app.models.company_search import CompanySearch
+from app.models.CompanyRegistry import CompanyRegistry
 from app.models.process_record import ProcessRecord
+from app.seeds.cnae_seed import backfill_cnae_metadata
+from app.services.cnj_searcher import (
+    normalize_court_code,
+    parse_currency_value,
+    parse_iso_date,
+)
 from app.services.economic_service import (
-    normalize_cnae_code,
+    EconomicStandingService,
     _fetch_from_brasilapi,
-    _fetch_from_receitaws,
     _fetch_from_cnpjws,
     _fetch_from_minhareceita,
-    EconomicStandingService,
+    _fetch_from_receitaws,
+    normalize_cnae_code,
 )
-from app.services.cnj_searcher import (
-    parse_iso_date,
-    parse_currency_value,
-    normalize_court_code,
-)
-from app.seeds.cnae_seed import backfill_cnae_metadata
 
 
 @pytest.fixture

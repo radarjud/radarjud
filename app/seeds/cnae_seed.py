@@ -1,19 +1,23 @@
 # Copyright (c) 2026 Equipe RadarJus - Todos os direitos reservados (Lei nº 9.609/1998).
 # Proibida a reprodução, distribuição ou uso comercial sem autorização expressa dos autores.
 
-import re
 import logging
-from typing import Dict, Any, Optional
+import re
+from typing import Any
+
 from app.extensions import db
-from app.models.CompanyRegistry import CompanyRegistry
 from app.models.company_search import CompanySearch, get_utc_now
-from app.services.economic_service import OFFICIAL_CORPORATE_METADATA, normalize_cnae_code
+from app.models.CompanyRegistry import CompanyRegistry
+from app.services.economic_service import (
+    OFFICIAL_CORPORATE_METADATA,
+    normalize_cnae_code,
+)
 from app.utils.sanitizer import sanitize_company_name
 
 logger = logging.getLogger(__name__)
 
 
-def backfill_cnae_metadata(app: Optional[Any] = None) -> Dict[str, int]:
+def backfill_cnae_metadata(app: Any | None = None) -> dict[str, int]:
     """
     Rotina utilitária e idempotente para preenchimento de metadados CNAE (código e descrição)
     nas tabelas CompanyRegistry e CompanySearch com base no catálogo corporativo oficial.
