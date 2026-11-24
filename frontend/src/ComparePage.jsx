@@ -3,7 +3,7 @@
 
 import React, { useState, useEffect } from 'react';
 import {
-  Scale, Plus, X, AlertCircle, AlertTriangle, CheckCircle2,
+  ArrowLeftRight, Plus, X, AlertCircle, AlertTriangle, CheckCircle2,
   Download, RefreshCw, Building2, TrendingUp, ShieldAlert,
   ArrowRight, Sparkles, FileText, BarChart3, HelpCircle
 } from 'lucide-react';
@@ -629,7 +629,7 @@ export default function ComparePage({ request, history = [], currentCompany, nav
         <div className="selected-chips-container">
           {selectedCompanies.length === 0 ? (
             <div className="empty-selection-note">
-              <Scale size={20} />
+              <ArrowLeftRight size={20} />
               <span>Nenhuma empresa selecionada ainda. Adicione acima ou escolha do histórico abaixo.</span>
             </div>
           ) : (
@@ -716,7 +716,7 @@ export default function ComparePage({ request, history = [], currentCompany, nav
               </>
             ) : (
               <>
-                <Scale size={18} />
+                <ArrowLeftRight size={18} />
                 Comparar {selectedCompanies.length > 1 ? `${selectedCompanies.length} Fornecedores` : 'Empresas'}
               </>
             )}
@@ -808,7 +808,7 @@ export default function ComparePage({ request, history = [], currentCompany, nav
       {!hasResult && !busy && (
         <div className="compare-empty-state card">
           <div className="empty-state-icon">
-            <Scale size={42} />
+            <ArrowLeftRight size={42} />
           </div>
           <h3>Como funciona o Benchmarking Setorial?</h3>
           <p>

@@ -6,7 +6,7 @@ import {
   Search, LayoutDashboard, FileText, ChartNoAxesCombined, History,
   Menu, X, ArrowRight, RefreshCw, AlertCircle, AlertTriangle, ShieldCheck, ShieldAlert,
   Info, ChevronRight, Building2, TrendingUp, Filter, CheckCircle2,
-  Check, Activity, BarChart3, Radar, Share2, Download, Library, Scale
+  Check, Activity, BarChart3, Radar, Share2, Download, Library, ArrowLeftRight
 } from 'lucide-react';
 import { companyHash, companyShareUrl, isCompanyPage, parseRoute, validSearchId } from './companyNavigation.js';
 import { CompanyLogo } from "./CompanyLogo.jsx";
@@ -22,7 +22,7 @@ const PAGE_LABELS = {
 const NAV_ITEMS = [
   { id: 'search', icon: Search }, { id: 'catalog', icon: Library }, { id: 'overview', icon: LayoutDashboard },
   { id: 'processes', icon: FileText }, { id: 'predictions', icon: ChartNoAxesCombined },
-  { id: 'compare', icon: Scale },
+  { id: 'compare', icon: ArrowLeftRight },
   { id: 'history', icon: History },
 ];
 const OUTCOME_LABELS = {
