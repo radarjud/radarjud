@@ -1,13 +1,16 @@
+# Copyright (c) 2026 Equipe RadarJus - Todos os direitos reservados (Lei nº 9.609/1998).
+# Proibida a reprodução, distribuição ou uso comercial sem autorização expressa dos autores.
+
 import os
 import re
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Set
 
 import requests
 
-from app.utils.cnj_proxy import cnj_post
+from app.utils.http_client import request_gov_br_with_fallback
 from app.utils.sanitizer import sanitize_company_name, is_cnpj, fetch_cnpj_brasilapi, remove_accents, extract_brand_search_term
 from app.utils.crypto import generate_movements_hash
 from app.utils.rate_limiter import RateLimiter
@@ -17,6 +20,7 @@ from app.services.tpu_constants import (
     TPU_OUTCOME_CODES,
     TPU_EXPERT_REPORT_CODES,
 )
+from app.utils.http_client import request_gov_br_with_fallback
 
 import html
 
@@ -478,7 +482,7 @@ class CNJMetadataOrchestrator:
         official_name = ""
         if is_cnpj(company_query):
             official_name = fetch_cnpj_brasilapi(company_query) or ""
-        else:
+        elif not fast_path:
             from app.services.economic_service import find_company_cnpj_by_name
             reg = find_company_cnpj_by_name(company_query)
             if reg and reg.get("razao_social"):
@@ -523,7 +527,14 @@ class CNJMetadataOrchestrator:
         }
 
         try:
-            resp = cnj_post(self.session, endpoint, json=payload, headers=headers, timeout=25)
+            resp = request_gov_br_with_fallback(
+                method="POST",
+                url=endpoint,
+                json_body=payload,
+                headers=headers,
+                timeout=25,
+                session=self.session,
+            )
             if resp.ok:
                 return resp.json().get("hits", {}).get("hits", [])
         except Exception as exc:
@@ -567,6 +578,7 @@ class CNJMetadataOrchestrator:
         fast_path: bool = False,
         limit_processes: int = 100,
         search_strategy: Optional[Dict[str, Any]] = None,
+        client_prefetched_items: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Executa a análise da empresa com dados reais completos.
@@ -585,13 +597,25 @@ class CNJMetadataOrchestrator:
         if search_strategy and search_strategy.get("comunica_query_term"):
             query_term = search_strategy["comunica_query_term"]
 
-        if fast_path and query_term:
-            processes_map = self.searcher.fetch_single_comunica_page(query_term, page_num=1, timeout=5.0) or {}
-        else:
-            search_input = query_term or company_name
-            processes_map = self._fetch_comunica_pje(search_input, max_pages=max_pages, fast_path=fast_path) or {}
-        
-        discovered_entities = getattr(self, "last_discovered_entities", [])
+        processes_map: Dict[str, Any] = {}
+        if client_prefetched_items:
+            logger.info("Ativando prefetch silencioso imediato Browser Edge Fetch com %d itens do cliente", len(client_prefetched_items))
+            prefetched_map: Dict[str, Any] = {}
+            disc_entities: Set[str] = set()
+            self.searcher._parse_comunica_items(client_prefetched_items, prefetched_map, disc_entities)
+            if prefetched_map:
+                processes_map = prefetched_map
+                discovered_entities = list(disc_entities)
+
+        if not processes_map:
+            if fast_path and query_term:
+                processes_map = self.searcher.fetch_single_comunica_page(query_term, page_num=1, timeout=5.0) or {}
+            else:
+                search_input = query_term or company_name
+                processes_map = self._fetch_comunica_pje(search_input, max_pages=max_pages, fast_path=fast_path) or {}
+            
+            if not discovered_entities:
+                discovered_entities = getattr(self, "last_discovered_entities", [])
 
         if not processes_map:
             empty_res = self._calculate_metrics(company_name, [], scan_status="COMPLETED")

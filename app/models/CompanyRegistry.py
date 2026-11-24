@@ -1,3 +1,7 @@
+from app.extensions import db
+from app.models.company_search import get_utc_now
+
+
 class CompanyRegistry(db.Model):
     __tablename__ = "company_registry"
 
@@ -15,9 +19,10 @@ class CompanyRegistry(db.Model):
 
     capital_social = db.Column(db.Numeric(15, 2), nullable=True)
 
-    created_at = db.Column(db.DateTime, default=get_utc_now)
+    created_at = db.Column(db.DateTime, default=get_utc_now, nullable=False)
     updated_at = db.Column(
         db.DateTime,
         default=get_utc_now,
-        onupdate=get_utc_now
+        onupdate=get_utc_now,
+        nullable=False
     )

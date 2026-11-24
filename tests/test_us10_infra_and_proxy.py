@@ -1,5 +1,4 @@
 import json
-import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import yaml
@@ -66,6 +65,7 @@ def test_render_yaml_and_vercel_json_us10_specs():
 
 def test_cnj_proxy_headers_sent_across_all_backend_clients(monkeypatch):
     monkeypatch.setenv("CNJ_PROXY_URL", "https://radarjus.vercel.app/api/cnj-proxy")
+    monkeypatch.setenv("CNJ_FORCE_PROXY", "true")
     monkeypatch.setenv("PROXY_SHARED_SECRET", "super-secret-token")
     monkeypatch.setenv("DATAJUD_API_KEY", "test-datajud-key")
 
@@ -82,7 +82,7 @@ def test_cnj_proxy_headers_sent_across_all_backend_clients(monkeypatch):
         assert m_get.call_args[0][0] == "https://radarjus.vercel.app/api/cnj-proxy"
         hdrs = m_get.call_args[1]["headers"]
         assert hdrs["x-proxy-secret"] == "super-secret-token"
-        assert "comunicaapi.pje.jus.br" in hdrs["x-target-url"]
+        assert "comunicaapi.pje.jus.br" in hdrs["X-Target-Url"]
 
     with patch.object(searcher.session, "post", return_value=mock_resp) as m_post:
         searcher.enrich_top_tribunals_datajud({"00000012320245020001": {"siglaTribunal": "TRT2"}})
@@ -90,7 +90,7 @@ def test_cnj_proxy_headers_sent_across_all_backend_clients(monkeypatch):
         assert m_post.call_args[0][0] == "https://radarjus.vercel.app/api/cnj-proxy"
         hdrs = m_post.call_args[1]["headers"]
         assert hdrs["x-proxy-secret"] == "super-secret-token"
-        assert "api-publica.datajud.cnj.jus.br/api_publica_trt2/_search" in hdrs["x-target-url"]
+        assert "api-publica.datajud.cnj.jus.br/api_publica_trt2/_search" in hdrs["X-Target-Url"]
 
     # 2. CNJMetadataOrchestrator (_query_datajud_tribunal POST)
     orchestrator = CNJMetadataOrchestrator()
@@ -100,19 +100,34 @@ def test_cnj_proxy_headers_sent_across_all_backend_clients(monkeypatch):
         assert m_orch_post.call_args[0][0] == "https://radarjus.vercel.app/api/cnj-proxy"
         assert m_orch_post.call_args[1]["headers"]["x-proxy-secret"] == "super-secret-token"
 
-    # 3. CNJClient (GET + POST)
+    # 3. CNJClient (GET + POST) e fallback automatico em 403
+    monkeypatch.setenv("CNJ_FORCE_PROXY", "false")
+    blocked_resp = MagicMock(status_code=403, ok=False)
     client = CNJClient()
-    with patch.object(client.session, "get", return_value=mock_resp) as m_cli_get:
+    with patch.object(client.session, "get", side_effect=[blocked_resp, mock_resp]) as m_cli_get:
         client.fetch_comunica_pje_by_name("EMPRESA TESTE")
-        m_cli_get.assert_called_once()
-        assert m_cli_get.call_args[0][0] == "https://radarjus.vercel.app/api/cnj-proxy"
-        assert m_cli_get.call_args[1]["headers"]["x-proxy-secret"] == "super-secret-token"
+        assert m_cli_get.call_count == 2
+        assert m_cli_get.call_args_list[1][0][0] == "https://radarjus.vercel.app/api/cnj-proxy"
+        assert m_cli_get.call_args_list[1][1]["headers"]["x-proxy-secret"] == "super-secret-token"
 
-    with patch.object(client.session, "post", return_value=mock_resp) as m_cli_post:
+    with patch.object(client.session, "post", side_effect=[blocked_resp, mock_resp]) as m_cli_post:
         client.fetch_datajud_process_metadata("00000012320245020001")
-        m_cli_post.assert_called_once()
-        assert m_cli_post.call_args[0][0] == "https://radarjus.vercel.app/api/cnj-proxy"
-        assert m_cli_post.call_args[1]["headers"]["x-proxy-secret"] == "super-secret-token"
+        assert m_cli_post.call_count == 2
+        assert m_cli_post.call_args_list[1][0][0] == "https://radarjus.vercel.app/api/cnj-proxy"
+        assert m_cli_post.call_args_list[1][1]["headers"]["x-proxy-secret"] == "super-secret-token"
+
+
+def test_flask_cnj_proxy_requires_secret_and_enforces_whitelist(client, monkeypatch):
+    monkeypatch.setenv("PROXY_SHARED_SECRET", "flask-proxy-secret")
+
+    r_missing = client.get("/api/cnj-proxy?target=https://comunicaapi.pje.jus.br/api/v1/comunicacao")
+    assert r_missing.status_code == 401
+
+    r_bad_host = client.get(
+        "/api/cnj-proxy?target=https://evil.example.com/data",
+        headers={"x-proxy-secret": "flask-proxy-secret"},
+    )
+    assert r_bad_host.status_code == 400
 
 
 def test_portal_transparencia_api_key_loaded_from_env(monkeypatch):
@@ -129,7 +144,7 @@ def test_no_hardcoded_datajud_or_secret_literals_in_source():
         "app/services/cnj_searcher.py",
         "app/services/orchestrator.py",
         "app/services/cnj_client.py",
-        "app/utils/cnj_proxy.py",
+        "app/utils/http_client.py",
         "frontend/api/cnj-proxy.js",
         "render.yaml",
     ):

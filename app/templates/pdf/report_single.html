@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <title>Relatório Executivo de Risco — {{ report.company_name }}</title>
+  <style>
+    @page {
+      size: A4 portrait;
+      margin: 14mm 15mm 16mm 15mm;
+      @bottom-left {
+        content: "RadarJus LegalTech • Relatório Executivo de Risco & Solvência";
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        font-size: 7.5pt;
+        color: #94a3b8;
+      }
+      @bottom-right {
+        content: "Página " counter(page) " de " counter(pages);
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        font-size: 7.5pt;
+        color: #64748b;
+        font-weight: 600;
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      color: #17283a;
+      background: #ffffff;
+      font-size: 9.5pt;
+      line-height: 1.45;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .header-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 2px solid #142335;
+      padding-bottom: 9px;
+      margin-bottom: 12px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .brand-title {
+      font-size: 15pt;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      color: #142335;
+    }
+
+    .brand-title span {
+      color: #245a81;
+    }
+
+    .brand-sub {
+      font-size: 7.5pt;
+      color: #64748b;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+    }
+
+    .header-meta {
+      text-align: right;
+      font-size: 7.5pt;
+      color: #64748b;
+      line-height: 1.35;
+    }
+
+    .header-meta strong {
+      color: #17283a;
+    }
+
+    .company-banner {
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
+      border-left: 5px solid #245a81;
+      border-radius: 6px;
+      padding: 10px 14px;
+      margin-bottom: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .company-info h1 {
+      font-size: 12pt;
+      font-weight: 800;
+      color: #0f172a;
+      letter-spacing: -0.3px;
+      margin-bottom: 2px;
+    }
+
+    .company-info p {
+      font-size: 8pt;
+      color: #475569;
+    }
+
+    .tag-badge {
+      display: inline-block;
+      padding: 4px 9px;
+      border-radius: 12px;
+      font-size: 7.5pt;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      white-space: nowrap;
+    }
+
+    .tag-cenario-a {
+      background: #ecfdf5;
+      color: #065f46;
+      border: 1px solid #a7f3d0;
+    }
+
+    .tag-cenario-b {
+      background: #fef2f2;
+      color: #991b1b;
+      border: 1px solid #fecaca;
+    }
+
+    .grid-kpis {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .kpi-card {
+      flex: 1;
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      padding: 8px 10px;
+    }
+
+    .kpi-label {
+      font-size: 6.8pt;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #64748b;
+      margin-bottom: 4px;
+    }
+
+    .kpi-value {
+      font-size: 13pt;
+      font-weight: 800;
+      color: #1e293b;
+      line-height: 1.1;
+    }
+
+    .kpi-value.blue { color: #245a81; }
+    .kpi-value.green { color: #16a34a; }
+    .kpi-value.amber { color: #d97706; }
+    .kpi-value.red { color: #dc2626; }
+
+    .kpi-sub {
+      font-size: 6.8pt;
+      color: #94a3b8;
+      margin-top: 3px;
+    }
+
+    .section-card {
+      background: #ffffff;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin-bottom: 11px;
+      page-break-inside: avoid;
+      break-inside: avoid;
+    }
+
+    .section-title {
+      font-size: 8.5pt;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: #1e293b;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .section-title::before {
+      content: "";
+      display: inline-block;
+      width: 3px;
+      height: 10pt;
+      background: #245a81;
+      border-radius: 2px;
+    }
+
+    .econ-grid {
+      display: flex;
+      gap: 12px;
+      font-size: 8pt;
+    }
+
+    .econ-col {
+      flex: 1;
+    }
+
+    .econ-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 3px 0;
+      border-bottom: 1px dotted #e2e8f0;
+    }
+
+    .econ-row:last-child {
+      border-bottom: none;
+    }
+
+    .econ-row span {
+      color: #64748b;
+    }
+
+    .econ-row strong {
+      color: #0f172a;
+      font-weight: 600;
+    }
+
+    .chart-container {
+      margin: 4px 0 2px 0;
+    }
+
+    .table-ranking {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 7.8pt;
+      margin-top: 4px;
+    }
+
+    .table-ranking th {
+      background: #f1f5f9;
+      color: #475569;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      font-size: 6.8pt;
+      padding: 5px 7px;
+      text-align: left;
+      border-bottom: 1px solid #cbd5e1;
+    }
+
+    .table-ranking td {
+      padding: 4px 7px;
+      border-bottom: 1px solid #f1f5f9;
+      color: #334155;
+    }
+
+    .table-ranking tr:last-child td {
+      border-bottom: none;
+    }
+
+    .table-ranking .text-right {
+      text-align: right;
+    }
+
+    .compliance-box {
+      background: #f8fafc;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      padding: 9px 12px;
+      margin-top: 6px;
+    }
+
+    .compliance-headline {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+
+    .compliance-headline strong {
+      font-size: 9pt;
+      color: #0f172a;
+    }
+
+    .compliance-text {
+      font-size: 7.8pt;
+      color: #334155;
+      line-height: 1.45;
+      margin-bottom: 6px;
+    }
+
+    .compliance-list {
+      list-style-type: none;
+      padding-left: 0;
+      font-size: 7.5pt;
+      color: #475569;
+    }
+
+    .compliance-list li {
+      margin-bottom: 3px;
+      padding-left: 10px;
+      position: relative;
+    }
+
+    .compliance-list li::before {
+      content: "•";
+      position: absolute;
+      left: 0;
+      color: #245a81;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Topo Institucional -->
+  <div class="header-bar">
+    <div class="brand">
+      <div>
+        <div class="brand-title">Radar<span>Jus</span></div>
+        <div class="brand-sub">Diagnóstico de Passivo & Solvência Trabalhista</div>
+      </div>
+    </div>
+    <div class="header-meta">
+      <div><strong>Emissão:</strong> {{ report.generated_at }}</div>
+      <div><strong>Documento:</strong> Relatório Executivo v3.0</div>
+      <div><strong>Status:</strong> {{ report.scan_status }}</div>
+    </div>
+  </div>
+
+  <!-- Identificação da Empresa -->
+  <div class="company-banner">
+    <div class="company-info">
+      <h1>{{ report.company_name }}</h1>
+      <p>CNPJ Matriz / Consolidado: <strong>{{ report.cnpj_formatted }}</strong></p>
+    </div>
+    <div>
+      {% if report.economic.is_cenario_a %}
+        <span class="tag-badge tag-cenario-a">{{ report.economic.cenario_badge }}</span>
+      {% else %}
+        <span class="tag-badge tag-cenario-b">{{ report.economic.cenario_badge }}</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Métricas Principais (KPIs) -->
+  <div class="grid-kpis">
+    <div class="kpi-card">
+      <div class="kpi-label">Índice de Exposição</div>
+      <div class="kpi-value blue">{{ "%.1f"|format(report.exposure_score) }}%</div>
+      <div class="kpi-sub">Risco global ponderado</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Processos Mapeados</div>
+      <div class="kpi-value">{{ report.total_processes }}</div>
+      <div class="kpi-sub">100% da base DataJud</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Prob. Condenação</div>
+      {% if report.prob_condenacao %}
+        <div class="kpi-value amber">{{ "%.1f"|format(report.prob_condenacao) }}%</div>
+      {% else %}
+        <div class="kpi-value amber">N/D</div>
+      {% endif %}
+      <div class="kpi-sub">Taxa histórica bruta</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Confiança Bayesiana</div>
+      <div class="kpi-value green">{{ report.conf_label }}</div>
+      <div class="kpi-sub">{{ report.conf_detail }}</div>
+    </div>
+  </div>
+
+  <!-- Seção 1: Idoneidade Econômica & Solvência -->
+  <div class="section-card">
+    <div class="section-title">Idoneidade Econômica & Solvência Empresarial</div>
+    <div class="econ-grid">
+      <div class="econ-col">
+        <div class="econ-row">
+          <span>Capital Social:</span>
+          <strong>{{ report.economic.capital_fmt }}</strong>
+        </div>
+        <div class="econ-row">
+          <span>Compatibilidade de Porte:</span>
+          <strong>{{ report.economic.badge_porte }}</strong>
+        </div>
+        <div class="econ-row">
+          <span>Situação Cadastral RFB:</span>
+          <strong>{{ report.economic.situacao_rfb }}</strong>
+        </div>
+      </div>
+      <div class="econ-col">
+        <div class="econ-row">
+          <span>Risco Calote Subsidiário:</span>
+          <strong>
+            {% if report.economic.risco_sub is not none %}
+              {{ "%.1f"|format(report.economic.risco_sub) }}%
+            {% else %}
+              0,0%
+            {% endif %}
+          </strong>
+        </div>
+        <div class="econ-row">
+          <span>Prob. Insolvência:</span>
+          <strong>
+            {% if report.economic.prob_insolv is not none %}
+              {{ "%.1f"|format(report.economic.prob_insolv) }}%
+            {% else %}
+              0,0%
+            {% endif %}
+          </strong>
+        </div>
+        <div class="econ-row">
+          <span>Restrições Federais (CGU/PGFN):</span>
+          <strong>{{ report.economic.sancoes_texto }}</strong>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Seção 2: Desfechos Processuais (Simplex 100%) -->
+  <div class="section-card">
+    <div class="section-title">Distribuição Estatística de Desfechos (Simplex 100%)</div>
+    <div class="chart-container">
+      {{ outcomes_svg | safe }}
+    </div>
+  </div>
+
+  <!-- Seção 3: Comparativo de Risco Bayesiano vs. Súmula 331 TST -->
+  <div class="section-card">
+    <div class="section-title">Inferência Bayesiana vs. Risco Subsidiário (Súmula 331 TST)</div>
+    <div class="chart-container">
+      {{ bayes_svg | safe }}
+    </div>
+  </div>
+
+  <!-- Seção 4: Ranking TPU de Motivos de Condenação -->
+  <div class="section-card">
+    <div class="section-title">Principais Motivos de Condenação (Tabelas Processuais Unificadas - TPU)</div>
+    {% if report.ranking_condenacoes %}
+      <table class="table-ranking">
+        <thead>
+          <tr>
+            <th style="width: 60%;">Assunto / Motivo TPU</th>
+            <th class="text-right" style="width: 20%;">Condenações</th>
+            <th class="text-right" style="width: 20%;">Taxa Histórica</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in report.ranking_condenacoes[:5] %}
+            <tr>
+              <td><strong>{{ item.motivo }}</strong></td>
+              <td class="text-right">{{ item.quantidade }}</td>
+              <td class="text-right">
+                {% if item.percentual is not none %}
+                  {{ "%.1f"|format(item.percentual) }}%
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p style="font-size: 7.8pt; color: #64748b; font-style: italic; margin-top: 4px;">
+        Nenhum registro de condenação específico mapeado nas sentenças julgadas.
+      </p>
+    {% endif %}
+  </div>
+
+  <!-- Seção 5: Parecer Executivo de Compliance & Súmula 331 -->
+  <div class="section-card">
+    <div class="section-title">Parecer Executivo de Governança & Compliance</div>
+    <div class="compliance-box">
+      <div class="compliance-headline">
+        <strong>Recomendação: {{ report.compliance.recomendacao }}</strong>
+        <span class="tag-badge {% if 'HOMOLOGAR' in report.compliance.recomendacao %}tag-cenario-a{% else %}tag-cenario-b{% endif %}">
+          Perfil: {{ report.compliance.perfil_risco }}
+        </span>
+      </div>
+      <p class="compliance-text">{{ report.compliance.resumo_executivo }}</p>
+      {% if report.compliance.recomendacoes %}
+        <ul class="compliance-list">
+          {% for rec in report.compliance.recomendacoes %}
+            <li>{{ rec }}</li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+    </div>
+  </div>
+
+</body>
+</html>

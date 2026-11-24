@@ -1,13 +1,14 @@
+// Copyright (c) 2026 Equipe RadarJus - Todos os direitos reservados (Lei nº 9.609/1998).
+// Proibida a reprodução, distribuição ou uso comercial sem autorização expressa dos autores.
+
 import React, { useEffect, useState } from 'react';
 import {
   Search, LayoutDashboard, FileText, ChartNoAxesCombined, History,
   Menu, X, ArrowRight, RefreshCw, AlertCircle, AlertTriangle, ShieldCheck, ShieldAlert,
   Info, ChevronRight, Building2, TrendingUp, Filter, CheckCircle2,
-  Check, Activity, BarChart3, Radar, Share2, Download,
+  Check, Activity, BarChart3, Radar, Share2, Download, Library
 } from 'lucide-react';
 import { companyHash, companyShareUrl, isCompanyPage, parseRoute, validSearchId } from './companyNavigation.js';
-  Check, Activity, BarChart3, Radar, Library,
-} from 'lucide-react';
 import { CompanyLogo } from "./CompanyLogo.jsx";
 import CatalogPage, { normalizeCatalog, onlyDigits } from './CatalogPage.jsx';
 
@@ -31,6 +32,14 @@ const OUTCOME_LABELS = {
 const CHART_COLORS = ['#245a81', '#674b3c', '#b79b85', '#8998a7'];
 const formatNumber = (value) => new Intl.NumberFormat('pt-BR').format(Number(value) || 0);
 const formatPercent = (value) => `${Number(value || 0).toLocaleString('pt-BR', { maximumFractionDigits: 1 })}%`;
+const formatProcessNumber = (raw) => {
+  if (!raw) return 'Não informado';
+  const digits = String(raw).replace(/\D/g, '');
+  if (digits.length === 20) {
+    return `${digits.slice(0, 7)}-${digits.slice(7, 9)}.${digits.slice(9, 13)}.${digits.slice(13, 14)}.${digits.slice(14, 16)}.${digits.slice(16, 20)}`;
+  }
+  return String(raw);
+};
 const formatDate = (value) => {
   if (!value) return 'Não disponível';
   const parsed = new Date(value);
@@ -92,19 +101,24 @@ function normalize(raw) {
 
   const logo = isRecord(payload.logo) ? payload.logo : (econ ? econ.logo : null);
 
+  const outcomesObj = isRecord(payload.desfechos_sentencas) ? payload.desfechos_sentencas
+    : isRecord(payload.outcomes_summary) ? payload.outcomes_summary : {};
+  const numCondenacoes = Number(outcomesObj.condenacoes ?? 0);
+  const isPrevisaoBloqueada = Boolean(payload.previsao_bloqueada) || (numCondenacoes === 0 && total > 0);
+  const effectiveRiskScore = (total === 0 || isPrevisaoBloqueada) ? 0.0 : riskScore;
+
   return {
     name: companyName,
     total: total,
-    riskScore: riskScore,
-    overallRiskScore: riskScore,
+    riskScore: effectiveRiskScore,
+    overallRiskScore: effectiveRiskScore,
     reasons: Array.isArray(payload.ranking_motivos) ? payload.ranking_motivos : [],
     rankingCondenacoes: Array.isArray(payload.ranking_motivos_condenacao) ? payload.ranking_motivos_condenacao : [],
-    outcomes: isRecord(payload.desfechos_sentencas) ? payload.desfechos_sentencas
-      : isRecord(payload.outcomes_summary) ? payload.outcomes_summary : {},
+    outcomes: outcomesObj,
     secrecy: isRecord(payload.niveis_sigilo) ? payload.niveis_sigilo : null,
     predictions: Array.isArray(payload.plus_previsao_condenacao) ? payload.plus_previsao_condenacao : [],
-    previsaoBloqueada: Boolean(payload.previsao_bloqueada),
-    motivoBloqueioPrevisao: payload.motivo_bloqueio_previsao || null,
+    previsaoBloqueada: isPrevisaoBloqueada,
+    motivoBloqueioPrevisao: payload.motivo_bloqueio_previsao || (isPrevisaoBloqueada ? 'Previsão de condenação desativada por ausência de passivo condenatório prévio na amostra (presunção de conformidade e integridade probatória - Súmula 331 TST).' : null),
     idoneidadeEconomica: econ,
     logo: logo,
     processes: Array.isArray(payload.processos) ? payload.processos
@@ -118,6 +132,54 @@ function normalize(raw) {
     cacheLevel: payload.cache_level || null,
     isBroadBrand: Boolean(payload.is_broad_brand || payload.isBroadBrand || (companyName && companyName.includes('GRUPO CONSOLIDADO'))),
   };
+}
+
+async function prefetchFromComunicaPjeBrowser(termo) {
+  try {
+    const clean = String(termo || '').trim();
+    if (!clean || clean.length < 2) return [];
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4000);
+    const cleanDigits = clean.replace(/\D/g, '');
+    const isDoc = cleanDigits.length === 14;
+    const targetUrl = isDoc
+      ? `https://comunicaapi.pje.jus.br/api/v1/comunicacao?numeroDocumento=${cleanDigits}&itensPorPagina=100`
+      : `https://comunicaapi.pje.jus.br/api/v1/comunicacao?nomeParte=${encodeURIComponent(clean)}&itensPorPagina=100`;
+
+    // Arquitetura Anti-Geoblocking:
+    // 1. Tenta Edge Proxy (/api/cnj-proxy) com execução forçada em São Paulo (gru1)
+    // 2. Fallback para fetch direto se proxy indisponível
+    let res = null;
+    try {
+      res = await fetch(`/api/cnj-proxy?target=${encodeURIComponent(targetUrl)}`, {
+        signal: controller.signal,
+        headers: { Accept: 'application/json' },
+      });
+    } catch {
+      res = null;
+    }
+
+    if (!res || !res.ok) {
+      try {
+        res = await fetch(targetUrl, {
+          signal: controller.signal,
+          headers: { Accept: 'application/json' },
+        });
+      } catch {
+        res = null;
+      }
+    }
+
+    clearTimeout(timer);
+    if (!res || !res.ok) return [];
+    const data = await res.json().catch(() => null);
+    if (Array.isArray(data)) return data;
+    if (data && Array.isArray(data.items)) return data.items;
+    if (data && Array.isArray(data.itens)) return data.itens;
+    return [];
+  } catch {
+    return [];
+  }
 }
 
 async function request(path, options = {}) {
@@ -182,6 +244,17 @@ function Tag({ children, type = 'blue' }) {
 }
 
 function Sidebar({page,navigate,mobileOpen,setMobileOpen,showCatalog}) {
+  useEffect(() => {
+    if (typeof document !== 'undefined') {
+      document.body.style.overflow = mobileOpen ? 'hidden' : '';
+    }
+    return () => {
+      if (typeof document !== 'undefined') {
+        document.body.style.overflow = '';
+      }
+    };
+  }, [mobileOpen]);
+
   return (
     <>
       <div className={`mobile-overlay ${mobileOpen ? 'visible' : ''}`} onClick={() => setMobileOpen(false)} />
@@ -320,6 +393,9 @@ function Overview({ data, navigate, catalogTerm }) {
               {tstCount} em Grau de Recurso no TST
             </Tag>
           )}
+          {data?.previsaoBloqueada && (
+            <Tag type="green"><CheckCircle2 size={13} style={{ display: 'inline', marginRight: '4px' }} /> Previsão Bloqueada (0,0%)</Tag>
+          )}
           {data?.cached && <Tag type="blue">⚡ Cache Inteligente ({data.cacheLevel || 'L1'})</Tag>}
         </div>
       </div>
@@ -328,7 +404,7 @@ function Overview({ data, navigate, catalogTerm }) {
         <Stat
           label="ÍNDICE DE EXPOSIÇÃO FINANCEIRA"
           value={hasData && data.riskScore != null ? formatPercent(data.riskScore) : '—'}
-          hint="Score geral estimado de impacto subsidiário"
+          hint={data?.previsaoBloqueada || data?.riskScore === 0 ? "Ausência de condenações (Risco mitigado)" : "Score geral estimado de impacto subsidiário"}
           icon={AlertTriangle}
           tone={data?.riskScore >= 60 ? 'red' : data?.riskScore >= 35 ? 'amber' : 'green'}
         />
@@ -388,8 +464,8 @@ function Overview({ data, navigate, catalogTerm }) {
                 </div>
               </div>
 
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: '14px' }}>
-                <div className="econ-badge" style={{ gridColumn: 'span 2' }}>
+              <div className="econ-grid">
+                <div className="econ-badge econ-capital">
                   <small style={{ color: '#245a81', fontWeight: 600 }}>
                     {data?.isBroadBrand || (econ?.unidades_identificadas > 1)
                       ? 'Capital Social Consolidado (Matriz + Filiais):'
@@ -667,7 +743,7 @@ function Processes({ data }) {
         </div>
         {processes.length ? (
           <div className="table-scroll">
-            <table>
+            <table className="responsive-table">
               <thead>
                 <tr>
                   <th>Número do processo</th>
@@ -680,30 +756,30 @@ function Processes({ data }) {
               <tbody>
                 {list.map((process, index) => (
                   <tr key={process.id || process.numero_processo || index}>
-                    <td className="mono">
-                      {process.numero_processo || process.process_number || 'Não informado'}
-                      {(process.is_tst_recurso || process.tribunal === 'tst' || String(process.grau || '').includes('TST')) && (
-                        <span style={{ marginLeft: '8px' }}>
+                    <td data-label="Processo" className="mono full-width">
+                      <div className="process-cell-content">
+                        <span className="process-number-text">{formatProcessNumber(process.numero_processo || process.process_number)}</span>
+                        {(process.is_tst_recurso || process.tribunal === 'tst' || String(process.grau || '').includes('TST')) && (
                           <Tag type="purple">Instância Superior TST</Tag>
-                        </span>
-                      )}
+                        )}
+                      </div>
                     </td>
-                    <td>
+                    <td data-label="Assunto Principal" className="full-width">
                       <b>{Array.isArray(process.subjects) ? process.subjects.join(', ') : process.primary_subject || 'Não informado'}</b>
                     </td>
-                    <td>
+                    <td data-label="Desfecho">
                       <Tag type={process.sentence_outcome === 'improcedentes' ? 'green' : process.sentence_outcome === 'condenacoes' ? 'red' : 'blue'}>
                         {OUTCOME_LABELS[process.sentence_outcome] || process.sentence_outcome || 'Em aberto'}
                       </Tag>
                     </td>
-                    <td>
+                    <td data-label="Segredo de Justiça">
                       {process.secrecy_level != null ? (
                         <Tag type={Number(process.secrecy_level) > 0 ? 'amber' : 'gray'}>
                           Nível {process.secrecy_level}
                         </Tag>
                       ) : '—'}
                     </td>
-                    <td>
+                    <td data-label="Observação Técnica" className="full-width">
                       {process.inferred_from_djen_text ? (
                         <span style={{ color: '#245a81', fontSize: '12px' }}>
                           Assunto identificado via publicação PJe
@@ -753,7 +829,7 @@ function Predictions({ data }) {
       <Panel title="Probabilidade Posterior nos Processos Abertos" subtitle="Distribuição tripartida e Intervalo de Credibilidade de 90% por motivo">
         {predictions.length ? (
           <div className="table-scroll">
-            <table>
+            <table className="responsive-table">
               <thead>
                 <tr>
                   <th>Motivo da Ação (TPU/PJe)</th>
@@ -775,23 +851,25 @@ function Predictions({ data }) {
                   const hasIC = prediction.ic_90_inferior_pct != null && prediction.ic_90_superior_pct != null;
                   return (
                     <tr key={`${prediction.motivo}-${index}`}>
-                      <td><b>{prediction.motivo || 'Não informado'}</b></td>
-                      <td>
+                      <td data-label="Motivo da Ação" className="full-width">
+                        <b>{prediction.motivo || 'Não informado'}</b>
+                      </td>
+                      <td data-label="Vitória (Improcedência)">
                         <span className="percent" style={{ color: '#25865a', fontWeight: 'bold' }}>
                           {formatPercent(probVencer)}
                         </span>
                       </td>
-                      <td>
+                      <td data-label="Acordo">
                         <span className="percent" style={{ color: '#245a81', fontWeight: 600 }}>
                           {formatPercent(probAcordo)}
                         </span>
                       </td>
-                      <td>
+                      <td data-label="Condenação">
                         <span className="percent" style={{ color: probCond >= 55 ? '#c34a4a' : '#667788', fontWeight: 'bold' }}>
                           {formatPercent(probCond)}
                         </span>
                       </td>
-                      <td>
+                      <td data-label="IC 90% (Condenação)">
                         {hasIC ? (
                           <span style={{ fontSize: '12px', color: '#556677' }}>
                             [{formatPercent(prediction.ic_90_inferior_pct)} – {formatPercent(prediction.ic_90_superior_pct)}]
@@ -803,7 +881,7 @@ function Predictions({ data }) {
                           formatPercent(prediction.confianca_previsao_pct)
                         )}
                       </td>
-                      <td>
+                      <td data-label="Processos Abertos">
                         <b>{formatNumber(prediction.processos_abertos)}</b>
                         {prediction.condenacoes_esperadas_abertos != null && prediction.processos_abertos > 0 && (
                           <small style={{ display: 'block', color: '#8899a6' }}>
@@ -811,7 +889,7 @@ function Predictions({ data }) {
                           </small>
                         )}
                       </td>
-                      <td>
+                      <td data-label="Diagnóstico" className="full-width">
                         <Tag type={isHighWin ? 'green' : isMidWin ? 'amber' : 'red'}>
                           {prediction.diagnostico_chance_vitoria || (isHighWin ? 'Alta probabilidade de êxito' : isMidWin ? 'Risco equilibrado' : 'Alto risco de condenação')}
                         </Tag>
@@ -823,7 +901,39 @@ function Predictions({ data }) {
             </table>
           </div>
         ) : (
-          <Empty title="Sem estimativas disponíveis" description="As estimativas serão exibidas quando a API retornar projeções por assunto." />
+          <div className="card" style={{ padding: '32px 24px', textAlign: 'center', background: '#fff' }}>
+            <div style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '8px',
+              padding: '7px 16px',
+              borderRadius: '20px',
+              background: '#f0fdf4',
+              color: '#166534',
+              border: '1px solid #bbf7d0',
+              fontWeight: 700,
+              fontSize: '13px',
+              marginBottom: '16px'
+            }}>
+              <CheckCircle2 size={16} /> Previsão Bloqueada: 0,0% de Condenação
+            </div>
+            <h3 style={{ margin: '0 0 10px', fontSize: '18px', color: '#17283a' }}>
+              Ausência de Registros Condenatórios Prévios
+            </h3>
+            <p style={{ maxWidth: '640px', margin: '0 auto 18px', color: '#556677', fontSize: '13px', lineHeight: 1.65 }}>
+              {data?.motivoBloqueioPrevisao || 'Previsão de condenação desativada por ausência de passivo condenatório prévio na amostra (presunção de conformidade e integridade probatória - Súmula 331 TST).'}
+            </p>
+            <div style={{ display: 'flex', justifyContent: 'center', gap: '16px', flexWrap: 'wrap', marginTop: '16px' }}>
+              <div style={{ padding: '14px 24px', background: '#f8fafb', border: '1px solid #e1e7ec', borderRadius: '10px' }}>
+                <small style={{ display: 'block', color: '#68798a', fontSize: '11px', marginBottom: '4px' }}>Probabilidade de Condenação:</small>
+                <strong style={{ fontSize: '22px', color: '#25865a' }}>0,0%</strong>
+              </div>
+              <div style={{ padding: '14px 24px', background: '#f8fafb', border: '1px solid #e1e7ec', borderRadius: '10px' }}>
+                <small style={{ display: 'block', color: '#68798a', fontSize: '11px', marginBottom: '4px' }}>Impacto Subsidiário Estimado:</small>
+                <strong style={{ fontSize: '22px', color: '#245a81' }}>Risco Mitigado (0,0%)</strong>
+              </div>
+            </div>
+          </div>
         )}
       </Panel>
 
@@ -910,7 +1020,37 @@ function CompanyShareActions({ data }) {
     setMessage('');
     let objectUrl;
     try {
-      const response = await fetch(`${API_BASE}/api/v1/history/${id}/summary.pdf`);
+      const pdfPayload = {
+        search_id: id || null,
+        empresa: data.name,
+        company_name: data.name,
+        total_processos: data.total,
+        indice_exposicao_financeira: data.riskScore,
+        score_risco_terceirizacao: data.overallRiskScore ?? data.riskScore,
+        desfechos_sentencas: data.outcomes || {},
+        ranking_motivos: data.reasons || [],
+        ranking_motivos_condenacao: data.rankingCondenacoes || [],
+        plus_previsao_condenacao: data.predictions || [],
+        idoneidade_economica: data.idoneidadeEconomica || {},
+        ai_analysis: data.aiAnalysis || {},
+        scan_status: data.scanStatus || 'COMPLETED',
+      };
+
+      // Prioriza POST com os dados já carregados na tela (elimina 404 mesmo sem persistência prévia)
+      let response = await fetch(`${API_BASE}/api/v1/report/pdf`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(pdfPayload),
+      }).catch(() => null);
+
+      // Fallback para GET por ID ou query string ?empresa=...
+      if (!response || !response.ok) {
+        const fallbackUrl = id
+          ? `${API_BASE}/api/v1/history/${id}/summary.pdf`
+          : `${API_BASE}/api/v1/report/pdf?empresa=${encodeURIComponent(data.name || '')}`;
+        response = await fetch(fallbackUrl);
+      }
+
       if (!response.ok) {
         const body = await response.json().catch(() => null);
         throw new Error(body?.error || `Não foi possível baixar o PDF (HTTP ${response.status}).`);
@@ -921,7 +1061,15 @@ function CompanyShareActions({ data }) {
       objectUrl = URL.createObjectURL(await response.blob());
       const anchor = document.createElement('a');
       anchor.href = objectUrl;
-      anchor.download = `radarjus-empresa-${id}.pdf`;
+      const safeSlug = String(data.name || '')
+        .replace(/\(.*?\)/g, '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .toLowerCase()
+        .slice(0, 40);
+      anchor.download = `radarjus-${safeSlug || (id ? `empresa-${id}` : 'relatorio')}.pdf`;
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
@@ -937,10 +1085,10 @@ function CompanyShareActions({ data }) {
   return (
     <section className="company-share card" aria-label="Compartilhar consulta">
       <div className="company-share-row">
-        <div><b>Compartilhar consulta</b><small>{id ? 'Compartilhe a análise salva ou baixe o resumo em PDF.' : 'A consulta ainda não foi salva no banco de dados.'}</small></div>
+        <div><b>Compartilhar consulta</b><small>{id ? 'Compartilhe a análise salva ou baixe o resumo em PDF.' : 'Baixe o relatório executivo em PDF desta análise.'}</small></div>
         <div className="company-share-buttons">
           <button type="button" className="secondary" onClick={copyLink} disabled={!id}><Share2 size={16} /> Compartilhar link</button>
-          <button type="button" className="secondary" onClick={downloadPdf} disabled={!id || pdfBusy}><Download size={16} /> {pdfBusy ? 'Gerando PDF...' : 'Baixar PDF'}</button>
+          <button type="button" className="secondary" onClick={downloadPdf} disabled={!data || pdfBusy}><Download size={16} /> {pdfBusy ? 'Gerando PDF...' : 'Baixar PDF'}</button>
         </div>
       </div>
       {message && <p className="company-share-message" role="status">{message}</p>}
@@ -1036,9 +1184,22 @@ export default function App() {
     setBusy(true);
     setError('');
     try {
+      // Fallback silencioso: prefetch transparente via browser contra bloqueios de geoblocking nos EUA
+      let prefetched = [];
+      try {
+        prefetched = await prefetchFromComunicaPjeBrowser(text);
+      } catch {
+        prefetched = [];
+      }
+
+      const payload = { company_name: text };
+      if (Array.isArray(prefetched) && prefetched.length > 0) {
+        payload.client_prefetched_items = prefetched;
+      }
+
       const result = await request('/search-company', {
         method: 'POST',
-        body: JSON.stringify({ company_name: text }),
+        body: JSON.stringify(payload),
       });
       const normalized = normalize(result);
       if (!normalized) throw new Error('A API não retornou dados de empresa válidos.');
@@ -1137,12 +1298,23 @@ export default function App() {
         <header className="topbar">
           <div className="topbar-left">
             <button className="menu-button" onClick={() => setMobileOpen(true)} aria-label="Abrir menu"><Menu size={23} /></button>
-            <span className="breadcrumb">RadarJus <ChevronRight size={14} /> <b>{PAGE_LABELS[page]}</b></span>
+            <span className="breadcrumb">
+              <span className="breadcrumb-brand">RadarJus</span>
+              <ChevronRight size={14} className="breadcrumb-sep" />
+              <b>{PAGE_LABELS[page]}</b>
+            </span>
           </div>
-          <div className="region"><span className="region-dot" /> CNJ DataJud · Comunica PJe</div>
+          <div className="region"><span className="region-dot" /><span className="region-text"> CNJ DataJud · Comunica PJe</span></div>
         </header>
         <main className="content">
-          {page === 'search' && <SearchPage onSearch={search} query={query} setQuery={setQuery} busy={busy} error={error} navigate={navigate} result={data} />}
+          {page === 'search' && <SearchPage onSearch={submitSearch} query={query} setQuery={setQuery} busy={busy} error={error} navigate={navigate} result={data} />}
+          {page === 'catalog' && (
+            <CatalogPage
+              query={query} setQuery={setQuery} catalog={catalog} onSubmit={submitSearch}
+              onAnalyze={analyzeCatalogItem} onAnalyzeGroup={analyzeGroup}
+              analyzing={analyzing} analysisBusy={busy} analysisError={error}
+            />
+          )}
           {isCompanyPage(page) && needsSharedData && (
             sharedError?.id === searchId ? (
               <div className="alert error" role="alert">
@@ -1153,24 +1325,13 @@ export default function App() {
           )}
           {isCompanyPage(page) && !needsSharedData && <>
             {visibleData && <CompanyShareActions key={visibleData.searchId ?? visibleData.name} data={visibleData} />}
-            {page === 'overview' && <Overview data={visibleData} navigate={navigate} />}
+            {page === 'overview' && <Overview data={visibleData} navigate={navigate} catalogTerm={catalog.term} />}
             {page === 'processes' && <Processes data={visibleData} />}
             {page === 'predictions' && <Predictions data={visibleData} />}
           </>}
-          {page === 'search' && <SearchPage onSearch={submitSearch} query={query} setQuery={setQuery} busy={busy} error={error} navigate={navigate} result={data} />}
-          {page === 'catalog' && (
-            <CatalogPage
-              query={query} setQuery={setQuery} catalog={catalog} onSubmit={submitSearch}
-              onAnalyze={analyzeCatalogItem} onAnalyzeGroup={analyzeGroup}
-              analyzing={analyzing} analysisBusy={busy} analysisError={error}
-            />
-          )}
-          {page === 'overview' && <Overview data={data} navigate={navigate} catalogTerm={catalog.term} />}
-          {page === 'processes' && <Processes data={data} />}
-          {page === 'predictions' && <Predictions data={data} />}
           {page === 'history' && <HistoryPage history={history} busy={historyBusy} error={historyError} onOpen={openHistory} onReload={loadHistory} />}
         </main>
-        <footer className="footer">RadarJus · Inteligência Preditiva e Gestão de Risco de Fornecedores</footer>
+        <footer className="footer">RadarJus · Inteligência Preditiva</footer>
       </div>
     </div>
   );

@@ -5,7 +5,8 @@ from typing import List, Dict, Any, Optional
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from app.utils.cnj_proxy import cnj_get, cnj_post
+
+from app.utils.http_client import request_gov_br_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -61,12 +62,13 @@ class CNJClient:
         }
         try:
             logger.info("Consultando Comunica PJe para: %s", company_name)
-            resp = cnj_get(
-                self.session,
-                self.comunica_url,
+            resp = request_gov_br_with_fallback(
+                method="GET",
+                url=self.comunica_url,
                 params=params,
                 timeout=self.timeout,
-                headers={"Accept": "application/json", "User-Agent": "LexGuardAI/1.0"},
+                headers={"Accept": "application/json"},
+                session=self.session,
             )
             if resp.ok:
                 data = resp.json()
@@ -127,18 +129,20 @@ class CNJClient:
             }
         }
         headers = {
-            "Authorization": f"APIKey {self.datajud_api_key}",
             "Content-Type": "application/json",
             "User-Agent": "LexGuardAI/1.0",
         }
+        if self.datajud_api_key:
+            headers["Authorization"] = f"APIKey {self.datajud_api_key}"
 
         try:
-            resp = cnj_post(
-                self.session,
-                endpoint,
-                json=payload,
+            resp = request_gov_br_with_fallback(
+                method="POST",
+                url=endpoint,
+                json_body=payload,
                 headers=headers,
                 timeout=self.timeout,
+                session=self.session,
             )
             if resp.ok:
                 data = resp.json()

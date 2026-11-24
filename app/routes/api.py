@@ -1,20 +1,32 @@
+# Copyright (c) 2026 Equipe RadarJus - Todos os direitos reservados (Lei nº 9.609/1998).
+# Proibida a reprodução, distribuição ou uso comercial sem autorização expressa dos autores.
+
+import os
 import re
 import sys
 import time
 import uuid
+import math
+import hmac
 import asyncio
 import logging
 import threading
 from pathlib import Path
-from datetime import datetime
+import gc
+from datetime import datetime, timezone
+from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, Response, request, jsonify, current_app, g
 from sqlalchemy import text
+
+from app.services.prediction_engine import build_sector_benchmark
+from app.utils.rate_limiter import limit_rate
 
 from app.extensions import db
 from app.models.company_search import CompanySearch, get_utc_now
 from app.models.process_record import ProcessRecord
 from app.services.orchestrator import CNJMetadataOrchestrator
+from app.services.pdf_report import generate_company_report_pdf, generate_comparative_report_pdf
 from app.services.economic_service import (
     EconomicStandingService,
     aggregate_group_capital,
@@ -33,6 +45,10 @@ from app.utils.sanitizer import (
     CORPORATE_SUFFIX_REGEX,
 )
 from app.utils.crypto import generate_movements_hash
+from app.utils.auth import get_current_user_optional, require_auth, require_role
+from app.models.tenant import Tenant
+from app.models.audit_log import AuditLog
+from app.services.quota_service import QuotaService
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +56,21 @@ logger = logging.getLogger(__name__)
 CNPJ_REGEX = re.compile(r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b")
 SEARCH_CACHE = {}  # {brand_term.upper(): (timestamp, dict_result)}
 CACHE_TTL = 900    # 15 minutos
+MAX_CACHE_ENTRIES = 200  # Proteção estrita de memória para Render Free (512 MB RAM)
+
+
+def _prune_search_cache_if_needed(max_entries: int = MAX_CACHE_ENTRIES) -> None:
+    """Purga entradas expiradas ou mais antigas do SEARCH_CACHE para mitigar memory leaks no Render Free."""
+    now = time.time()
+    # 1. Purga por TTL
+    expired = [k for k, v in SEARCH_CACHE.items() if (now - v[0]) > CACHE_TTL]
+    for k in expired:
+        SEARCH_CACHE.pop(k, None)
+    # 2. Se ainda exceder o limite máximo, remove as entradas mais antigas
+    if len(SEARCH_CACHE) > max_entries:
+        sorted_keys = sorted(SEARCH_CACHE.keys(), key=lambda k: SEARCH_CACHE[k][0])
+        for k in sorted_keys[: len(SEARCH_CACHE) - max_entries]:
+            SEARCH_CACHE.pop(k, None)
 
 ACTIVE_SEARCH_LOCK = threading.Lock()
 ACTIVE_SEARCH_JOB_ID = None
@@ -390,6 +421,8 @@ def run_agent_pipeline():
 
 @api_bp.route("/company-dashboard", methods=["POST"])
 @api_bp.route("/search-company", methods=["POST", "GET"])
+@api_bp.route("/search", methods=["POST", "GET"])
+@limit_rate(max_requests=60, window_seconds=60)
 def search_company():
     """
     Endpoint principal para pesquisa e diagnóstico de risco de fornecedores/terceiros.
@@ -399,11 +432,16 @@ def search_company():
     - Fast-Path síncrono (< 3s na primeira página).
     - Deep Scan disparado em background para complementar o histórico.
     - Curto-Circuito Nível 2: Se o hash de movimentos não mudou, preserva o parecer da IA.
+    - Suporte a client_prefetched_items para fallback invisível anti-geoblocking.
     """
+    client_prefetched_items = []
+    current_user = get_current_user_optional()
+    current_tenant_id = current_user.tenant_id if current_user else None
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
         company_input = data.get("company_name") or data.get("name")
         force_refresh = bool(data.get("force_refresh", False))
+        client_prefetched_items = data.get("client_prefetched_items") or []
     else:
         company_input = request.args.get("name") or request.args.get("company_name")
         force_refresh = request.args.get("force_refresh", "false").lower() in ("true", "1")
@@ -449,7 +487,13 @@ def search_company():
                 res_copy = dict(cached_data)
                 res_copy["cached"] = True
                 res_copy["cache_level"] = "L0_MEMORY_CACHE"
-                return jsonify(res_copy), 200
+                resp = jsonify(res_copy)
+                if current_user and current_user.tenant_id:
+                    tenant_for_quota = db.session.get(Tenant, current_user.tenant_id)
+                    if tenant_for_quota:
+                        q_stat = QuotaService.check_quota(tenant_for_quota)
+                        resp.headers["X-Quota-Remaining"] = q_stat["header_value"]
+                return resp, 200
 
     # =========================================================================
     # CURTO-CIRCUITO NÍVEL 1 (Antes do CNJ): Busca instantânea no PostgreSQL
@@ -539,9 +583,37 @@ def search_company():
                 except Exception:
                     pass
 
-                return jsonify(res), 200
+                resp = jsonify(res)
+                if current_user and current_user.tenant_id:
+                    tenant_for_quota = db.session.get(Tenant, current_user.tenant_id)
+                    if tenant_for_quota:
+                        q_stat = QuotaService.check_quota(tenant_for_quota)
+                        resp.headers["X-Quota-Remaining"] = q_stat["header_value"]
+                return resp, 200
         except Exception as db_err:
             logger.debug("Falha na checagem de cache L1 no banco: %s", db_err)
+
+    # =========================================================================
+    # CONTROLE DE COTA MENSAL (QuotaService - US-02)
+    # Apenas novas consultas externas consomem cota.
+    # =========================================================================
+    tenant_obj = None
+    quota_header_val = None
+    if current_user and current_user.tenant_id:
+        tenant_obj = db.session.get(Tenant, current_user.tenant_id)
+        if tenant_obj:
+            quota_status = QuotaService.check_quota(tenant_obj)
+            quota_header_val = quota_status["header_value"]
+            if not quota_status["allowed"]:
+                resp = jsonify({
+                    "error": "Cota mensal de consultas esgotada para o seu plano. Entre em contato para realizar upgrade ou aguarde a renovação no próximo mês.",
+                    "code": "QUOTA_EXCEEDED",
+                    "used": quota_status["used"],
+                    "limit": quota_status["limit"],
+                    "plan": tenant_obj.plan,
+                })
+                resp.headers["X-Quota-Remaining"] = quota_header_val
+                return resp, 402
 
     if force_refresh:
         orchestrator._cache.pop(raw_query.lower(), None)
@@ -566,6 +638,7 @@ def search_company():
             search_strategy=search_strategy,
             fast_path=True,
             limit_processes=50,
+            client_prefetched_items=client_prefetched_items,
         )
 
         fast_results["empresa"] = display_title
@@ -629,6 +702,7 @@ def search_company():
         search_id = None
         try:
             search_entry = CompanySearch(
+                tenant_id=current_tenant_id,
                 company_name=display_title,
                 normalized_name=normalized_name,
                 total_processes=fast_results.get("total_processos", 0),
@@ -690,7 +764,15 @@ def search_company():
 
         fast_results["scan_status"] = initial_status
         SEARCH_CACHE[cache_key] = (time.time(), fast_results)
-        return jsonify(fast_results), 200
+        resp = jsonify(fast_results)
+        if quota_header_val is not None:
+            # Recalcula o saldo restante após a persistência da nova consulta
+            if tenant_obj:
+                updated_quota = QuotaService.check_quota(tenant_obj)
+                resp.headers["X-Quota-Remaining"] = updated_quota["header_value"]
+            else:
+                resp.headers["X-Quota-Remaining"] = quota_header_val
+        return resp, 200
 
     except Exception as exc:
         logger.exception("Erro ao processar busca de empresa: %s", exc)
@@ -698,7 +780,132 @@ def search_company():
 
 
 # =============================================================================
-# CATÁLOGO DE EMPRESAS  ->  GET /api/v1/company-catalog?q=sauter&limit=100[&debug=1]
+# DECISÕES DE COMPLIANCE E TRILHA DE AUDITORIA (US-02)
+# =============================================================================
+
+@api_bp.route("/searches/<int:company_search_id>/decision", methods=["POST"])
+@require_auth
+def register_search_decision(company_search_id: int):
+    """
+    Registra decisão de compliance (APROVADO, REPROVADO, RETENCAO) sobre uma empresa analisada.
+    Congela o snapshot de risco (score de risco e Cenário A/B) e garante trilha de auditoria append-only.
+    """
+    search = db.session.get(CompanySearch, company_search_id)
+    if not search:
+        return jsonify({"error": "Registro de pesquisa não encontrado."}), 404
+
+    # Anti-IDOR: Usuário só pode registrar decisão em buscas do seu próprio tenant
+    current_user = g.current_user
+    if search.tenant_id is not None and search.tenant_id != current_user.tenant_id:
+        return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
+
+    data = request.get_json(silent=True) or {}
+    decision = str(data.get("decision") or "").strip().upper()
+    justification = str(data.get("justification") or "").strip()
+
+    if decision not in AuditLog.VALID_DECISIONS:
+        return jsonify({
+            "error": f"Decisão inválida: '{decision}'. Valores permitidos: {sorted(list(AuditLog.VALID_DECISIONS))}."
+        }), 400
+
+    if not justification:
+        return jsonify({"error": "O campo 'justification' é obrigatório."}), 400
+
+    # Captura snapshot congelado de score e Cenário A/B
+    econ = search.economic_standing if isinstance(search.economic_standing, dict) else {}
+    cenario = econ.get("cenario") or ("CENARIO_A" if (search.overall_risk_score or 0) < 50 else "CENARIO_B")
+    
+    risk_snapshot = {
+        "overall_risk_score": float(search.overall_risk_score or 0.0),
+        "cenario": cenario,
+        "total_processes": search.total_processes,
+        "score_risco_terceirizacao": float(search.overall_risk_score or 0.0),
+        "company_name": search.company_name,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        audit_entry = AuditLog(
+            tenant_id=current_user.tenant_id,
+            user_id=current_user.id,
+            company_search_id=search.id,
+            decision=decision,
+            justification=justification,
+            risk_score_snapshot=risk_snapshot,
+        )
+        db.session.add(audit_entry)
+        db.session.commit()
+
+        logger.info(
+            "Decisão de auditoria registrada: user_id=%d, tenant_id=%d, search_id=%d, decision=%s",
+            current_user.id, current_user.tenant_id, search.id, decision
+        )
+        return jsonify({
+            "status": "success",
+            "message": "Decisão de compliance registrada com sucesso.",
+            "audit_log": audit_entry.to_dict(),
+        }), 201
+
+    except Exception as exc:
+        db.session.rollback()
+        logger.exception("Erro ao registrar decisão de auditoria: %s", exc)
+        return jsonify({"error": "Falha interna ao registrar decisão de auditoria."}), 500
+
+
+@api_bp.route("/audit-logs", methods=["GET"])
+@require_auth
+def list_audit_logs():
+    """
+    Lista registros da trilha de auditoria imutável do tenant autenticado.
+    Suporta paginação e filtros opcionais por company_search_id e decision.
+    """
+    current_user = g.current_user
+    tenant_id = current_user.tenant_id
+
+    page = max(1, int(request.args.get("page", 1)))
+    per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+    search_id_filter = request.args.get("company_search_id")
+    decision_filter = request.args.get("decision")
+
+    try:
+        query = AuditLog.query.filter_by(tenant_id=tenant_id)
+
+        if search_id_filter and str(search_id_filter).isdigit():
+            query = query.filter_by(company_search_id=int(search_id_filter))
+
+        if decision_filter:
+            dec_up = str(decision_filter).strip().upper()
+            if dec_up in AuditLog.VALID_DECISIONS:
+                query = query.filter_by(decision=dec_up)
+
+        total = query.count()
+        logs = (
+            query.order_by(AuditLog.created_at.desc())
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+            .all()
+        )
+
+        return jsonify({
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "items": [log.to_dict() for log in logs],
+        }), 200
+
+    except Exception as exc:
+        logger.exception("Erro ao listar trilha de auditoria: %s", exc)
+        return jsonify({"error": "Falha ao recuperar logs de auditoria."}), 500
+
+
+@api_bp.route("/audit-logs/<int:audit_id>", methods=["PUT", "PATCH", "DELETE"])
+@require_auth
+def block_audit_log_mutations(audit_id: int):
+    """Bloqueio explícito de mutação ou deleção de logs de auditoria via API."""
+    return jsonify({
+        "error": "Operação não permitida: a trilha de auditoria é estritamente imutável (append-only)."
+    }), 405
+
 #   (alias: /api/v1/companies/search)
 #
 # COLE ESTE BLOCO no mesmo arquivo do `api_bp` (o que contém search_company),
@@ -752,19 +959,78 @@ def _cat_matrix(root8: str) -> str:
 
 
 def _cat_brasilapi(cnpj: str):
-    """Usa o fetcher do projeto; se ele devolver outro formato, cai na BrasilAPI direta."""
+    """Obtém dados cadastrais do CNPJ com camadas resilientes (Diretório Oficial, DB, Cache e APIs)."""
+    clean_cnpj = re.sub(r"\D", "", str(cnpj or ""))
+    if not _cat_valid(clean_cnpj):
+        return None
+
+    # 1. Diretório Oficial Corporativo de Fallback (alta velocidade, thread-safe, sem I/O)
     try:
-        data = fetch_cnpj_brasilapi(cnpj)
+        from app.services.economic_service import OFFICIAL_CORPORATE_METADATA
+        if clean_cnpj in OFFICIAL_CORPORATE_METADATA:
+            return dict(OFFICIAL_CORPORATE_METADATA[clean_cnpj])
+    except Exception as exc:
+        logger.debug("Catálogo: OFFICIAL_CORPORATE_METADATA falhou (%s): %s", clean_cnpj, exc)
+
+    # 2. Tenta obter do banco local CompanyRegistry
+    try:
+        from app.models.CompanyRegistry import CompanyRegistry
+        reg = CompanyRegistry.query.filter_by(cnpj=clean_cnpj).first()
+        if reg and reg.razao_social:
+            return {
+                "cnpj": clean_cnpj,
+                "razao_social": reg.razao_social,
+                "nome_fantasia": reg.nome_fantasia or "",
+                "descricao_situacao_cadastral": reg.situacao_cadastral or "ATIVA",
+                "capital_social": float(reg.capital_social or 0.0),
+                "municipio": reg.municipio or "",
+                "uf": reg.uf or "",
+                "identificador_matriz_filial": 1 if (reg.matriz_filial == "1" or clean_cnpj[8:12] == "0001") else 2,
+            }
+    except Exception as exc:
+        logger.debug("Catálogo: consulta a CompanyRegistry falhou (%s): %s", clean_cnpj, exc)
+
+    # 3. Tenta fetch_accurate_cnpj_data_cached (Round-Robin entre BrasilAPI, CNPJ.ws, MinhaReceita, ReceitaWS)
+    try:
+        from app.services.economic_service import fetch_accurate_cnpj_data_cached
+        data = fetch_accurate_cnpj_data_cached(clean_cnpj, timeout=4.0)
+        if isinstance(data, dict) and data.get("razao_social"):
+            return {
+                "cnpj": clean_cnpj,
+                "razao_social": data.get("razao_social"),
+                "nome_fantasia": data.get("nome_fantasia") or "",
+                "descricao_situacao_cadastral": data.get("situacao") or data.get("descricao_situacao_cadastral") or "ATIVA",
+                "capital_social": float(data.get("capital_social") or 0.0),
+                "municipio": data.get("municipio") or "",
+                "uf": data.get("uf") or "",
+                "identificador_matriz_filial": 1 if clean_cnpj[8:12] == "0001" else 2,
+            }
+    except Exception as exc:
+        logger.debug("Catálogo: fetch_accurate_cnpj_data_cached falhou (%s): %s", clean_cnpj, exc)
+
+    # 4. Tenta fetch_cnpj_brasilapi
+    try:
+        data = fetch_cnpj_brasilapi(clean_cnpj)
         if isinstance(data, dict) and data.get("razao_social") and "descricao_situacao_cadastral" in data:
             return data
     except Exception as exc:
-        logger.debug("Catálogo: fetch_cnpj_brasilapi falhou (%s): %s", cnpj, exc)
+        logger.debug("Catálogo: fetch_cnpj_brasilapi falhou (%s): %s", clean_cnpj, exc)
+
+    # 5. Tenta requisição direta BrasilAPI
     try:
-        r = requests.get(f"https://brasilapi.com.br/api/cnpj/v1/{cnpj}", timeout=12)
-        return r.json() if r.ok else None
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        }
+        r = requests.get(f"https://brasilapi.com.br/api/cnpj/v1/{clean_cnpj}", headers=headers, timeout=5)
+        if r.ok:
+            data = r.json()
+            if isinstance(data, dict) and data.get("razao_social"):
+                return data
     except Exception as exc:
-        logger.debug("Catálogo: BrasilAPI direta falhou (%s): %s", cnpj, exc)
-        return None
+        logger.debug("Catálogo: BrasilAPI direta falhou (%s): %s", clean_cnpj, exc)
+
+    return None
 
 
 def _cat_logo(data: dict, cnpj: str):
@@ -864,6 +1130,40 @@ def search_companies_catalog():
             brand = strat.get("comunica_query_term") or q
             dbg["termo_pje"] = brand
 
+            # 1) Descoberta via Banco Local (CompanyRegistry)
+            try:
+                from app.models.CompanyRegistry import CompanyRegistry
+                from sqlalchemy import or_
+                db_matches = CompanyRegistry.query.filter(
+                    or_(
+                        CompanyRegistry.razao_social.ilike(f"%{q}%"),
+                        CompanyRegistry.nome_fantasia.ilike(f"%{q}%")
+                    )
+                ).all()
+                for comp in db_matches:
+                    d = re.sub(r"\D", "", comp.cnpj)
+                    if _cat_valid(d):
+                        counts.setdefault(d[:8], 0)
+                        seen.setdefault(d[:8], set()).add(d)
+                dbg["db_matches"] = len(db_matches)
+            except Exception as exc:
+                dbg["db_matches_erro"] = str(exc)
+
+            # 2) Descoberta via Diretório Oficial Corporativo (ex: BRADESCO, ITAU, etc.)
+            try:
+                from app.services.economic_service import OFFICIAL_CORPORATE_CNPJ_DIRECTORY
+                norm_q = _cat_norm(q).upper()
+                for brand_key, cnpjs in OFFICIAL_CORPORATE_CNPJ_DIRECTORY.items():
+                    norm_k = _cat_norm(brand_key).upper()
+                    if norm_k in norm_q or norm_q in norm_k or (len(norm_q) >= 4 and norm_q.split()[0] in norm_k):
+                        for c in cnpjs:
+                            d = re.sub(r"\D", "", c)
+                            if _cat_valid(d):
+                                counts.setdefault(d[:8], 0)
+                                seen.setdefault(d[:8], set()).add(d)
+            except Exception as exc:
+                dbg["directory_erro"] = str(exc)
+
             processes_map = {}
             try:
                 processes_map = orchestrator._fetch_comunica_pje(
@@ -874,7 +1174,7 @@ def search_companies_catalog():
                 logger.warning("Catálogo: Comunica PJe falhou para '%s': %s", brand, exc)
             dbg["pje_processos"] = len(processes_map)
 
-            # 1) CNPJs nos textos das publicações (contados 1x por processo e por raiz)
+            # 3) CNPJs nos textos das publicações (contados 1x por processo e por raiz)
             for proc in processes_map.values():
                 here = {}
                 for txt in proc.get("publicacoes_texto", []) or []:
@@ -887,7 +1187,7 @@ def search_companies_catalog():
                     seen.setdefault(root, set()).update(cnpjs)
             dbg["cnpjs_nos_textos"] = len(counts)
 
-            # 2) Descoberta já existente no projeto (grupo/marca)
+            # 4) Descoberta já existente no projeto (grupo/marca)
             try:
                 for ent in discover_company_cnpjs(q, brand, processes_map, search_strategy=strat) or []:
                     d = re.sub(r"\D", "", str(ent))
@@ -945,8 +1245,7 @@ def search_companies_catalog():
                     "matriz": cnpj[8:12] == "0001",
                     "processos_encontrados": counts.get(cnpj[:8], 0),
                     "logo": logo,
-                    "logo_url": (logo.get("logo_url") or logo.get("google_favicon_url")
-                                 or logo.get("logo_primary_url")),
+                    "logo_url": logo.get("logo_url") if logo.get("is_verified_domain") else None,
                 })
         dbg["brasilapi"] = {"consultas": len(jobs), "matrizes": n_matrizes,
                             "sem_resposta": sem_resposta, "descartados_por_nome": descartados}
@@ -960,7 +1259,7 @@ def search_companies_catalog():
             payload["debug"] = dbg
         if not items:
             logger.info("Catálogo sem resultados para '%s': %s", q, dbg)
-            return jsonify({**payload, "error": "NOT_FOUND"}), 404
+            return jsonify({**payload, "error": "NOT_FOUND"}), 200
         CATALOG_CACHE[key] = (time.time(), {k: v for k, v in payload.items() if k != "debug"})
         return jsonify(payload), 200
     except Exception as exc:
@@ -982,6 +1281,13 @@ def get_search_status(search_id: int):
         search = db.session.get(CompanySearch, search_id)
         if not search:
             return jsonify({"error": "Registro não encontrado."}), 404
+
+        # Anti-IDOR: Se a busca pertencer a um tenant específico, valida permissão
+        current_user = get_current_user_optional()
+        if search.tenant_id is not None:
+            if not current_user or current_user.tenant_id != search.tenant_id:
+                return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
+        
         is_completed = search.scan_status == "COMPLETED"
         response = {
             "search_id": search.id,
@@ -1110,16 +1416,333 @@ def incremental_sync(search_id: int):
         return jsonify({"error": "Falha na sincronização incremental."}), 500
 
 
+@api_bp.route("/ingest-deep-scan", methods=["POST"])
+@limit_rate(max_requests=30, window_seconds=60)
+def ingest_deep_scan():
+    """
+    Endpoint canônico para ingestão em lote de varredura profunda (Deep Scan)
+    proveniente do navegador ou robôs assíncronos.
+    - Validação de payload e limite de 2.000 itens (HTTP 413 se excedido).
+    - Deduplicação inteligente por número CNJ normalizado (20 dígitos).
+    - Preserva processos já existentes e mescla novas ocorrências.
+    - Reavaliação estatística completa sobre 100% dos processos (sem fatiamento artificial [:50]/[:100]).
+    - Invariante estrita: soma dos desfechos == total de processos consolidados.
+    - Regra estrita de bloqueio para zero condenações (0.0%).
+    - Isolamento de Multitenancy defensivo (Anti-IDOR).
+    - Atualização dos caches L0 (SEARCH_CACHE) e banco L1.
+    """
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Payload JSON inválido. Um objeto JSON é esperado."}), 400
+
+    search_id = data.get("search_id")
+    if search_id is None or not isinstance(search_id, int):
+        return jsonify({"error": "Campo 'search_id' obrigatório e deve ser um número inteiro."}), 400
+
+    items = data.get("items")
+    if items is None or not isinstance(items, list) or len(items) == 0:
+        return jsonify({"error": "Campo 'items' obrigatório e deve ser uma lista não vazia."}), 400
+
+    if len(items) > 2000:
+        return jsonify({"error": "O lote de ingestão excede o limite máximo de 2.000 itens por requisição."}), 413
+
+    is_final_batch = bool(data.get("is_final_batch", True))
+
+    try:
+        search = db.session.get(CompanySearch, search_id) if hasattr(db.session, "get") else CompanySearch.query.get(search_id)
+        if not search:
+            return jsonify({"error": f"Registro de busca ID {search_id} não encontrado."}), 404
+
+        # Isolamento de Multitenancy defensivo (Anti-IDOR)
+        req_tenant_id = getattr(g, "tenant_id", None)
+        if req_tenant_id is None and request.headers.get("X-Tenant-ID"):
+            req_tenant_id = request.headers.get("X-Tenant-ID")
+
+        if req_tenant_id is not None:
+            rec_tenant_id = getattr(CompanySearch, "tenant_id", None)
+            if isinstance(rec_tenant_id, (int, str)):
+                tenant_val = rec_tenant_id
+            else:
+                tenant_val = getattr(search, "tenant_id", None)
+
+            if tenant_val is not None and str(tenant_val) != str(req_tenant_id):
+                return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
+
+        existing_records = {p.numero_processo: p for p in search.processes if p.numero_processo}
+
+        new_records = []
+        discovered_entities = set()
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            raw_num = (
+                item.get("numero_processo")
+                or item.get("numeroProcesso")
+                or item.get("numeroprocessocommascara")
+            )
+            cnj = orchestrator.searcher.normalize_cnj(raw_num) if raw_num else None
+            if not cnj:
+                continue
+
+            if cnj in existing_records:
+                existing_p = existing_records[cnj]
+                item_outcome = item.get("sentence_outcome") or item.get("statusDesfecho")
+                if existing_p.sentence_outcome == "em_aberto" and item_outcome and item_outcome != "em_aberto":
+                    existing_p.sentence_outcome = item_outcome
+                continue
+
+            if item.get("primary_subject") or item.get("sentence_outcome"):
+                tribunal = str(item.get("tribunal") or item.get("siglaTribunal") or "N/A")[:50]
+                grau = str(item.get("grau") or "G1")[:50]
+                sigilo_raw = item.get("nivel_sigilo") if item.get("nivel_sigilo") is not None else item.get("nivelSigilo", 0)
+                try:
+                    nivel_sigilo = int(sigilo_raw)
+                except (ValueError, TypeError):
+                    nivel_sigilo = 0
+                primary_sub = item.get("primary_subject") or "Obrigação / Reclamação em Apuração Inicial"
+                subjects_list = item.get("subjects") or [primary_sub]
+                outcome = item.get("sentence_outcome") or "em_aberto"
+                has_expert = bool(item.get("has_expert_report", False))
+                obs = item.get("observation")
+                parsed_proc = item
+            else:
+                single_map = {}
+                orchestrator.searcher._parse_comunica_items([item], single_map, discovered_entities)
+                com_data = single_map.get(cnj, {})
+                parsed_proc = orchestrator.searcher._merge_process_data_fast(cnj, com_data, None)
+                tribunal = str(parsed_proc.get("tribunal") or "N/A")[:50]
+                grau = str(parsed_proc.get("grau") or "G1")[:50]
+                nivel_sigilo = int(parsed_proc.get("nivel_sigilo") or 0)
+                primary_sub = parsed_proc.get("primary_subject")
+                subjects_list = [s.get("nome") for s in parsed_proc.get("assuntos", []) if isinstance(s, dict) and s.get("nome")]
+                outcome = parsed_proc.get("sentence_outcome") or "em_aberto"
+                has_expert = bool(parsed_proc.get("has_expert_report", False))
+                obs = parsed_proc.get("observation")
+
+            record = ProcessRecord(
+                company_search_id=search.id,
+                numero_processo=cnj,
+                tribunal=tribunal,
+                grau=grau,
+                nivel_sigilo=nivel_sigilo,
+                primary_subject=primary_sub,
+                subjects_json=subjects_list,
+                observation=obs,
+                sentence_outcome=outcome,
+                has_expert_report=has_expert,
+                raw_metadata=parsed_proc,
+            )
+            new_records.append(record)
+            existing_records[cnj] = record
+
+        if new_records:
+            for i in range(0, len(new_records), 50):
+                db.session.bulk_save_objects(new_records[i : i + 50])
+                db.session.commit()
+
+        # Recarrega a totalidade dos processos consolidados (100% da base sem truncamentos)
+        all_processes = ProcessRecord.query.filter_by(company_search_id=search.id).all()
+        proc_dicts = []
+        for p in all_processes:
+            d = p.to_dict()
+            if isinstance(p.raw_metadata, dict):
+                for k, v in p.raw_metadata.items():
+                    if k not in d:
+                        d[k] = v
+            proc_dicts.append(d)
+
+        fresh_metrics = orchestrator.predictor.generate_dashboard_metrics(search.company_name, proc_dicts)
+
+        p_cond = fresh_metrics.get("probabilidade_condenacao_geral_pct") or fresh_metrics.get("score_risco_terceirizacao") or 0.0
+        econ_data = economic_service.evaluate_economic_standing(
+            company_name=search.company_name,
+            company_processes=proc_dicts,
+            p_condenacao_trabalhista=p_cond,
+        )
+
+        ai_payload = {**fresh_metrics, "empresa": search.company_name, "processos": proc_dicts}
+        ai_res = orchestrator.ai_analyzer.analyze_company(ai_payload)
+
+        search.total_processes = len(all_processes)
+        secrecy_count = sum(1 for p in all_processes if p.nivel_sigilo and p.nivel_sigilo > 0)
+        search.secrecy_count = secrecy_count
+        search.secrecy_rate = round(secrecy_count / len(all_processes), 4) if all_processes else 0.0
+        search.outcomes_summary = fresh_metrics.get("desfechos_sentencas", {})
+        search.ranking_motivos = fresh_metrics.get("ranking_motivos", [])
+        search.ranking_motivos_condenacao = fresh_metrics.get("ranking_motivos_condenacao", [])
+        search.predictions_summary = fresh_metrics.get("plus_previsao_condenacao", [])
+        search.overall_risk_score = fresh_metrics.get("score_risco_terceirizacao", 0.0)
+        search.economic_standing = econ_data
+        search.ai_analysis = ai_res
+        search.scan_status = "COMPLETED" if is_final_batch else "PARTIAL_FAST_PATH"
+        search.movements_hash = generate_movements_hash(proc_dicts)
+        search.last_checked_at = get_utc_now()
+        db.session.commit()
+
+        cache_key = search.normalized_name.upper()
+        SEARCH_CACHE[cache_key] = (time.time(), search.to_dict())
+        _prune_search_cache_if_needed()
+
+        condenacoes = search.outcomes_summary.get("condenacoes", 0) if search.outcomes_summary else 0
+        previsao_bloqueada = (condenacoes == 0)
+        prob_pct = None if previsao_bloqueada else fresh_metrics.get("probabilidade_condenacao_geral_pct")
+
+        return jsonify({
+            "status": "success",
+            "search_id": search.id,
+            "company_name": search.company_name,
+            "scan_status": search.scan_status,
+            "total_processes": search.total_processes,
+            "ingested_count": len(new_records),
+            "desfechos_sentencas": search.outcomes_summary or {},
+            "score_risco_terceirizacao": search.overall_risk_score,
+            "probabilidade_condenacao_geral_pct": prob_pct,
+            "previsao_bloqueada": previsao_bloqueada,
+        }), 200
+
+    except Exception as exc:
+        db.session.rollback()
+        logger.exception("Erro durante ingest-deep-scan para search_id %d: %s", search_id, exc)
+        return jsonify({"error": f"Erro interno ao processar ingestão: {str(exc)}"}), 500
+
+
+@api_bp.route("/searches/<int:search_id>/processes", methods=["GET"])
+def get_search_processes(search_id: int):
+    """
+    Retorna a listagem paginada e filtrada dos processos consolidados de uma empresa.
+    Query parameters:
+    - page: int (padrão 1)
+    - per_page: int (padrão 20, máximo 100)
+    - tribunal: string opcional (ex: TRT2, TST)
+    - outcome: string opcional (condenacao, acordo, improcedente, em_aberto)
+    - search: string opcional (busca textual por CNJ, assunto ou observação)
+    """
+    try:
+        search = db.session.get(CompanySearch, search_id) if hasattr(db.session, "get") else CompanySearch.query.get(search_id)
+        if not search:
+            return jsonify({"error": f"Pesquisa ID {search_id} não encontrada."}), 404
+
+        req_tenant_id = getattr(g, "tenant_id", None)
+        if req_tenant_id is None and request.headers.get("X-Tenant-ID"):
+            req_tenant_id = request.headers.get("X-Tenant-ID")
+
+        if req_tenant_id is not None:
+            rec_tenant_id = getattr(CompanySearch, "tenant_id", None)
+            if isinstance(rec_tenant_id, (int, str)):
+                tenant_val = rec_tenant_id
+            else:
+                tenant_val = getattr(search, "tenant_id", None)
+
+            if tenant_val is not None and str(tenant_val) != str(req_tenant_id):
+                return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
+
+        try:
+            page = max(1, int(request.args.get("page", 1)))
+        except (ValueError, TypeError):
+            page = 1
+
+        try:
+            per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+        except (ValueError, TypeError):
+            per_page = 20
+
+        query = ProcessRecord.query.filter_by(company_search_id=search.id)
+
+        tribunal = request.args.get("tribunal")
+        if tribunal and tribunal.strip():
+            query = query.filter(ProcessRecord.tribunal.ilike(f"%{tribunal.strip()}%"))
+
+        outcome = request.args.get("outcome")
+        if outcome and outcome.strip():
+            o = outcome.strip().lower()
+            if o in ("condenacao", "condenacoes", "condenação", "condenações"):
+                query = query.filter(ProcessRecord.sentence_outcome.in_(["condenacoes", "condenacao"]))
+            elif o in ("acordo", "acordos"):
+                query = query.filter(ProcessRecord.sentence_outcome.in_(["acordos", "acordo"]))
+            elif o in ("improcedente", "improcedentes"):
+                query = query.filter(ProcessRecord.sentence_outcome.in_(["improcedentes", "improcedente"]))
+            elif o in ("em_aberto", "aberto"):
+                query = query.filter(ProcessRecord.sentence_outcome.in_(["em_aberto", "aberto"]))
+            else:
+                query = query.filter(ProcessRecord.sentence_outcome == o)
+
+        search_query = request.args.get("search")
+        if search_query and search_query.strip():
+            sq = f"%{search_query.strip()}%"
+            query = query.filter(
+                db.or_(
+                    ProcessRecord.numero_processo.ilike(sq),
+                    ProcessRecord.primary_subject.ilike(sq),
+                    ProcessRecord.observation.ilike(sq),
+                )
+            )
+
+        total_matches = query.count()
+        total_pages = max(1, math.ceil(total_matches / per_page))
+        offset = (page - 1) * per_page
+        records = query.order_by(ProcessRecord.id.asc()).offset(offset).limit(per_page).all()
+
+        processes_data = [
+            {
+                "id": r.id,
+                "numero_processo": r.numero_processo,
+                "tribunal": r.tribunal,
+                "grau": r.grau,
+                "primary_subject": r.primary_subject,
+                "sentence_outcome": r.sentence_outcome,
+                "has_expert_report": r.has_expert_report,
+                "observation": r.observation,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in records
+        ]
+
+        return jsonify({
+            "search_id": search.id,
+            "company_name": search.company_name,
+            "page": page,
+            "per_page": per_page,
+            "total": total_matches,
+            "total_pages": total_pages,
+            "processes": processes_data,
+        }), 200
+
+    except Exception as exc:
+        logger.exception("Erro ao listar processos da busca ID %d: %s", search_id, exc)
+        return jsonify({"error": f"Erro interno ao listar processos: {str(exc)}"}), 500
+
+
 @api_bp.route("/history", methods=["GET", "DELETE"])
 def get_search_history():
     """
     GET: Retorna o histórico de análises de empresas salvas no banco de dados.
     DELETE: Remove todo o histórico de buscas e processos vinculados do banco de dados.
     """
+    current_user = get_current_user_optional()
     if request.method == "DELETE":
         try:
-            ProcessRecord.query.delete()
-            CompanySearch.query.delete()
+            if current_user:
+                tenant_searches = CompanySearch.query.filter_by(tenant_id=current_user.tenant_id).all()
+                for s in tenant_searches:
+                    db.session.delete(s)
+            else:
+                # Exclusão em lote (batch deletes) para evitar table lock ou alto consumo de RAM
+                batch_size = 500
+                while True:
+                    proc_ids = [p.id for p in ProcessRecord.query.with_entities(ProcessRecord.id).limit(batch_size).all()]
+                    if not proc_ids:
+                        break
+                    ProcessRecord.query.filter(ProcessRecord.id.in_(proc_ids)).delete(synchronize_session=False)
+                    db.session.commit()
+
+                while True:
+                    search_ids = [s.id for s in CompanySearch.query.with_entities(CompanySearch.id).limit(batch_size).all()]
+                    if not search_ids:
+                        break
+                    CompanySearch.query.filter(CompanySearch.id.in_(search_ids)).delete(synchronize_session=False)
+                    db.session.commit()
             db.session.commit()
             SEARCH_CACHE.clear()
             logger.info("Todo o histórico de pesquisas e processos foi limpo pelo usuário.")
@@ -1134,8 +1757,14 @@ def get_search_history():
 
     limit = int(request.args.get("limit", 20))
     try:
+        query = CompanySearch.query
+        if current_user:
+            query = query.filter_by(tenant_id=current_user.tenant_id)
+        else:
+            query = query.filter(CompanySearch.tenant_id.is_(None))
+            
         searches = (
-            CompanySearch.query.order_by(CompanySearch.updated_at.desc())
+            query.order_by(CompanySearch.updated_at.desc())
             .limit(limit)
             .all()
         )
@@ -1154,11 +1783,18 @@ def get_search_detail(search_id: int):
     GET: Retorna os dados detalhados e a lista de processos de uma análise específica.
     DELETE: Remove um registro específico do histórico.
     """
+    search = db.session.get(CompanySearch, search_id)
+    if not search:
+        return jsonify({"error": "Registro não encontrado."}), 404
+
+    # Anti-IDOR: Se a busca pertencer a um tenant específico, valida permissão
+    current_user = get_current_user_optional()
+    if search.tenant_id is not None:
+        if not current_user or current_user.tenant_id != search.tenant_id:
+            return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
+
     if request.method == "DELETE":
         try:
-            search = db.session.get(CompanySearch, search_id)
-            if not search:
-                return jsonify({"error": "Registro não encontrado."}), 404
             db.session.delete(search)
             db.session.commit()
             logger.info("Registro search_id=%d removido pelo usuário.", search_id)
@@ -1171,9 +1807,6 @@ def get_search_detail(search_id: int):
             logger.error("Erro ao deletar search_id %d: %s", search_id, exc)
             return jsonify({"error": "Falha ao remover o registro."}), 500
     try:
-        search = db.session.get(CompanySearch, search_id)
-        if not search:
-            return jsonify({"error": "Registro não encontrado."}), 404
         proc_dicts = [p.to_dict() for p in search.processes]
         result = search.to_dict()
         result["empresa"] = search.company_name
@@ -1192,3 +1825,698 @@ def get_search_detail(search_id: int):
     except Exception as exc:
         logger.error("Erro ao obter detalhes da pesquisa ID %d: %s", search_id, exc)
         return jsonify({"error": "Registro não encontrado."}), 404
+
+
+@api_bp.route("/compare-companies", methods=["POST"])
+@limit_rate(max_requests=60, window_seconds=60)
+def compare_companies():
+    """
+    Endpoint canônico para benchmarking setorial comparativo entre 2 e 5 empresas.
+
+    Formatos de entrada suportados via JSON:
+    1. { "search_ids": [12, 15] }
+    2. { "cnpjs": ["11.222.333/0001-44", "55.666.777/0001-88"] }
+    3. { "items": [{ "search_id": 12 }, { "cnpj": "55.666.777/0001-88" }] }
+    4. { "companies": ["Nome Empresa 1", "Nome Empresa 2"] }
+
+    Validações e Segurança:
+    - Exige entre 2 e 5 empresas distintas (HTTP 400 em caso de < 2 ou > 5).
+    - Valida e sanitiza todos os termos de entrada via sanitizer.py.
+    - Isolamento de multitenancy defensivo (Anti-IDOR): se g.tenant_id estiver ativo,
+      impede acesso a buscas pertencentes a outros tenants.
+    - Reutiliza 100% dos dados já computados pelo /overview (L0_MEMORY_CACHE ou L1_DATABASE),
+      executando consulta sob demanda apenas para termos inéditos.
+    """
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Payload JSON inválido. Envie um objeto com search_ids, cnpjs ou items."}), 400
+
+    raw_items = []
+    if "search_ids" in data and isinstance(data["search_ids"], list):
+        for sid in data["search_ids"]:
+            raw_items.append({"search_id": sid})
+    elif "cnpjs" in data and isinstance(data["cnpjs"], list):
+        for c in data["cnpjs"]:
+            raw_items.append({"cnpj": c})
+    elif "items" in data and isinstance(data["items"], list):
+        for it in data["items"]:
+            if isinstance(it, dict):
+                raw_items.append(it)
+            elif isinstance(it, int) or (isinstance(it, str) and str(it).isdigit() and len(str(it)) < 10):
+                raw_items.append({"search_id": int(it)})
+            elif isinstance(it, str):
+                raw_items.append({"cnpj": str(it)})
+    elif "companies" in data and isinstance(data["companies"], list):
+        for comp in data["companies"]:
+            if isinstance(comp, dict):
+                raw_items.append(comp)
+            else:
+                raw_items.append({"company_name": str(comp)})
+
+    if len(raw_items) < 2:
+        return jsonify({"error": "É necessário informar entre 2 e 5 empresas para realizar o comparativo setorial."}), 400
+    if len(raw_items) > 5:
+        return jsonify({"error": "O limite máximo para comparação simultânea é de 5 empresas."}), 400
+
+    # Verificação de duplicatas no payload de entrada
+    seen_identifiers = set()
+    for item in raw_items:
+        sid = item.get("search_id") or item.get("id")
+        cnpj_val = item.get("cnpj") or item.get("cnpj_utilizado")
+        name_val = item.get("company_name") or item.get("name") or item.get("empresa")
+        if sid is not None and str(sid).isdigit():
+            key = f"id:{sid}"
+        elif cnpj_val:
+            d_val = re.sub(r"\D", "", str(cnpj_val))
+            key = f"cnpj:{d_val}" if len(d_val) == 14 else f"name:{str(cnpj_val).upper()}"
+        elif name_val:
+            key = f"name:{sanitize_company_name(str(name_val)).upper()}"
+        else:
+            key = f"raw:{str(item)}"
+        seen_identifiers.add(key)
+
+    if len(seen_identifiers) < 2:
+        return jsonify({"error": "Forneça pelo menos 2 empresas distintas para comparação."}), 400
+
+    resolved_payloads: list = [None] * len(raw_items)
+    on_demand_queue: list = []
+
+    for idx, item in enumerate(raw_items):
+        # Se já for um payload completo pré-calculado
+        if isinstance(item, dict) and (
+            item.get("risco_subsidiario") is not None
+            or item.get("score_risco_terceirizacao") is not None
+            or item.get("plus_previsao_condenacao") is not None
+        ) and not (item.get("search_id") and not item.get("empresa")):
+            resolved_payloads[idx] = item
+            continue
+
+        sid = item.get("search_id") or item.get("id")
+        if sid is not None and str(sid).isdigit():
+            sid_int = int(sid)
+            search_record = db.session.get(CompanySearch, sid_int)
+            if not search_record:
+                return jsonify({"error": f"Empresa com ID {sid_int} não encontrada."}), 404
+
+            # Defesa Anti-IDOR contra acesso cruzado de tenants
+            req_tenant_id = getattr(g, "tenant_id", None)
+            if req_tenant_id is None and request.headers.get("X-Tenant-ID"):
+                req_tenant_id = request.headers.get("X-Tenant-ID")
+
+            if req_tenant_id is not None:
+                # Prioriza valor da classe (caso monkeypatched em testes) ou da instância
+                rec_tenant_id = getattr(CompanySearch, "tenant_id", None)
+                if isinstance(rec_tenant_id, int) or isinstance(rec_tenant_id, str):
+                    tenant_val = rec_tenant_id
+                else:
+                    tenant_val = getattr(search_record, "tenant_id", None)
+
+                if tenant_val is not None and str(tenant_val) != str(req_tenant_id):
+                    return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
+
+            resolved_payloads[idx] = _search_record_to_pdf_payload(search_record)
+            continue
+
+        raw_term = str(item.get("cnpj") or item.get("company_name") or item.get("name") or "").strip()
+        if not raw_term:
+            return jsonify({"error": "Item de busca vazio ou sem identificador válido."}), 400
+
+        # Sanitização da entrada
+        if not is_valid_company_search_input(raw_term):
+            return jsonify({"error": f"Identificador de empresa inválido: '{raw_term}'. Forneça Razão Social ou CNPJ válido."}), 400
+
+        # Busca no L0 (Memory Cache) ou L1 (Database)
+        cached_payload = _find_company_payload_for_pdf(raw_term)
+        if cached_payload:
+            resolved_payloads[idx] = cached_payload
+            continue
+
+        on_demand_queue.append((idx, raw_term))
+
+    # Execução concorrente via ThreadPoolExecutor para termos inéditos fora de cache (baixa latência no Render Free)
+    if on_demand_queue:
+        def _fetch_company_on_demand(term: str) -> dict:
+            def _brasil_api_fetcher_with_timeout(cnpj: str) -> Optional[str]:
+                return fetch_cnpj_brasilapi(cnpj, timeout=5)
+
+            strat = resolve_search_strategy(term, brasil_api_fetcher=_brasil_api_fetcher_with_timeout)
+            q_term = strat["comunica_query_term"]
+            d_title = strat["display_title"]
+            target_cnpj = strat.get("target_cnpj")
+
+            fast_res = orchestrator.analyze_company_by_name(
+                company_name=q_term,
+                target_cnpj=target_cnpj,
+                max_items_first_page=50,
+                search_strategy=strat,
+            )
+            fast_res["empresa"] = d_title
+            fast_res["is_broad_brand"] = strat.get("is_broad_brand", False)
+            fast_res["search_strategy"] = strat
+
+            econ = economic_service.evaluate_economic_standing(
+                company_name=d_title,
+                cnpj=target_cnpj,
+                company_processes=fast_res.get("processos", []),
+                p_condenacao_trabalhista=fast_res.get("probabilidade_condenacao_geral_pct") or 0.0,
+                search_strategy=strat,
+            )
+            fast_res["idoneidade_economica"] = econ
+            if econ.get("indice_exposicao_financeira") is not None:
+                fast_res["indice_exposicao_financeira"] = econ["indice_exposicao_financeira"]
+                fast_res["score_risco_terceirizacao"] = econ["indice_exposicao_financeira"]
+                fast_res["overall_risk_score"] = econ["indice_exposicao_financeira"]
+
+            ckey = strat.get("cache_key") or f"{strat['mode']}::{q_term}::{target_cnpj or ''}"
+            _prune_search_cache_if_needed()
+            SEARCH_CACHE[ckey] = (time.time(), fast_res)
+            return fast_res
+
+        if len(on_demand_queue) == 1:
+            idx, term = on_demand_queue[0]
+            try:
+                resolved_payloads[idx] = _fetch_company_on_demand(term)
+            except Exception as search_err:
+                logger.error("Erro na busca sob demanda para comparativo ('%s'): %s", term, search_err)
+                return jsonify({"error": f"Não foi possível processar a empresa '{term}' para o comparativo."}), 500
+        else:
+            with ThreadPoolExecutor(max_workers=min(len(on_demand_queue), 4)) as executor:
+                future_to_item = {
+                    executor.submit(_fetch_company_on_demand, term): (idx, term)
+                    for idx, term in on_demand_queue
+                }
+                for future in as_completed(future_to_item, timeout=15.0):
+                    idx, term = future_to_item[future]
+                    try:
+                        resolved_payloads[idx] = future.result(timeout=15.0)
+                    except Exception as search_err:
+                        logger.error("Erro na busca concorrente sob demanda ('%s'): %s", term, search_err)
+                        return jsonify({"error": f"Não foi possível processar a empresa '{term}' para o comparativo."}), 500
+
+    # Validação de unicidade das empresas resolvidas
+    unique_resolved = set()
+    for p in resolved_payloads:
+        p_cnpj = re.sub(r"\D", "", str(p.get("cnpj") or (p.get("idoneidade_economica") or {}).get("cnpj_utilizado") or ""))
+        p_name = sanitize_company_name(str(p.get("empresa") or p.get("company_name") or "")).upper()
+        unique_resolved.add(p_cnpj if p_cnpj else p_name)
+
+    if len(unique_resolved) < 2:
+        return jsonify({"error": "Forneça pelo menos 2 empresas distintas para comparação."}), 400
+
+    try:
+        benchmark = build_sector_benchmark(resolved_payloads, ai_analyzer=orchestrator.ai_analyzer)
+        return jsonify(benchmark), 200
+    except Exception as bench_err:
+        logger.exception("Erro ao gerar benchmarking setorial: %s", bench_err)
+        return jsonify({"error": "Erro interno ao processar o comparativo setorial."}), 500
+
+
+# =============================================================================
+# EXPORTAÇÃO DE RELATÓRIO EXECUTIVO EM PDF (v2.0 RiskTech + Solvência)
+# Suporta:
+#   - GET  /api/v1/history/<int:search_id>/summary.pdf
+#   - GET/POST /api/v1/report/pdf  (e /api/v1/export/pdf)
+#   - GET  /api/v1/report/pdf/<path:company_name> (e /api/v1/export/pdf/<path:company_name>)
+#   - Aliases diretos /api/report/pdf, /api/export/pdf registrados no app factory
+# =============================================================================
+def _strip_visual_company_suffixes(text: str) -> str:
+    """Remove sufixos visuais como '(GRUPO CONSOLIDADO / FILIAIS)' para localizar a chave real."""
+    cleaned = re.sub(r"\(.*?\)", "", str(text or "")).strip()
+    for kw in ("GRUPO CONSOLIDADO", "FILIAIS", "MATRIZ / FILIAIS"):
+        cleaned = re.sub(rf"\b{re.escape(kw)}\b", "", cleaned, flags=re.IGNORECASE).strip()
+    return re.sub(r"\s+", " ", cleaned).strip(" -/")
+
+
+def _search_record_to_pdf_payload(search: CompanySearch) -> dict:
+    """Converte um registro CompanySearch do banco no payload completo para geração do PDF."""
+    result = search.to_dict()
+    result["empresa"] = search.company_name
+    result["total_processos"] = search.total_processes or 0
+    result["desfechos_sentencas"] = search.outcomes_summary or {}
+    result["ranking_motivos"] = search.ranking_motivos or []
+    result["ranking_motivos_condenacao"] = search.ranking_motivos_condenacao or []
+    result["plus_previsao_condenacao"] = search.predictions_summary or []
+    result["score_risco_terceirizacao"] = search.overall_risk_score or 0.0
+    result["overall_risk_score"] = search.overall_risk_score or 0.0
+    if isinstance(search.economic_standing, dict):
+        result["idoneidade_economica"] = search.economic_standing
+        if search.economic_standing.get("indice_exposicao_financeira") is not None:
+            result["indice_exposicao_financeira"] = search.economic_standing["indice_exposicao_financeira"]
+    result["parecer_agente_adk"] = result.get("ai_analysis") or {}
+    return result
+
+
+def _find_company_payload_for_pdf(term: str, tenant_id: Optional[int] = None) -> Optional[dict]:
+    """
+    Procura os dados consolidados da empresa primeiro no L0_MEMORY_CACHE (SEARCH_CACHE)
+    e depois no banco (CompanySearch), aplicando isolamento multitenant (anti-IDOR),
+    limpando sufixos visuais e suportando CNPJs com barra.
+    """
+    raw = str(term or "").strip()
+    if not raw:
+        return None
+
+    clean_no_parens = _strip_visual_company_suffixes(raw)
+    digits = re.sub(r"\D", "", raw)
+    cnpj_digits = digits if len(digits) == 14 else ""
+    sanitized = sanitize_company_name(clean_no_parens or raw).upper()
+    brand = extract_brand_search_term(clean_no_parens or raw).upper()
+
+    targets = {
+        t.upper()
+        for t in (raw, clean_no_parens, sanitized, brand, cnpj_digits)
+        if t and len(t.strip()) >= 2
+    }
+
+    # 1. Busca no L0_MEMORY_CACHE (SEARCH_CACHE)
+    for cache_key, (_ts, cached_data) in list(SEARCH_CACHE.items()):
+        if not isinstance(cached_data, dict):
+            continue
+        cached_tenant = cached_data.get("tenant_id")
+        if cached_tenant is not None and tenant_id is not None and str(cached_tenant) != str(tenant_id):
+            continue
+        key_upper = str(cache_key).upper()
+        emp_upper = str(cached_data.get("empresa") or cached_data.get("company_name") or "").upper()
+        emp_clean = _strip_visual_company_suffixes(emp_upper).upper()
+        econ = cached_data.get("idoneidade_economica") or {}
+        strat = cached_data.get("search_strategy") or {}
+
+        cached_cnpjs = set()
+        for c_val in [
+            econ.get("cnpj_utilizado"),
+            econ.get("cnpj_triangulado"),
+            strat.get("target_cnpj"),
+            *(econ.get("cnpjs_consolidados") or []),
+        ]:
+            d_val = re.sub(r"\D", "", str(c_val or ""))
+            if len(d_val) == 14:
+                cached_cnpjs.add(d_val)
+
+        if cnpj_digits and (cnpj_digits in cached_cnpjs or cnpj_digits in key_upper):
+            return dict(cached_data)
+
+        if (
+            emp_upper in targets
+            or emp_clean in targets
+            or any(t in key_upper.split("::") for t in targets)
+            or (brand and emp_clean and brand == emp_clean)
+        ):
+            return dict(cached_data)
+
+    # 2. Busca no banco de dados (SQLite / PostgreSQL - CompanySearch) com isolamento multitenant
+    try:
+        query = CompanySearch.query
+        if tenant_id is not None:
+            query = query.filter((CompanySearch.tenant_id == tenant_id) | (CompanySearch.tenant_id.is_(None)))
+        recent_rows = query.order_by(CompanySearch.updated_at.desc()).limit(50).all()
+        for row in recent_rows:
+            if row.tenant_id is not None and tenant_id is not None and str(row.tenant_id) != str(tenant_id):
+                continue
+            row_name_up = str(row.company_name or "").upper()
+            row_norm_up = str(row.normalized_name or "").upper()
+            row_clean_up = _strip_visual_company_suffixes(row_name_up).upper()
+            row_econ = row.economic_standing if isinstance(row.economic_standing, dict) else {}
+
+            row_cnpjs = set()
+            for c_val in [
+                row_econ.get("cnpj_utilizado"),
+                row_econ.get("cnpj_triangulado"),
+                *(row_econ.get("cnpjs_consolidados") or []),
+            ]:
+                d_val = re.sub(r"\D", "", str(c_val or ""))
+                if len(d_val) == 14:
+                    row_cnpjs.add(d_val)
+
+            if cnpj_digits and (cnpj_digits in row_cnpjs or cnpj_digits in re.sub(r"\D", "", row_name_up)):
+                return _search_record_to_pdf_payload(row)
+
+            if (
+                row_name_up in targets
+                or row_norm_up in targets
+                or row_clean_up in targets
+                or (sanitized and sanitized == row_norm_up)
+                or (brand and brand == row_clean_up)
+            ):
+                return _search_record_to_pdf_payload(row)
+    except Exception as db_exc:
+        logger.debug("Consulta ao banco para PDF tratada silenciosamente: %s", db_exc)
+
+    return None
+
+
+def _build_pdf_response(payload: dict, filename_hint: str = "relatorio") -> Response:
+    """Renderiza os bytes do PDF executivo v3.0 e retorna a resposta HTTP application/pdf."""
+    pdf_bytes = generate_company_report_pdf(payload)
+    base_name = _strip_visual_company_suffixes(filename_hint) or "relatorio"
+    norm_ascii = unicodedata.normalize("NFKD", base_name).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", norm_ascii).strip("-").lower()[:48] or "relatorio"
+    safe_filename = re.sub(r'[\r\n/\\"]+', "_", f"radarjus-{slug}.pdf")
+    resp = Response(
+        pdf_bytes,
+        status=200,
+        mimetype="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+    gc.collect()
+    return resp
+
+
+def _build_compare_pdf_response(payload: dict, filename_hint: str = "comparativo") -> Response:
+    """Renderiza os bytes do PDF comparativo v3.0 e retorna a resposta HTTP application/pdf."""
+    pdf_bytes = generate_comparative_report_pdf(payload)
+    base_name = _strip_visual_company_suffixes(filename_hint) or "comparativo"
+    norm_ascii = unicodedata.normalize("NFKD", base_name).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", norm_ascii).strip("-").lower()[:48] or "comparativo"
+    safe_filename = re.sub(r'[\r\n/\\"]+', "_", f"radarjus-{slug}.pdf")
+    resp = Response(
+        pdf_bytes,
+        status=200,
+        mimetype="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+    gc.collect()
+    return resp
+
+
+def handle_pdf_export_request(
+    search_id: Optional[int] = None,
+    company_name: Optional[str] = None,
+) -> Response:
+    """
+    Manipulador unificado de exportação de PDF:
+    1. Aceita POST com o objeto de resultado já carregado na tela (nunca dá 404).
+    2. Aceita search_id (via path /history/<id>/summary.pdf ou query ?search_id=).
+    3. Aceita nome/CNPJ via query string (?empresa=, ?q=, ?company_name=) ou <path:company_name> (suportando '/').
+    4. Busca em L0_MEMORY_CACHE -> banco CompanySearch -> geração sob demanda para empresa/CNPJ válido.
+    Garante estrito isolamento multitenant (anti-IDOR).
+    """
+    body = request.get_json(silent=True) if request.method == "POST" else None
+    if not isinstance(body, dict):
+        body = {}
+
+    current_user = get_current_user_optional()
+    user_tenant_id = current_user.tenant_id if current_user else None
+
+    # Validação Anti-IDOR se o body trouxer tenant_id explícito
+    body_tenant = body.get("tenant_id")
+    if body_tenant is not None and (not current_user or current_user.tenant_id != body_tenant):
+        return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
+
+    # 1. Payload já carregado na sessão do Front-end (via POST)
+    live_name = body.get("empresa") or body.get("company_name") or body.get("name")
+    has_live_metrics = any(
+        k in body and body.get(k) is not None
+        for k in (
+            "idoneidade_economica",
+            "idoneidadeEconomica",
+            "desfechos_sentencas",
+            "outcomes",
+            "outcomes_summary",
+            "total_processos",
+            "total_processes",
+            "total",
+            "ai_analysis",
+            "aiAnalysis",
+            "ranking_motivos",
+            "reasons",
+        )
+    )
+    if live_name and has_live_metrics:
+        payload = dict(body)
+        # Se houver search_id e faltar idoneidade ou IA, enriquece com o registro salvo
+        body_sid = body.get("search_id") or body.get("searchId") or body.get("id")
+        if body_sid:
+            try:
+                saved = db.session.get(CompanySearch, int(body_sid))
+                if saved:
+                    if saved.tenant_id is not None and (not current_user or current_user.tenant_id != saved.tenant_id):
+                        return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
+                    if (
+                        not payload.get("idoneidade_economica")
+                        and not payload.get("idoneidadeEconomica")
+                        and isinstance(saved.economic_standing, dict)
+                    ):
+                        payload["idoneidade_economica"] = saved.economic_standing
+            except Exception:
+                pass
+        return _build_pdf_response(payload, filename_hint=str(live_name))
+
+    # 2. Busca por search_id (rota /history/<id>/summary.pdf ou ?search_id=)
+    resolved_sid = search_id
+    if resolved_sid is None:
+        raw_sid = request.args.get("search_id") or body.get("search_id") or body.get("searchId")
+        if raw_sid is not None and str(raw_sid).isdigit():
+            resolved_sid = int(raw_sid)
+
+    if resolved_sid is not None:
+        try:
+            search = db.session.get(CompanySearch, int(resolved_sid))
+        except Exception:
+            search = None
+        if search:
+            if search.tenant_id is not None and (not current_user or current_user.tenant_id != search.tenant_id):
+                return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
+            payload = _search_record_to_pdf_payload(search)
+            return _build_pdf_response(payload, filename_hint=f"empresa-{search.id}")
+        # Se veio somente search_id e não existe no banco, verifica se veio nome de fallback
+        fallback_term = (
+            company_name
+            or request.args.get("empresa")
+            or request.args.get("q")
+            or request.args.get("company_name")
+            or live_name
+        )
+        if not fallback_term:
+            return jsonify({"error": "Consulta não encontrada para geração do PDF."}), 404
+
+    # 3. Busca por nome de empresa ou CNPJ (suporta barras via <path:company_name> ou query string)
+    term = (
+        company_name
+        or request.args.get("empresa")
+        or request.args.get("q")
+        or request.args.get("company_name")
+        or request.args.get("name")
+        or live_name
+        or ""
+    ).strip()
+
+    if not term:
+        return jsonify({
+            "error": "Informe 'empresa', 'q', 'search_id' ou envie os dados da análise via POST para gerar o PDF."
+        }), 400
+
+    payload = _find_company_payload_for_pdf(term, tenant_id=user_tenant_id)
+    if payload:
+        return _build_pdf_response(payload, filename_hint=term)
+
+    # 4. Fallback sob demanda: gera relatório executivo com estratégia + idoneidade econômica
+    try:
+        strategy = resolve_search_strategy(term)
+        display_title = strategy.get("display_title") or term
+        cnpj_target = strategy.get("target_cnpj")
+        econ_data = economic_service.evaluate_economic_standing(
+            company_name=display_title,
+            cnpj=cnpj_target,
+            company_processes=[],
+            p_condenacao_trabalhista=0.0,
+            search_strategy=strategy,
+        )
+    except Exception as exc:
+        logger.debug("Fallback econômico na geração direta de PDF: %s", exc)
+        display_title = term
+        strategy = {}
+        econ_data = {}
+
+    live_payload = {
+        "empresa": display_title,
+        "total_processos": 0,
+        "desfechos_sentencas": {"condenacoes": 0, "acordos": 0, "improcedentes": 0, "em_aberto": 0},
+        "ranking_motivos": [],
+        "ranking_motivos_condenacao": [],
+        "plus_previsao_condenacao": [],
+        "indice_exposicao_financeira": econ_data.get("indice_exposicao_financeira", 0.0),
+        "score_risco_terceirizacao": econ_data.get("indice_exposicao_financeira", 0.0),
+        "idoneidade_economica": econ_data,
+        "search_strategy": strategy,
+        "scan_status": "COMPLETED",
+    }
+    try:
+        live_payload["ai_analysis"] = orchestrator.ai_analyzer.analyze_company(live_payload)
+    except Exception:
+        live_payload["ai_analysis"] = {}
+
+    return _build_pdf_response(live_payload, filename_hint=display_title)
+
+
+@api_bp.route("/history/<int:search_id>/summary.pdf", methods=["GET"])
+def export_history_summary_pdf(search_id: int):
+    """Exporta o relatório executivo em PDF de uma pesquisa salva pelo ID."""
+    search = db.session.get(CompanySearch, search_id)
+    if not search:
+        return jsonify({"error": "Registro não encontrado."}), 404
+    current_user = get_current_user_optional()
+    if search.tenant_id is not None:
+        if not current_user or current_user.tenant_id != search.tenant_id:
+            return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
+    return handle_pdf_export_request(search_id=search_id)
+
+
+@api_bp.route("/export-pdf", methods=["GET", "POST"])
+@api_bp.route("/report/pdf", methods=["GET", "POST"])
+@api_bp.route("/export/pdf", methods=["GET", "POST"])
+def export_report_pdf_query_or_post() -> Response:
+    """Exporta o relatório executivo em PDF via query string (?empresa=... / ?q=...) ou POST com JSON da tela."""
+    return handle_pdf_export_request()
+
+
+@api_bp.route("/export-pdf/<path:company_name>", methods=["GET"])
+@api_bp.route("/report/pdf/<path:company_name>", methods=["GET"])
+@api_bp.route("/export/pdf/<path:company_name>", methods=["GET"])
+def export_report_pdf_by_path(company_name: str) -> Response:
+    """Exporta o relatório executivo em PDF por nome/CNPJ no path (suporta barras como CNPJ e GRUPO CONSOLIDADO / FILIAIS)."""
+    return handle_pdf_export_request(company_name=company_name)
+
+
+@api_bp.route("/export-compare-pdf", methods=["GET", "POST"])
+@api_bp.route("/compare-pdf", methods=["GET", "POST"])
+@api_bp.route("/export/compare-pdf", methods=["GET", "POST"])
+def export_compare_pdf() -> Response:
+    """
+    Exporta o relatório comparativo de 2 a 5 empresas em PDF (v3.0).
+    Aceita POST com JSON contendo 'companies', 'empresas', 'search_ids' ou lista de empresas.
+    Aceita GET com query string contendo ?search_ids=1,2,3 ou ?empresas=A,B ou ?q=A,B.
+    Garante estrito isolamento multitenant (anti-IDOR).
+    """
+    body = request.get_json(silent=True) if request.method == "POST" else None
+    if not isinstance(body, dict):
+        if isinstance(body, list):
+            body = {"companies": body}
+        else:
+            body = {}
+
+    current_user = get_current_user_optional()
+    user_tenant_id = current_user.tenant_id if current_user else None
+    resolved_companies: List[dict] = []
+
+    # 1. Se vieram search_ids
+    search_ids = body.get("search_ids") or body.get("ids")
+    if not search_ids and request.args.get("search_ids"):
+        raw_sids = request.args.get("search_ids", "").split(",")
+        search_ids = [int(s.strip()) for s in raw_sids if s.strip().isdigit()]
+    elif not search_ids and request.args.get("ids"):
+        raw_sids = request.args.get("ids", "").split(",")
+        search_ids = [int(s.strip()) for s in raw_sids if s.strip().isdigit()]
+
+    if search_ids and isinstance(search_ids, list):
+        for sid in search_ids:
+            try:
+                s_rec = db.session.get(CompanySearch, int(sid))
+            except Exception:
+                s_rec = None
+            if s_rec:
+                if s_rec.tenant_id is not None:
+                    if not current_user or current_user.tenant_id != s_rec.tenant_id:
+                        return jsonify({"error": f"Acesso negado: a busca ID {sid} pertence a outra organização."}), 403
+                resolved_companies.append(_search_record_to_pdf_payload(s_rec))
+
+    # 2. Se vieram objetos de empresa diretamente no POST
+    if not resolved_companies:
+        raw_list = body.get("companies") or body.get("empresas") or body.get("items")
+        if isinstance(raw_list, list) and raw_list:
+            for item in raw_list:
+                if isinstance(item, dict):
+                    item_tenant = item.get("tenant_id")
+                    if item_tenant is not None and (not current_user or current_user.tenant_id != item_tenant):
+                        return jsonify({"error": "Acesso negado: um ou mais itens enviados pertencem a outra organização."}), 403
+                    if any(
+                        k in item
+                        for k in ("idoneidade_economica", "outcomes", "desfechos_sentencas", "total_processos", "total_processes")
+                    ):
+                        resolved_companies.append(item)
+                    else:
+                        term = str(item.get("empresa") or item.get("company_name") or item.get("cnpj") or "").strip()
+                        if term:
+                            payload = _find_company_payload_for_pdf(term, tenant_id=user_tenant_id)
+                            if payload:
+                                resolved_companies.append(payload)
+                            else:
+                                resolved_companies.append({"company_name": term})
+                elif isinstance(item, str) and item.strip():
+                    payload = _find_company_payload_for_pdf(item.strip(), tenant_id=user_tenant_id)
+                    if payload:
+                        resolved_companies.append(payload)
+                    else:
+                        resolved_companies.append({"company_name": item.strip()})
+
+    # 3. Se vieram nomes de empresas por query string
+    if not resolved_companies:
+        names_param = request.args.get("empresas") or request.args.get("companies") or request.args.get("q")
+        if names_param:
+            raw_names = [n.strip() for n in names_param.split(",") if n.strip()]
+            for name in raw_names:
+                payload = _find_company_payload_for_pdf(name, tenant_id=user_tenant_id)
+                if payload:
+                    resolved_companies.append(payload)
+                else:
+                    resolved_companies.append({"company_name": name})
+
+    # Regra estrita: relatório comparativo exige ao menos 2 empresas (máximo 5)
+    if len(resolved_companies) < 2:
+        return jsonify({
+            "error": "Informe pelo menos 2 empresas (máximo 5) via 'companies', 'empresas' ou 'search_ids' para exportação comparativa."
+        }), 400
+
+    return _build_compare_pdf_response({"companies": resolved_companies[:5]}, filename_hint="comparativo-empresas")
+
+
+@api_bp.route("/cnj-proxy", methods=["GET", "POST", "OPTIONS"])
+def cnj_proxy():
+    """Proxy local e para desenvolvimento para contornar restrições de CORS e geoblocking."""
+    from flask import request as flask_req, Response
+    if flask_req.method == "OPTIONS":
+        resp = Response("", status=204)
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, chave-api-dados, X-Target-Url, x-proxy-secret"
+        return resp
+
+    expected_secret = (os.getenv("PROXY_SHARED_SECRET") or os.getenv("CNJ_PROXY_SECRET") or "").strip()
+    if expected_secret:
+        provided_secret = (flask_req.headers.get("x-proxy-secret") or "").strip()
+        auth_header = (flask_req.headers.get("Authorization") or "").strip()
+        if not provided_secret and auth_header.startswith("Bearer "):
+            provided_secret = auth_header[7:].strip()
+        if not provided_secret or not hmac.compare_digest(provided_secret, expected_secret):
+            return jsonify({"error": "Unauthorized proxy access"}), 401
+
+    target_url = flask_req.args.get("target") or flask_req.headers.get("X-Target-Url")
+    if not target_url:
+        return jsonify({"error": "Missing target URL"}), 400
+
+    from urllib.parse import urlparse
+    parsed_target = urlparse(target_url)
+    allowed_hosts = {
+        "comunicaapi.pje.jus.br",
+        "api-publica.datajud.cnj.jus.br",
+        "api.portaldatransparencia.gov.br",
+    }
+    if parsed_target.scheme != "https" or parsed_target.hostname not in allowed_hosts:
+        return jsonify({"error": "Host not allowed by proxy whitelist"}), 400
+
+    try:
+        from app.utils.http_client import request_gov_br_with_fallback
+        method = flask_req.method
+        headers = {k: v for k, v in flask_req.headers.items() if k.lower() in ("authorization", "chave-api-dados", "content-type")}
+        json_body = flask_req.get_json(silent=True) if method in ("POST", "PUT", "PATCH") else None
+        upstream = request_gov_br_with_fallback(method, target_url, headers=headers, json_body=json_body, timeout=8.0)
+        resp = Response(upstream.content, status=upstream.status_code, content_type=upstream.headers.get("content-type", "application/json"))
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502

@@ -1,0 +1,59 @@
+name: AI Code Reviewer
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ai-review:
+    name: RadarJus AI Code Review (Gemini Flash-Lite)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (full history for diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run AI PR Reviewer Script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+        run: |
+          python .github/scripts/ai_pr_reviewer.py
+
+      - name: Post or update PR review comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          COMMENT_FILE="ai_review_comment.md"
+          if [ ! -f "$COMMENT_FILE" ]; then
+            echo "Nenhum arquivo de comentário gerado. Encerrando."
+            exit 0
+          fi
+
+          echo "Procurando comentário anterior do AI Reviewer..."
+          EXISTING_ID=$(gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments --jq '.[] | select(.body | contains("<!-- radarjus-ai-reviewer -->")) | .id' | head -n 1)
+
+          if [ -n "$EXISTING_ID" ]; then
+            echo "Atualizando comentário existente ID: $EXISTING_ID"
+            gh api -X PATCH repos/${{ github.repository }}/issues/comments/${EXISTING_ID} -F body=@"$COMMENT_FILE"
+          else
+            echo "Criando novo comentário no PR #$PR_NUMBER"
+            gh pr comment "$PR_NUMBER" --body-file "$COMMENT_FILE"
+          fi
+

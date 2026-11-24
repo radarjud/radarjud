@@ -1,89 +1,48 @@
-name: CI - Regular Checks
+name: CI - DevSecOps Pipeline
 
 on:
   push:
-    branches: [ "main", "develop" ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ "main", "develop" ]
+    branches: [ "main" ]
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  PYTHON_VERSION: "3.11"
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
-  lint:
-    name: Code Quality & Syntax
+  backend-quality-and-tests:
+    name: Backend Quality & Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install Ruff
-        run: pip install ruff
-
-      - name: Check Python syntax and critical errors (Ruff)
-        # Ruff checks syntax errors unconditionally; F63, F7, F82 catch undefined names & broken syntax constructs
-        run: |
-          if [ -n "$(find . -name '*.py' -not -path './.*' -print -quit)" ]; then
-            ruff check . --select=F63,F7,F82 --output-format=github
-          else
-            echo "No Python files found yet, skipping Ruff critical check."
-          fi
-
-      - name: General style & lint warnings (non-blocking)
-        run: |
-          if [ -n "$(find . -name '*.py' -not -path './.*' -print -quit)" ]; then
-            ruff check . --exit-zero --output-format=github
-          else
-            echo "No Python files found yet, skipping Ruff style check."
-          fi
-
-      - name: Compile Python files
-        run: |
-          if [ -d "app" ]; then
-            python -m compileall -q app
-          fi
-          if [ -f "run.py" ]; then
-            python -m py_compile run.py
-          fi
-
-  test:
-    name: Unit & Integration Tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Cache pip packages
-        if: hashFiles('requirements.txt') != ''
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest pytest-cov
+          pip install pytest pytest-cov ruff
           if [ -f "requirements.txt" ]; then
             pip install -r requirements.txt
           fi
+
+      - name: Check critical Python syntax errors (Ruff blocking)
+        run: ruff check app/ tests/ --select=E9,F63,F7,F82
+
+      - name: General style & lint analysis (Ruff)
+        run: ruff check app/ tests/ --exit-zero
 
       - name: Set up environment variables
         run: |
@@ -91,40 +50,89 @@ jobs:
             cp .env.example .env
           fi
 
-      - name: Run pytest
-        run: |
-          if [ -d "tests" ]; then
-            set +e
-            PYTHONPATH=. pytest tests/ -v --tb=short
-            exit_code=$?
-            set -e
-            if [ $exit_code -eq 5 ]; then
-              echo "No tests collected yet (pytest exit code 5) — passing check."
-              exit 0
-            fi
-            exit $exit_code
-          else
-            echo "No tests directory found yet, skipping pytest."
-          fi
+      - name: Run unit & integration tests with coverage
+        run: pytest -v --cov=app --cov-report=term-missing --cov-fail-under=65 --disable-warnings
 
-  docker:
-    name: Docker Build Check
+  frontend-verify:
+    name: Frontend Verification & Build
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up environment file for Docker Compose
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend unit tests
+        run: node --test src/companyNavigation.test.js
+
+      - name: Build frontend for production
+        run: npm run build
+
+  security-scan:
+    name: DevSecOps Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (full history for Gitleaks)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Gitleaks standalone binary
         run: |
-          if [ -f ".env.example" ] && [ ! -f ".env" ]; then
-            cp .env.example .env
-          fi
+          GITLEAKS_VERSION="8.24.0"
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | sudo tar -xz -C /usr/local/bin gitleaks
 
-      - name: Validate docker-compose.yml
-        if: hashFiles('docker-compose.yml') != ''
-        run: docker compose config -q
+      - name: Run Gitleaks secret detection
+        run: gitleaks detect --source=. -v --redact --gitleaks-ignore-path=.gitleaksignore
 
-      - name: Test Docker image build
-        if: hashFiles('Dockerfile') != ''
-        run: docker build -t radarjud:ci-test .
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
+      - name: Install security scanning tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit pip-audit
+
+      - name: Run Bandit static application security testing (SAST)
+        run: bandit -r app/ -ll -q
+
+      - name: Run pip-audit vulnerability check
+        continue-on-error: true
+        run: pip-audit -r requirements.txt
+
+  pr-title-check:
+    name: PR Semantic Title Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Validate Conventional Commits PR Title
+        uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            refactor
+            chore
+            test
+            docs
+            ci
+            perf
+            style
+            build
+          validateSingleCommit: false
