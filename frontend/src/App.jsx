@@ -6,21 +6,23 @@ import {
   Search, LayoutDashboard, FileText, ChartNoAxesCombined, History,
   Menu, X, ArrowRight, RefreshCw, AlertCircle, AlertTriangle, ShieldCheck, ShieldAlert,
   Info, ChevronRight, Building2, TrendingUp, Filter, CheckCircle2,
-  Check, Activity, BarChart3, Radar, Share2, Download, Library
+  Check, Activity, BarChart3, Radar, Share2, Download, Library, Scale
 } from 'lucide-react';
 import { companyHash, companyShareUrl, isCompanyPage, parseRoute, validSearchId } from './companyNavigation.js';
 import { CompanyLogo } from "./CompanyLogo.jsx";
 import CatalogPage, { normalizeCatalog, onlyDigits } from './CatalogPage.jsx';
+import ComparePage from './ComparePage.jsx';
 
 // Vite encaminha /api ao Flask. Defina VITE_API_BASE_URL se a API estiver em outro host.
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
 const PAGE_LABELS = {
   search: 'Pesquisar empresas', catalog: 'Catálogo de empresas', overview: 'Visão geral', processes: 'Processos',
-  predictions: 'Estimativas', history: 'Histórico',
+  predictions: 'Estimativas', history: 'Histórico', compare: 'Comparar empresas',
 };
 const NAV_ITEMS = [
   { id: 'search', icon: Search }, { id: 'catalog', icon: Library }, { id: 'overview', icon: LayoutDashboard },
   { id: 'processes', icon: FileText }, { id: 'predictions', icon: ChartNoAxesCombined },
+  { id: 'compare', icon: Scale },
   { id: 'history', icon: History },
 ];
 const OUTCOME_LABELS = {
@@ -1288,7 +1290,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (page === 'history') loadHistory();
+    if (page === 'history' || page === 'compare') loadHistory();
   }, [page]);
 
   return (
@@ -1329,6 +1331,14 @@ export default function App() {
             {page === 'processes' && <Processes data={visibleData} />}
             {page === 'predictions' && <Predictions data={visibleData} />}
           </>}
+          {page === 'compare' && (
+            <ComparePage
+              request={request}
+              history={history}
+              currentCompany={visibleData}
+              navigate={navigate}
+            />
+          )}
           {page === 'history' && <HistoryPage history={history} busy={historyBusy} error={historyError} onOpen={openHistory} onReload={loadHistory} />}
         </main>
         <footer className="footer">RadarJus · Inteligência Preditiva</footer>
