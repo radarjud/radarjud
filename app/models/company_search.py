@@ -27,7 +27,8 @@ class CompanySearch(db.Model):
     movements_hash = db.Column(db.String(64), index=True, nullable=True)
     last_checked_at = db.Column(db.DateTime, default=get_utc_now, nullable=False)
     scan_status = db.Column(db.String(20), default="COMPLETED", nullable=False, index=True)
-    # Valores possíveis de scan_status: 'COMPLETED', 'PARTIAL_FAST_PATH', 'SCANNING_BACKGROUND'
+    # Estados: COMPLETED, PARTIAL_FAST_PATH, SCANNING_BACKGROUND,
+    # BROWSER_PENDING (cliente coletando), BROWSER_PARTIAL (encerrada incompleta).
 
     # Sumários estruturados em JSON
     outcomes_summary = db.Column(db.JSON, nullable=True)
