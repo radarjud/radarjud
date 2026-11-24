@@ -129,10 +129,11 @@ class CNJClient:
             }
         }
         headers = {
-            "Authorization": f"APIKey {self.datajud_api_key}",
             "Content-Type": "application/json",
             "User-Agent": "LexGuardAI/1.0",
         }
+        if self.datajud_api_key:
+            headers["Authorization"] = f"APIKey {self.datajud_api_key}"
 
         try:
             resp = request_gov_br_with_fallback(

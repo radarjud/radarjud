@@ -440,6 +440,9 @@ def search_company():
     - Suporte a client_prefetched_items para fallback invisível anti-geoblocking.
     """
     client_prefetched_items = []
+    browser_requested = False
+    browser_count = None
+    browser_term = None
     current_user = get_current_user_optional()
     current_tenant_id = current_user.tenant_id if current_user else None
     if request.method == "POST":
@@ -447,6 +450,9 @@ def search_company():
         company_input = data.get("company_name") or data.get("name")
         force_refresh = bool(data.get("force_refresh", False))
         client_prefetched_items = data.get("client_prefetched_items") or []
+        browser_requested = data.get("browser_deep_scan") is True
+        browser_count = data.get("browser_page1_count")
+        browser_term = data.get("browser_query_term")
     else:
         company_input = request.args.get("name") or request.args.get("company_name")
         force_refresh = request.args.get("force_refresh", "false").lower() in ("true", "1")
@@ -465,6 +471,25 @@ def search_company():
     is_broad_brand = search_strategy["is_broad_brand"]
     cnpj_used = search_strategy["target_cnpj"]
 
+    # A busca do navegador deve usar o mesmo termo empresarial da estratégia do servidor.
+    # Nunca aceitar uma página sem filtro identificado como prefetch de uma empresa.
+    browser_owned = (
+        browser_requested
+        and isinstance(browser_term, str)
+        and bool(sanitize_company_name(browser_term))
+        and sanitize_company_name(browser_term) == sanitize_company_name(query_term)
+        and not is_cnpj(browser_term)
+        and type(browser_count) is int and browser_count >= 0
+        and isinstance(client_prefetched_items, list)
+        and 0 < len(client_prefetched_items) <= 100
+        and len(client_prefetched_items) == min(browser_count, 100)
+        and all(isinstance(item, dict) and orchestrator.searcher.normalize_cnj(
+            item.get("numero_processo") or item.get("numeroProcesso") or item.get("numeroprocessocommascara")
+        ) for item in client_prefetched_items)
+    )
+    if browser_requested and not browser_owned:
+        client_prefetched_items = []
+
     sanitized = sanitize_company_name(query_term)
     normalized_name = sanitized.upper() if sanitized else query_term.upper()
 
@@ -479,7 +504,7 @@ def search_company():
     # =========================================================================
     # REGRA 4: Cache em Memória com TTL de 15 minutos (0.05s de resposta)
     # =========================================================================
-    if not force_refresh:
+    if not force_refresh and not browser_requested:
         cached_entry = SEARCH_CACHE.get(cache_key)
         if cached_entry:
             ts, cached_data = cached_entry
@@ -507,6 +532,7 @@ def search_company():
         try:
             cached_search = (
                 CompanySearch.query.filter(
+                    CompanySearch.tenant_id == current_tenant_id,
                     (CompanySearch.normalized_name == normalized_name) |
                     (CompanySearch.company_name == display_title)
                 )
@@ -520,6 +546,8 @@ def search_company():
                 and (cached_search.total_processes or 0) > 0
                 and cached_search.is_recent(hours=24)
                 and cached_search.scan_status == "COMPLETED"
+                and (not browser_requested or ((cached_search.economic_standing or {})
+                     .get("browser_search_strategy", {}).get("cache_key") == cache_key))
             ):
                 logger.info("Curto-circuito Nível 1 ativado para '%s' (search_id=%d).", normalized_name, cached_search.id)
                 proc_dicts = [p.to_dict() for p in cached_search.processes]
@@ -560,6 +588,9 @@ def search_company():
                     p_condenacao_trabalhista=res.get("probabilidade_condenacao_geral_pct") or 0.0,
                     search_strategy=search_strategy,
                 )
+                saved_browser_strategy = (cached_search.economic_standing or {}).get("browser_search_strategy")
+                if saved_browser_strategy:
+                    econ_data = {**econ_data, "browser_search_strategy": saved_browser_strategy}
                 res["idoneidade_economica"] = econ_data
                 res["logo"] = econ_data.get("logo", {})
                 res["capital_social_consolidado"] = econ_data.get("valor_formatado") or econ_data.get("capital_social_formatado")
@@ -655,6 +686,10 @@ def search_company():
 
         new_hash = fast_results.get("movements_hash")
         initial_status = fast_results.get("scan_status", "COMPLETED")
+        if browser_owned and fast_results.get("total_processos", 0) > 0:
+            initial_status = "BROWSER_PENDING" if browser_count > 100 else "COMPLETED"
+        else:
+            browser_owned = False
 
         # =====================================================================
         # CURTO-CIRCUITO NÍVEL 2 (Antes da IA): Invalidação inteligente por Hash
@@ -690,6 +725,8 @@ def search_company():
             discovered_entities=fast_results.get("discovered_entities", []),
             search_strategy=search_strategy,
         )
+        if browser_owned:
+            econ_data = {**econ_data, "browser_search_strategy": search_strategy}
         fast_results["idoneidade_economica"] = econ_data
         fast_results["logo"] = econ_data.get("logo", {})
         fast_results["capital_social_consolidado"] = econ_data.get("valor_formatado") or econ_data.get("capital_social_formatado")
@@ -774,8 +811,12 @@ def search_company():
                 fast_results.get("processos", []),
             )
 
-        fast_results["scan_status"] = initial_status
-        SEARCH_CACHE[cache_key] = (time.time(), fast_results)
+        fast_results["scan_status"] = (
+            "BROWSER_PARTIAL" if browser_owned and not search_id else initial_status
+        )
+        # O estado provisório do navegador não deve sobreviver no cache L0.
+        if not browser_owned:
+            SEARCH_CACHE[cache_key] = (time.time(), fast_results)
         resp = jsonify(fast_results)
         if quota_header_val is not None:
             # Recalcula o saldo restante após a persistência da nova consulta
@@ -1282,6 +1323,16 @@ def search_companies_catalog():
         return jsonify(body), 500
 
 
+def _expire_browser_scan(search):
+    """Uma aba fechada ou conexão perdida não deixa a busca pendente indefinidamente."""
+    if (search.scan_status == "BROWSER_PENDING" and search.last_checked_at
+            and (get_utc_now() - search.last_checked_at).total_seconds() > 120):
+        CompanySearch.query.filter_by(id=search.id, scan_status="BROWSER_PENDING").update(
+            {CompanySearch.scan_status: "BROWSER_PARTIAL"}, synchronize_session=False)
+        db.session.commit()
+        db.session.refresh(search)
+
+
 @api_bp.route("/search_status/<int:search_id>", methods=["GET"])
 @api_bp.route("/search-status/<int:search_id>", methods=["GET"])
 def get_search_status(search_id: int):
@@ -1300,18 +1351,21 @@ def get_search_status(search_id: int):
             if not current_user or current_user.tenant_id != search.tenant_id:
                 return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
         
+        _expire_browser_scan(search)
         is_completed = search.scan_status == "COMPLETED"
+        is_terminal = is_completed or search.scan_status == "BROWSER_PARTIAL"
         response = {
             "search_id": search.id,
             "company_name": search.company_name,
             "scan_status": search.scan_status,
             "is_completed": is_completed,
+            "is_terminal": is_terminal,
             "total_processes": search.total_processes,
             "last_checked_at": search.last_checked_at.isoformat() if search.last_checked_at else None,
             "updated_at": search.updated_at.isoformat() if search.updated_at else None,
         }
         # Quando completado, retorna os dados atualizados para atualizar o dashboard sem reload
-        if is_completed:
+        if is_terminal:
             proc_dicts = [p.to_dict() for p in search.processes]
             response["data"] = search.to_dict()
             response["data"]["empresa"] = search.company_name
@@ -1452,16 +1506,19 @@ def ingest_deep_scan():
         return jsonify({"error": "Campo 'search_id' obrigatório e deve ser um número inteiro."}), 400
 
     items = data.get("items")
-    if items is None or not isinstance(items, list) or len(items) == 0:
+    browser_finished = data.get("browser_scan_finished") is True
+    if not isinstance(items, list) or (not items and not browser_finished):
         return jsonify({"error": "Campo 'items' obrigatório e deve ser uma lista não vazia."}), 400
 
     if len(items) > 2000:
         return jsonify({"error": "O lote de ingestão excede o limite máximo de 2.000 itens por requisição."}), 413
 
-    is_final_batch = bool(data.get("is_final_batch", True))
+    is_final_batch = data.get("is_final_batch", True)
+    if type(is_final_batch) is not bool:
+        return jsonify({"error": "is_final_batch deve ser booleano."}), 400
 
     try:
-        search = db.session.get(CompanySearch, search_id) if hasattr(db.session, "get") else CompanySearch.query.get(search_id)
+        search = db.session.get(CompanySearch, search_id, with_for_update=True)
         if not search:
             return jsonify({"error": f"Registro de busca ID {search_id} não encontrado."}), 404
 
@@ -1479,6 +1536,21 @@ def ingest_deep_scan():
 
             if tenant_val is not None and str(tenant_val) != str(req_tenant_id):
                 return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
+
+        # Para buscas reais vinculadas a uma organização, o JWT (não o header informado
+        # pelo cliente) é a autoridade de acesso.
+        if isinstance(search.tenant_id, int):
+            user = get_current_user_optional()
+            if not user or user.tenant_id != search.tenant_id:
+                return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
+
+        if browser_finished and (
+            search.scan_status not in ("BROWSER_PENDING", "BROWSER_PARTIAL", "COMPLETED")
+            or not (search.economic_standing or {}).get("browser_search_strategy")
+        ):
+            return jsonify({"error": "A busca não está sob paginação do navegador."}), 409
+        if search.scan_status in ("BROWSER_PENDING", "BROWSER_PARTIAL") and not browser_finished:
+            return jsonify({"error": "A conclusão da paginação do navegador deve ser informada."}), 409
 
         existing_records = {p.numero_processo: p for p in search.processes if p.numero_processo}
 
@@ -1554,7 +1626,7 @@ def ingest_deep_scan():
         if new_records:
             for i in range(0, len(new_records), 50):
                 db.session.bulk_save_objects(new_records[i : i + 50])
-                db.session.commit()
+            db.session.flush()
 
         # Recarrega a totalidade dos processos consolidados (100% da base sem truncamentos)
         all_processes = ProcessRecord.query.filter_by(company_search_id=search.id).all()
@@ -1570,11 +1642,16 @@ def ingest_deep_scan():
         fresh_metrics = orchestrator.predictor.generate_dashboard_metrics(search.company_name, proc_dicts)
 
         p_cond = fresh_metrics.get("probabilidade_condenacao_geral_pct") or fresh_metrics.get("score_risco_terceirizacao") or 0.0
+        browser_strategy = (search.economic_standing or {}).get("browser_search_strategy")
         econ_data = economic_service.evaluate_economic_standing(
             company_name=search.company_name,
             company_processes=proc_dicts,
             p_condenacao_trabalhista=p_cond,
+            **({"cnpj": browser_strategy.get("target_cnpj"), "search_strategy": browser_strategy}
+               if browser_strategy else {}),
         )
+        if browser_strategy:
+            econ_data = {**econ_data, "browser_search_strategy": browser_strategy}
 
         ai_payload = {**fresh_metrics, "empresa": search.company_name, "processos": proc_dicts}
         ai_res = orchestrator.ai_analyzer.analyze_company(ai_payload)
@@ -1593,13 +1670,20 @@ def ingest_deep_scan():
             search.cnae_codigo = econ_data.get("cnae_codigo") or search.cnae_codigo
             search.cnae_descricao = econ_data.get("cnae_descricao") or search.cnae_descricao
         search.ai_analysis = ai_res
-        search.scan_status = "COMPLETED" if is_final_batch else "PARTIAL_FAST_PATH"
+        if browser_finished:
+            if search.scan_status != "COMPLETED":
+                search.scan_status = "COMPLETED" if is_final_batch else "BROWSER_PARTIAL"
+        else:
+            search.scan_status = "COMPLETED" if is_final_batch else "PARTIAL_FAST_PATH"
         search.movements_hash = generate_movements_hash(proc_dicts)
         search.last_checked_at = get_utc_now()
         db.session.commit()
 
-        cache_key = search.normalized_name.upper()
-        SEARCH_CACHE[cache_key] = (time.time(), search.to_dict())
+        # Invalida as chaves reais de busca que apontam para este ID, sem criar
+        # uma chave incompatível com STRICT_CNPJ/BROAD_BRAND.
+        for cache_key, (_, cached) in list(SEARCH_CACHE.items()):
+            if cached.get("search_id", cached.get("id")) == search.id:
+                SEARCH_CACHE.pop(cache_key, None)
         _prune_search_cache_if_needed()
 
         condenacoes = search.outcomes_summary.get("condenacoes", 0) if search.outcomes_summary else 0
@@ -1824,6 +1908,7 @@ def get_search_detail(search_id: int):
             logger.error("Erro ao deletar search_id %d: %s", search_id, exc)
             return jsonify({"error": "Falha ao remover o registro."}), 500
     try:
+        _expire_browser_scan(search)
         proc_dicts = [p.to_dict() for p in search.processes]
         result = search.to_dict()
         result["empresa"] = search.company_name
@@ -2505,17 +2590,26 @@ def cnj_proxy():
 
     expected_secret = (os.getenv("PROXY_SHARED_SECRET") or os.getenv("CNJ_PROXY_SECRET") or "").strip()
     if expected_secret:
-        auth_header = flask_req.headers.get("Authorization", "").strip()
-        bearer_secret = auth_header[7:].strip() if auth_header.startswith("Bearer ") else auth_header
-        provided_secret = (flask_req.headers.get("x-proxy-secret") or bearer_secret or "").strip()
-        if not hmac.compare_digest(provided_secret, expected_secret):
+        provided_secret = (flask_req.headers.get("x-proxy-secret") or "").strip()
+        auth_header = (flask_req.headers.get("Authorization") or "").strip()
+        if not provided_secret and auth_header.startswith("Bearer "):
+            provided_secret = auth_header[7:].strip()
+        if not provided_secret or not hmac.compare_digest(provided_secret, expected_secret):
             return jsonify({"error": "Unauthorized proxy access"}), 401
-    else:
-        logger.warning("[Proxy Warning] PROXY_SHARED_SECRET não configurado. Modo aberto para desenvolvimento.")
 
     target_url = flask_req.args.get("target") or flask_req.headers.get("X-Target-Url")
     if not target_url:
         return jsonify({"error": "Missing target URL"}), 400
+
+    from urllib.parse import urlparse
+    parsed_target = urlparse(target_url)
+    allowed_hosts = {
+        "comunicaapi.pje.jus.br",
+        "api-publica.datajud.cnj.jus.br",
+        "api.portaldatransparencia.gov.br",
+    }
+    if parsed_target.scheme != "https" or parsed_target.hostname not in allowed_hosts:
+        return jsonify({"error": "Host not allowed by proxy whitelist"}), 400
 
     try:
         from app.utils.http_client import request_gov_br_with_fallback

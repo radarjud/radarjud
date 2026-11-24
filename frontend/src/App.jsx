@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Equipe RadarJus - Todos os direitos reservados (Lei nº 9.609/1998).
 // Proibida a reprodução, distribuição ou uso comercial sem autorização expressa dos autores.
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Search, LayoutDashboard, FileText, ChartNoAxesCombined, History,
   Menu, X, ArrowRight, RefreshCw, AlertCircle, AlertTriangle, ShieldCheck, ShieldAlert,
@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import { companyHash, companyShareUrl, isCompanyPage, parseRoute, validSearchId } from './companyNavigation.js';
 import { CompanyLogo } from "./CompanyLogo.jsx";
+import { fetchPjePage, runBrowserDeepScan } from './services/pjeBrowserScanner.js';
 import CatalogPage, { normalizeCatalog, onlyDigits } from './CatalogPage.jsx';
 
 // Vite encaminha /api ao Flask. Defina VITE_API_BASE_URL se a API estiver em outro host.
@@ -132,54 +133,6 @@ function normalize(raw) {
     cacheLevel: payload.cache_level || null,
     isBroadBrand: Boolean(payload.is_broad_brand || payload.isBroadBrand || (companyName && companyName.includes('GRUPO CONSOLIDADO'))),
   };
-}
-
-async function prefetchFromComunicaPjeBrowser(termo) {
-  try {
-    const clean = String(termo || '').trim();
-    if (!clean || clean.length < 2) return [];
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 4000);
-    const cleanDigits = clean.replace(/\D/g, '');
-    const isDoc = cleanDigits.length === 14;
-    const targetUrl = isDoc
-      ? `https://comunicaapi.pje.jus.br/api/v1/comunicacao?numeroDocumento=${cleanDigits}&itensPorPagina=100`
-      : `https://comunicaapi.pje.jus.br/api/v1/comunicacao?nomeParte=${encodeURIComponent(clean)}&itensPorPagina=100`;
-
-    // Arquitetura Anti-Geoblocking:
-    // 1. Tenta Edge Proxy (/api/cnj-proxy) com execução forçada em São Paulo (gru1)
-    // 2. Fallback para fetch direto se proxy indisponível
-    let res = null;
-    try {
-      res = await fetch(`/api/cnj-proxy?target=${encodeURIComponent(targetUrl)}`, {
-        signal: controller.signal,
-        headers: { Accept: 'application/json' },
-      });
-    } catch {
-      res = null;
-    }
-
-    if (!res || !res.ok) {
-      try {
-        res = await fetch(targetUrl, {
-          signal: controller.signal,
-          headers: { Accept: 'application/json' },
-        });
-      } catch {
-        res = null;
-      }
-    }
-
-    clearTimeout(timer);
-    if (!res || !res.ok) return [];
-    const data = await res.json().catch(() => null);
-    if (Array.isArray(data)) return data;
-    if (data && Array.isArray(data.items)) return data.items;
-    if (data && Array.isArray(data.itens)) return data.itens;
-    return [];
-  } catch {
-    return [];
-  }
 }
 
 async function request(path, options = {}) {
@@ -355,7 +308,7 @@ function Overview({ data, navigate, catalogTerm }) {
   const classified = Object.values(outcomes).reduce((sum, value) => sum + Number(value || 0), 0);
   const ai = data?.aiAnalysis;
 
-  const isFastPath = data?.scanStatus === 'PARTIAL_FAST_PATH';
+  const isFastPath = ['PARTIAL_FAST_PATH', 'BROWSER_PENDING', 'SCANNING_BACKGROUND'].includes(data?.scanStatus);
   const isCompleted = data?.scanStatus === 'COMPLETED';
   const tstCount = (data?.processes || []).filter(p => p.is_tst_recurso || p.tribunal === 'tst' || String(p.grau || '').includes('TST')).length;
 
@@ -386,6 +339,7 @@ function Overview({ data, navigate, catalogTerm }) {
               Fast-Path ativo (&lt; 3s) · Varrendo em 2º plano
             </Tag>
           )}
+          {data?.scanStatus === 'BROWSER_PARTIAL' && <Tag type="amber">Varredura parcial encerrada</Tag>}
           {isCompleted && <Tag type="green"><Check size={13} style={{ display: 'inline', marginRight: '4px' }} /> Varredura Completa</Tag>}
           {tstCount > 0 && (
             <Tag type="purple">
@@ -1115,6 +1069,16 @@ export default function App() {
   const visibleData = needsSharedData ? null : data;
   const [catalog, setCatalog] = useState({ term: '', items: [], busy: false, error: '', unavailable: false, suggestion: '' });
   const [analyzing, setAnalyzing] = useState('');
+  const activeSearch = useRef(null);
+  const [scanProgress, setScanProgress] = useState(null);
+  function cancelSearch() {
+    activeSearch.current?.abort();
+    activeSearch.current = null;
+    setScanProgress(null);
+    setBusy(false);
+    setAnalyzing('');
+  }
+  useEffect(() => () => activeSearch.current?.abort(), []);
 
   function navigate(destination, id = searchId ?? data?.searchId) {
     if (!Object.hasOwn(PAGE_LABELS, destination)) return;
@@ -1124,7 +1088,11 @@ export default function App() {
   }
 
   useEffect(() => {
-    const syncHash = () => setRoute(parseRoute(window.location.hash));
+    const syncHash = () => {
+      const next = parseRoute(window.location.hash);
+      if (activeSearch.current?.searchId && next.searchId && next.searchId !== activeSearch.current.searchId) cancelSearch();
+      setRoute(next);
+    };
     window.addEventListener('hashchange', syncHash);
     return () => window.removeEventListener('hashchange', syncHash);
   }, []);
@@ -1151,12 +1119,12 @@ export default function App() {
 
   // Polling automático para atualizar tela quando o Deep Scan em segundo plano finalizar
   useEffect(() => {
-    if (!data?.searchId || !['PARTIAL_FAST_PATH', 'SCANNING_BACKGROUND'].includes(data?.scanStatus)) return;
+    if (scanProgress?.running || !data?.searchId || !['PARTIAL_FAST_PATH', 'SCANNING_BACKGROUND', 'BROWSER_PENDING'].includes(data?.scanStatus)) return;
     let active = true;
     const intervalId = setInterval(async () => {
       try {
         const statusRes = await request(`/search_status/${data.searchId}`);
-        if (active && statusRes?.is_completed && statusRes.data) {
+        if (active && (statusRes?.is_terminal || statusRes?.is_completed) && statusRes.data) {
           const updated = normalize(statusRes.data);
           if (updated) {
             setData((prev) => validSearchId(prev?.searchId) !== validSearchId(data.searchId) ? prev : ({
@@ -1176,39 +1144,75 @@ export default function App() {
     }, 3000);
 
     return () => { active = false; clearInterval(intervalId); };
-  }, [data?.searchId, data?.scanStatus]);
+  }, [data?.searchId, data?.scanStatus, scanProgress?.running]);
 
-  async function search(term = query) {
+  async function search(term = query, legalName = null) {
     const text = String(term || '').trim();
     if (text.length < 2) return;
+    activeSearch.current?.abort();
+    const controller = new AbortController();
+    activeSearch.current = controller;
+    const { signal } = controller;
+    const current = () => activeSearch.current === controller && !signal.aborted;
+    setScanProgress(null);
     setBusy(true);
     setError('');
     try {
-      // Fallback silencioso: prefetch transparente via browser contra bloqueios de geoblocking nos EUA
-      let prefetched = [];
-      try {
-        prefetched = await prefetchFromComunicaPjeBrowser(text);
-      } catch {
-        prefetched = [];
+      const cnpj = onlyDigits(text).length === 14 ? onlyDigits(text) : null;
+      // O endpoint público pesquisa pelo nome da parte. Para CNPJ, resolve o nome
+      // cadastral antes de consultar o PJe, sem trocar o CNPJ enviado ao backend.
+      let pjeTerm = cnpj ? legalName : text;
+      if (cnpj && !pjeTerm) {
+        try {
+          const registration = await fetch(`https://brasilapi.com.br/api/cnpj/v1/${cnpj}`, {
+            signal: AbortSignal.any([signal, AbortSignal.timeout(3000)]),
+          });
+          if (registration.ok) pjeTerm = (await registration.json()).razao_social;
+        } catch { /* sem nome: mantém o fallback original do servidor */ }
       }
-
-      const payload = { company_name: text };
-      if (Array.isArray(prefetched) && prefetched.length > 0) {
-        payload.client_prefetched_items = prefetched;
-      }
-
+      const first = pjeTerm && !signal.aborted
+        ? await fetchPjePage(pjeTerm, cnpj, 1, signal, 4000).catch(() => ({ items: [], count: null }))
+        : { items: [], count: null };
+      if (!current()) return;
+      const payload = { company_name: text, browser_deep_scan: true,
+        browser_query_term: pjeTerm, browser_page1_count: first.count };
+      if (first.items.length) payload.client_prefetched_items = first.items;
       const result = await request('/search-company', {
-        method: 'POST',
-        body: JSON.stringify(payload),
+        method: 'POST', signal, body: JSON.stringify(payload),
       });
+      if (!current()) return;
       const normalized = normalize(result);
       if (!normalized) throw new Error('A API não retornou dados de empresa válidos.');
+      controller.searchId = validSearchId(normalized.searchId);
       setData(normalized);
       navigate('overview', normalized.searchId);
-    } catch (failure) {
-      setError(failure.message || 'Não foi possível pesquisar a empresa.');
-    } finally {
       setBusy(false);
+      setAnalyzing('');
+      if (!validSearchId(normalized.searchId) || normalized.scanStatus !== 'BROWSER_PENDING') return;
+      setScanProgress({ running: true, message: `Consolidando varredura: ${first.items.length}/${Math.min(first.count, 1000)} comunicações...` });
+      try {
+        const scan = await runBrowserDeepScan(pjeTerm, cnpj, first.count, progress => {
+          if (current()) setScanProgress({ running: true, message: `Consolidando varredura: ${progress.received}/${progress.total} comunicações...` });
+        }, { signal, page1Items: first.items });
+        if (!current()) return;
+        {
+          await request('/ingest-deep-scan', {
+            method: 'POST', signal, body: JSON.stringify({ search_id: Number(normalized.searchId), items: scan.items, browser_scan_finished: true, is_final_batch: scan.failedPages.length === 0 && scan.received >= first.count && first.count <= 1000 }),
+          });
+          if (!current()) return;
+          const updated = normalize(await request(`/history/${normalized.searchId}`, { signal }));
+          if (current() && validSearchId(updated?.searchId) === validSearchId(normalized.searchId)) {
+            setData(prev => validSearchId(prev?.searchId) === validSearchId(normalized.searchId) ? updated : prev);
+          }
+        }
+        if (current()) setScanProgress({ running: false, message: scan.failedPages.length || (first.count <= 1000 && scan.received < first.count) ? 'Varredura parcial: nem todas as comunicações foram coletadas.' : first.count > 1000 ? 'Varredura limitada às primeiras 10 páginas.' : 'Varredura do navegador concluída.' });
+      } catch {
+        if (current()) setScanProgress({ running: false, message: 'Não foi possível consolidar toda a varredura. Os resultados iniciais foram preservados.' });
+      }
+    } catch (failure) {
+      if (current()) setError(failure.message || 'Não foi possível pesquisar a empresa.');
+    } finally {
+      if (current()) { setBusy(false); setAnalyzing(''); }
     }
   }
 
@@ -1220,6 +1224,7 @@ export default function App() {
       search(onlyDigits(text));
       return;
     }
+    cancelSearch();
     navigate('catalog');
     loadCatalog(text);
   }
@@ -1246,15 +1251,13 @@ export default function App() {
   async function analyzeCatalogItem(item) {
     setAnalyzing(item.cnpj);
     // Envia o CNPJ (não a razão social): é ele que isola a empresa escolhida no backend.
-    await search(item.cnpj);
-    setAnalyzing('');
+    await search(item.cnpj, item.razao);
   }
 
   // Marca inteira (modo BROAD_BRAND): consolida todas as empresas e filiais do nome pesquisado.
   async function analyzeGroup() {
     setAnalyzing('GROUP');
     await search(catalog.term);
-    setAnalyzing('');
   }
 
   async function loadHistory() {
@@ -1271,6 +1274,7 @@ export default function App() {
   }
 
   async function openHistory(id) {
+    cancelSearch();
     setHistoryBusy(true);
     setHistoryError('');
     try {
@@ -1324,6 +1328,7 @@ export default function App() {
             ) : <div className="loading" role="status"><RefreshCw className="spin" /> Carregando consulta compartilhada...</div>
           )}
           {isCompanyPage(page) && !needsSharedData && <>
+            {scanProgress && <p role="status" className="company-share-message">{scanProgress.message}</p>}
             {visibleData && <CompanyShareActions key={visibleData.searchId ?? visibleData.name} data={visibleData} />}
             {page === 'overview' && <Overview data={visibleData} navigate={navigate} catalogTerm={catalog.term} />}
             {page === 'processes' && <Processes data={visibleData} />}

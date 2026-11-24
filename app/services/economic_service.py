@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Equipe RadarJus - Todos os direitos reservados (Lei nº 9.609/1998).
 # Proibida a reprodução, distribuição ou uso comercial sem autorização expressa dos autores.
 
+import os
 import re
 import unicodedata
 import logging
@@ -2137,7 +2138,11 @@ class EconomicStandingService:
     """
 
     def __init__(self, cgu_api_key: Optional[str] = None, timeout_seconds: float = 3.0):
-        self.cgu_api_key = cgu_api_key
+        self.cgu_api_key = (
+            cgu_api_key
+            if cgu_api_key is not None
+            else (os.getenv("PORTAL_TRANSPARENCIA_API_KEY") or os.getenv("CGU_API_KEY") or "").strip() or None
+        )
         self.timeout = timeout_seconds
         self.session = requests.Session()
         self.session.headers.update({
