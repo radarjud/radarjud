@@ -1965,10 +1965,10 @@ def compare_companies():
             target_cnpj = strat.get("target_cnpj")
 
             fast_res = orchestrator.analyze_company_by_name(
-                company_name=q_term,
-                target_cnpj=target_cnpj,
-                max_items_first_page=50,
+                company_name=d_title,
                 search_strategy=strat,
+                fast_path=True,
+                limit_processes=50,
             )
             fast_res["empresa"] = d_title
             fast_res["is_broad_brand"] = strat.get("is_broad_brand", False)
@@ -1982,6 +1982,15 @@ def compare_companies():
                 search_strategy=strat,
             )
             fast_res["idoneidade_economica"] = econ
+            fast_res["logo"] = econ.get("logo", {})
+            if econ.get("cnpj_utilizado"):
+                fast_res["cnpj"] = econ.get("cnpj_utilizado")
+            elif target_cnpj:
+                fast_res["cnpj"] = target_cnpj
+            if econ.get("risco_calote_subsidiario") is not None:
+                fast_res["risco_subsidiario"] = econ["risco_calote_subsidiario"]
+            elif econ.get("indice_exposicao_financeira") is not None:
+                fast_res["risco_subsidiario"] = econ["indice_exposicao_financeira"]
             if econ.get("indice_exposicao_financeira") is not None:
                 fast_res["indice_exposicao_financeira"] = econ["indice_exposicao_financeira"]
                 fast_res["score_risco_terceirizacao"] = econ["indice_exposicao_financeira"]
@@ -2062,6 +2071,8 @@ def _search_record_to_pdf_payload(search: CompanySearch) -> dict:
         result["idoneidade_economica"] = search.economic_standing
         if search.economic_standing.get("indice_exposicao_financeira") is not None:
             result["indice_exposicao_financeira"] = search.economic_standing["indice_exposicao_financeira"]
+        if search.economic_standing.get("risco_calote_subsidiario") is not None:
+            result["risco_subsidiario"] = search.economic_standing["risco_calote_subsidiario"]
     result["parecer_agente_adk"] = result.get("ai_analysis") or {}
     return result
 
