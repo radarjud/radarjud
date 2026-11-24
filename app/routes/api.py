@@ -322,6 +322,8 @@ def _deep_scan_background_worker(
                             observation=proc.get("observation"),
                             sentence_outcome=proc.get("sentence_outcome", "em_aberto"),
                             has_expert_report=proc.get("has_expert_report", False),
+                            data_distribuicao=proc.get("data_distribuicao"),
+                            valor_causa=proc.get("valor_causa"),
                             raw_metadata=proc.get("raw_metadata"),
                         )
                         new_records.append(record)
@@ -747,6 +749,8 @@ def search_company():
                     observation=proc.get("observation"),
                     sentence_outcome=proc.get("sentence_outcome", "em_aberto"),
                     has_expert_report=proc.get("has_expert_report", False),
+                    data_distribuicao=proc.get("data_distribuicao"),
+                    valor_causa=proc.get("valor_causa"),
                     raw_metadata=proc.get("raw_metadata"),
                 )
                 db.session.add(record)
@@ -1540,6 +1544,8 @@ def ingest_deep_scan():
                 observation=obs,
                 sentence_outcome=outcome,
                 has_expert_report=has_expert,
+                data_distribuicao=parsed_proc.get("data_distribuicao"),
+                valor_causa=parsed_proc.get("valor_causa"),
                 raw_metadata=parsed_proc,
             )
             new_records.append(record)

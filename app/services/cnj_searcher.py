@@ -3,6 +3,8 @@
 
 import os
 import re
+import datetime
+from decimal import Decimal, InvalidOperation
 import unicodedata
 import logging
 from collections import defaultdict
@@ -29,6 +31,224 @@ TJ_MAP = {
     19: "tjrj", 20: "tjrn", 21: "tjrs", 22: "tjro", 23: "tjrr", 24: "tjsc",
     25: "tjse", 26: "tjsp", 27: "tjto"
 }
+
+
+def parse_iso_date(raw: Any, text_fallback: str = "") -> Optional[datetime.date]:
+    """
+    Extrai e valida datas de distribuição judicial (ISO, YYYYMMDD ou BR DD/MM/YYYY).
+    Valida rigorosamente o calendário (meses de 1 a 12, dias de 1 a 28..31, anos bissextos).
+    Datas inválidas (ex: 32/13/2024, 2024-02-31) retornam None de forma segura.
+    Se raw estiver ausente ou inválido, busca padrões textuais em text_fallback.
+    """
+    if isinstance(raw, datetime.datetime):
+        return raw.date()
+    if isinstance(raw, datetime.date):
+        return raw
+
+    def _try_parse_date_str(s: str) -> Optional[datetime.date]:
+        if not s:
+            return None
+        s = str(s).strip()
+        # Se contiver timestamp com 'T' ou espaço
+        if "T" in s:
+            s = s.split("T")[0]
+        elif " " in s:
+            s = s.split(" ")[0]
+        s = s.strip()
+
+        # 1. Padrão ISO YYYY-MM-DD
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+            try:
+                dt = datetime.datetime.strptime(s, "%Y-%m-%d").date()
+                if 1900 <= dt.year <= 2100:
+                    return dt
+            except ValueError:
+                return None
+
+        # 2. Padrão Brasileiro DD/MM/YYYY
+        if re.match(r"^\d{2}/\d{2}/\d{4}$", s):
+            try:
+                dt = datetime.datetime.strptime(s, "%d/%m/%Y").date()
+                if 1900 <= dt.year <= 2100:
+                    return dt
+            except ValueError:
+                return None
+
+        # 3. Padrão Compacto YYYYMMDD
+        if re.match(r"^\d{8}$", s):
+            try:
+                dt = datetime.datetime.strptime(s, "%Y%m%d").date()
+                if 1900 <= dt.year <= 2100:
+                    return dt
+            except ValueError:
+                return None
+
+        return None
+
+    if raw is not None:
+        parsed = _try_parse_date_str(str(raw))
+        if parsed:
+            return parsed
+
+    # Fallback em texto de publicações
+    if text_fallback:
+        patterns = [
+            r"(?:distribu[ií]d[oa]|ajuizad[oa]|ajuizamento|distribui[cç][aã]o)\s*(?:em|:)?\s*(\d{2}/\d{2}/\d{4})",
+            r"(?:data\s+de\s+ajuizamento|data\s+da\s+distribui[cç][aã]o)\s*(?:em|:)?\s*(\d{2}/\d{2}/\d{4})",
+            r"(?:distribu[ií]d[oa]|ajuizad[oa])\s+no\s+dia\s+(\d{2}/\d{2}/\d{4})",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text_fallback, re.IGNORECASE)
+            if m:
+                parsed = _try_parse_date_str(m.group(1))
+                if parsed:
+                    return parsed
+
+    return None
+
+
+def parse_currency_value(raw: Any, text_fallback: str = "") -> Optional[Decimal]:
+    """
+    Normaliza valores da causa para Decimal(15, 2).
+    Suporta:
+      - Números numéricos (int, float, Decimal)
+      - Strings com notação BR ('R$ 45.000,00', '1.250.300,75')
+      - Strings com notação internacional ('45000.00', '1250300.75')
+      - Fallback em regex textual em publicações ('dá-se à causa o valor de R$ 50.000,00')
+    Valores nulos, negativos ou zerados retornam None.
+    """
+    def _to_decimal(val_str: str) -> Optional[Decimal]:
+        if not val_str:
+            return None
+        cleaned = re.sub(r"[^\d,\.]", "", val_str).strip()
+        if not cleaned:
+            return None
+
+        # Se houver ponto e vírgula (ex: 1.250.300,75)
+        if "." in cleaned and "," in cleaned:
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        elif "," in cleaned:
+            # Apenas vírgula (ex: 45000,00 ou 1,25)
+            cleaned = cleaned.replace(",", ".")
+        elif "." in cleaned:
+            # Ex: 45.000 (milhar) ou 45000.00 (decimal)
+            parts = cleaned.split(".")
+            if len(parts) > 2:
+                # Múltiplos pontos de milhar: 1.250.300
+                cleaned = "".join(parts)
+            elif len(parts) == 2 and len(parts[1]) == 3:
+                try:
+                    if int(parts[0]) > 0:
+                        cleaned = parts[0] + parts[1]
+                except ValueError:
+                    pass
+
+        try:
+            dec = Decimal(cleaned).quantize(Decimal("0.01"))
+            if dec > Decimal("0.00"):
+                return dec
+        except (InvalidOperation, ValueError, TypeError):
+            pass
+        return None
+
+    if raw is not None:
+        if isinstance(raw, (int, float, Decimal)):
+            try:
+                dec = Decimal(str(raw)).quantize(Decimal("0.01"))
+                if dec > Decimal("0.00"):
+                    return dec
+            except (InvalidOperation, ValueError, TypeError):
+                pass
+        else:
+            dec = _to_decimal(str(raw))
+            if dec:
+                return dec
+
+    # Fallback em texto de publicações
+    if text_fallback:
+        patterns = [
+            r"(?:valor\s+da\s+causa|d[aá]-se\s+[aà]\s+causa\s+o\s+valor\s+de|atribu[ií]-se\s+[aà]\s+causa\s+o\s+valor\s+de)\s*(?:em|:)?\s*(?:r\$)?\s*([\d\.,]+)",
+            r"(?:condena[cç][aã]o\s+no\s+valor\s+de|arbitrad[oa]\s+em)\s*(?:r\$)?\s*([\d\.,]+)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text_fallback, re.IGNORECASE)
+            if m:
+                dec = _to_decimal(m.group(1))
+                if dec:
+                    return dec
+
+    return None
+
+
+def normalize_court_code(raw: Any, cnj: Optional[str] = None) -> Optional[str]:
+    """
+    Normaliza a sigla do tribunal para o formato canônico oficial.
+    Exemplos:
+      - 'TRT-2', 'TRT 02', 'trt2', 'TRT02', 'Tribunal Regional do Trabalho da 2ª Região' -> 'TRT2'
+      - 'TRT-15', 'trt15' -> 'TRT15'
+      - 'TST', 'Tribunal Superior do Trabalho' -> 'TST'
+      - 'TJSP', 'Tribunal de Justiça de São Paulo' -> 'TJSP'
+      - Processo CNJ NNNNNNN-DD.AAAA.J.TR.OOOO -> inferência canônica precisa pelo ramo J.TR
+    """
+    raw_str = str(raw or "").strip()
+
+    if raw_str and raw_str.upper() not in {"N/A", "NONE", "NULL", ""}:
+        clean_upper = unicodedata.normalize("NFKD", raw_str)
+        clean_upper = "".join(c for c in clean_upper if not unicodedata.combining(c)).upper()
+
+        # 1. TRT 1 a 24
+        m_trt = re.search(r"\bTRT[\s-]*0?([1-9]|1[0-9]|2[0-4])\b", clean_upper)
+        if m_trt:
+            return f"TRT{int(m_trt.group(1))}"
+
+        m_trt_ext = re.search(r"TRIBUNAL\s+REGIONAL\s+DO\s+TRABALHO.*?0?([1-9]|1[0-9]|2[0-4])", clean_upper)
+        if m_trt_ext:
+            return f"TRT{int(m_trt_ext.group(1))}"
+
+        # 2. TST
+        if re.search(r"\bTST\b|TRIBUNAL\s+SUPERIOR\s+DO\s+TRABALHO", clean_upper):
+            return "TST"
+
+        # 3. TRF 1 a 6
+        m_trf = re.search(r"\bTRF[\s-]*0?([1-6])\b", clean_upper)
+        if m_trf:
+            return f"TRF{int(m_trf.group(1))}"
+
+        # 4. Tribunais de Justiça Estaduais (TJSP, TJRJ, etc.)
+        m_tj = re.search(r"\bTJ[\s-]*([A-Z]{2})\b", clean_upper)
+        if m_tj:
+            return f"TJ{m_tj.group(1).upper()}"
+
+        # 5. Tribunais Superiores
+        if re.search(r"\bSTJ\b", clean_upper):
+            return "STJ"
+        if re.search(r"\bSTF\b", clean_upper):
+            return "STF"
+
+    # Fallback por desmembramento do número CNJ: NNNNNNN-DD.AAAA.J.TR.OOOO
+    if cnj:
+        m_cnj = re.search(r"\.\d{4}\.(?P<J>\d)\.(?P<TR>\d{2})\.", str(cnj))
+        if m_cnj:
+            j_ramo = m_cnj.group("J")
+            tr_code = m_cnj.group("TR")
+            tr_num = int(tr_code)
+
+            if j_ramo == "5":  # Justiça do Trabalho
+                if tr_num == 0:
+                    return "TST"
+                if 1 <= tr_num <= 24:
+                    return f"TRT{tr_num}"
+            elif j_ramo == "8":  # Justiça Estadual
+                if tr_num in TJ_MAP:
+                    return TJ_MAP[tr_num].upper()
+            elif j_ramo == "4":  # Justiça Federal
+                if 1 <= tr_num <= 6:
+                    return f"TRF{tr_num}"
+
+    if raw_str and raw_str.upper() not in {"N/A", "NONE", "NULL", ""}:
+        return raw_str.strip().upper()[:50]
+
+    return None
 
 # Termos genéricos que NÃO devem mascarar os motivos substantivos do processo
 GENERIC_SUBJECT_TERMS = {
@@ -707,7 +927,7 @@ class CNJProcessSearcher:
                 batch = cnj_list[i:i + 50]
                 body = {
                     "size": len(batch),
-                    "_source": ["numeroProcesso", "tribunal", "nivelSigilo", "assuntos", "movimentos.codigo", "grau"],
+                    "_source": ["numeroProcesso", "tribunal", "nivelSigilo", "assuntos", "movimentos.codigo", "grau", "dataAjuizamento", "valorCausa"],
                     "query": {
                         "terms": {
                             "numeroProcesso": batch
@@ -769,7 +989,7 @@ class CNJProcessSearcher:
             batch = cnjs[:50]
             body = {
                 "size": len(batch),
-                "_source": ["numeroProcesso", "tribunal", "nivelSigilo", "assuntos", "movimentos.codigo", "grau"],
+                "_source": ["numeroProcesso", "tribunal", "nivelSigilo", "assuntos", "movimentos.codigo", "grau", "dataAjuizamento", "valorCausa"],
                 "query": {
                     "terms": {
                         "numeroProcesso": batch
@@ -877,10 +1097,22 @@ class CNJProcessSearcher:
         grau_val = "TST (Recursal)" if is_tst else dj.get("grau", "G1")
         sigilo_val = int(dj.get("nivelSigilo", 0))
 
+        # Metadados judiciais: data de distribuição, valor da causa e tribunal canônico
+        raw_dist = dj.get("dataAjuizamento") or com_data.get("dataUltimaPublicacao") or com_data.get("data_disponibilizacao")
+        data_distribuicao = parse_iso_date(raw_dist, text_fallback=texto_concat)
+
+        raw_val = dj.get("valorCausa")
+        valor_causa = parse_currency_value(raw_val, text_fallback=texto_concat)
+
+        raw_trib = dj.get("tribunal") or com_data.get("siglaTribunal") or com_data.get("tribunal")
+        canonical_tribunal = normalize_court_code(raw_trib, cnj=cnj)
+
         return {
             "numeroProcesso": cnj,
             "numero_processo": cnj,
-            "tribunal": dj.get("tribunal") or com_data.get("siglaTribunal", "N/A"),
+            "tribunal": canonical_tribunal or dj.get("tribunal") or com_data.get("siglaTribunal", "N/A"),
+            "data_distribuicao": data_distribuicao,
+            "valor_causa": valor_causa,
             "grau": grau_val,
             "is_tst_recurso": is_tst,
             "nivelSigilo": sigilo_val,
