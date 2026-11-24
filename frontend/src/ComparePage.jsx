@@ -37,6 +37,16 @@ export function formatCurrency(val) {
   return new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(num);
 }
 
+export function getCompanyDisplayName(item) {
+  if (!item) return 'Empresa sem nome';
+  const econ = item.idoneidade_economica || item.economic_standing;
+  const raw = item.company_name || item.empresa || item.name || '';
+  if ((raw.startsWith('CNPJ:') || /^\d+$/.test(raw.replace(/\D/g, ''))) && econ?.razao_social) {
+    return econ.razao_social;
+  }
+  return raw || econ?.razao_social || 'Empresa sem nome';
+}
+
 /**
  * Gráfico SVG Agrupado de Barras (Zero Dependências Externas).
  * Compara Probabilidade de Condenação (Bayes) vs Risco Subsidiário (Súmula 331).
@@ -299,13 +309,20 @@ function RankedCompanyCard({ company }) {
       </div>
 
       <div className="ranked-company-info">
-        <h3>{company.empresa || 'Empresa sem nome'}</h3>
-        <div className="company-identifiers">
-          <span className="cnpj-badge">{formatCnpj(company.cnpj)}</span>
-          <span className={`rfb-status ${isAtiva ? 'status-active' : 'status-inactive'}`}>
-            <span className="status-dot" />
-            {company.situacao_cadastral || 'ATIVA'}
-          </span>
+        <div className="ranked-company-header-row">
+          <div className="company-logo-wrapper" style={{ width: 44, height: 44 }}>
+            <CompanyLogo logo={company.logo} companyName={company.empresa} />
+          </div>
+          <div>
+            <h3>{company.empresa || 'Empresa sem nome'}</h3>
+            <div className="company-identifiers">
+              <span className="cnpj-badge">{formatCnpj(company.cnpj)}</span>
+              <span className={`rfb-status ${isAtiva ? 'status-active' : 'status-inactive'}`}>
+                <span className="status-dot" />
+                {company.situacao_cadastral || 'ATIVA'}
+              </span>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -416,8 +433,8 @@ export default function ComparePage({ request, history = [], currentCompany, nav
       return;
     }
 
-    const companyName = item.company_name || item.empresa || item.name;
-    const companyCnpj = item.cnpj || '';
+    const companyName = getCompanyDisplayName(item);
+    const companyCnpj = item.cnpj || item.idoneidade_economica?.cnpj_utilizado || '';
     const sid = item.id || item.search_id;
 
     const alreadyAdded = selectedCompanies.some(
@@ -435,7 +452,8 @@ export default function ComparePage({ request, history = [], currentCompany, nav
         id: sid,
         search_id: sid,
         name: companyName,
-        cnpj: companyCnpj
+        cnpj: companyCnpj,
+        logo: item.logo || item.idoneidade_economica?.logo
       }
     ]);
     setError('');
@@ -495,19 +513,31 @@ export default function ComparePage({ request, history = [], currentCompany, nav
     setExportMessage('');
 
     try {
-      // Coleta identificadores das empresas
-      const searchIds = result.empresas_ranqueadas
-        .map((c) => c.search_id || c.id)
-        .filter(Boolean);
-
-      const queryParams = searchIds.length === result.empresas_ranqueadas.length
-        ? `search_ids=${searchIds.join(',')}`
-        : `empresas=${encodeURIComponent(result.empresas_ranqueadas.map((c) => c.empresa).join(','))}`;
-
-      const res = await fetch(`/api/v1/export-compare-pdf?${queryParams}`, {
-        method: 'GET',
-        headers: { Accept: 'application/pdf, application/json' }
+      // 1. Tenta POST com as empresas já ranqueadas e consolidadas
+      let res = await fetch('/api/v1/export-compare-pdf', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/pdf, application/json'
+        },
+        body: JSON.stringify({ companies: result.empresas_ranqueadas })
       });
+
+      // 2. Fallback para GET via query string caso POST falhe
+      if (!res.ok) {
+        const searchIds = result.empresas_ranqueadas
+          .map((c) => c.search_id || c.id)
+          .filter(Boolean);
+
+        const queryParams = searchIds.length === result.empresas_ranqueadas.length
+          ? `search_ids=${searchIds.join(',')}`
+          : `empresas=${encodeURIComponent(result.empresas_ranqueadas.map((c) => c.empresa).join(','))}`;
+
+        res = await fetch(`/api/v1/export-compare-pdf?${queryParams}`, {
+          method: 'GET',
+          headers: { Accept: 'application/pdf, application/json' }
+        });
+      }
 
       if (!res.ok) {
         // Tenta ler erro JSON retornado ou mensagem padrão
@@ -554,6 +584,17 @@ export default function ComparePage({ request, history = [], currentCompany, nav
 
         {hasResult && (
           <div className="compare-header-actions">
+            <button
+              className="secondary"
+              onClick={() => {
+                setResult(null);
+                setError('');
+              }}
+              title="Ajustar seleção de empresas"
+            >
+              <RefreshCw size={15} />
+              Ajustar Seleção
+            </button>
             <button
               className="primary"
               onClick={handleExportPdf}
@@ -659,8 +700,8 @@ export default function ComparePage({ request, history = [], currentCompany, nav
           <div className="history-quick-add">
             <span className="quick-add-label">Adicionar do Histórico Recente:</span>
             <div className="quick-add-chips">
-              {history.slice(0, 8).map((item, idx) => {
-                const name = item.company_name || item.empresa || item.name;
+              {history.slice(0, 10).map((item, idx) => {
+                const name = getCompanyDisplayName(item);
                 const isAdded = selectedCompanies.some(
                   (c) => c.name.toLowerCase() === name.toLowerCase()
                 );
