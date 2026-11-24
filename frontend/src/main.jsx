@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client';
 import App from './App.jsx';
 import { AuthProvider } from './AuthContext.jsx';
 import './styles.css';
-import './auth.css';
+import './Auth.css';
 
 class ErrorBoundary extends React.Component {
   constructor(props) {
