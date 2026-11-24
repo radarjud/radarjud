@@ -1,19 +1,45 @@
 services:
   - type: web
-    name: radarjud-api
-    env: python
+    name: radarjus-api
+    runtime: python
     plan: free
+    region: ohio # ou virginia (menor latencia para sa-east-1 no tier free)
+    branch: main
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn "app:create_app()" --bind 0.0.0.0:$PORT --workers 2 --threads 8 --timeout 120
+    startCommand: gunicorn --workers 1 --threads 4 --max-requests 300 --timeout 120 --bind 0.0.0.0:$PORT run:app
+    healthCheckPath: /api/v1/health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.8
+        value: 3.11.9
       - key: FLASK_ENV
         value: production
+      - key: FLASK_APP
+        value: run.py
+      - key: DEBUG
+        value: "False"
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false # Cole a URI Transaction Pooler do Supabase (porta 6543) no painel
       - key: CNJ_PROXY_URL
+        sync: false
+      - key: PROXY_SHARED_SECRET
+        sync: false
+      - key: GEMINI_API_KEY
         sync: false
       - key: DATAJUD_API_KEY
         sync: false
       - key: PORTAL_TRANSPARENCIA_API_KEY
         sync: false
-
+      - key: DATAJUD_BASE_URL
+        value: https://api-publica.datajud.cnj.jus.br
+      - key: COMUNICA_PJE_URL
+        value: https://comunicaapi.pje.jus.br/api/v1/comunicacao
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash-lite
+      - key: REQUEST_TIMEOUT_SECONDS
+        value: "20"
+      - key: MAX_PROCESSES_PER_QUERY
+        value: "100"
+      - key: CACHE_EXPIRATION_HOURS
+        value: "24"

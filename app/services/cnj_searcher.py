@@ -214,12 +214,10 @@ class CNJProcessSearcher:
 
     COMUNICA_URL = "https://comunicaapi.pje.jus.br/api/v1/comunicacao"
     DATAJUD_BASE = "https://api-publica.datajud.cnj.jus.br"
-    # Chave pública oficial disponibilizada pelo CNJ (https://datajud-wiki.cnj.jus.br)
-    DEFAULT_DATAJUD_KEY = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="  # gitleaks:allow
 
     def __init__(self, session: Optional[requests.Session] = None):
-        key = os.getenv("DATAJUD_API_KEY") or self.DEFAULT_DATAJUD_KEY
-        self.datajud_key = key.strip() if key else self.DEFAULT_DATAJUD_KEY
+        key = os.getenv("DATAJUD_API_KEY", "").strip()
+        self.datajud_key = key
         self.session = session or requests.Session()
         
         # Suporte a proxy dedicado isolado (não interfere no pip/build do Render)
@@ -695,10 +693,9 @@ class CNJProcessSearcher:
             by_alias[alias].append(cnj)
 
         datajud_results = {}
-        headers = {
-            "Authorization": f"APIKey {self.datajud_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
+        if self.datajud_key:
+            headers["Authorization"] = f"APIKey {self.datajud_key}"
 
         for alias, cnj_list in by_alias.items():
             url = f"{self.DATAJUD_BASE}/{alias}/_search"
@@ -759,10 +756,9 @@ class CNJProcessSearcher:
         top_tribunals = sorted_tribunals[:max_tribunals]
 
         datajud_results = {}
-        headers = {
-            "Authorization": f"APIKey {self.datajud_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
+        if self.datajud_key:
+            headers["Authorization"] = f"APIKey {self.datajud_key}"
 
         def _fetch_alias_batch(alias: str, cnjs: List[str]) -> List[Dict[str, Any]]:
             url = f"{self.DATAJUD_BASE}/{alias}/_search"

@@ -81,7 +81,8 @@ def create_app(config_name: str = None) -> Flask:
                 }
             }), 200
 
-    # Cria tabelas no banco de dados se não existirem
+    # Cria tabelas no banco de dados automaticamente no startup (PostgreSQL/SQLite)
+    from app import models as _registered_models  # noqa: F401 - garante registro dos modelos antes de create_all()
     with app.app_context():
         try:
             from app.models.tenant import Tenant  # noqa: F401

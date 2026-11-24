@@ -2573,17 +2573,26 @@ def cnj_proxy():
 
     expected_secret = (os.getenv("PROXY_SHARED_SECRET") or os.getenv("CNJ_PROXY_SECRET") or "").strip()
     if expected_secret:
-        auth_header = flask_req.headers.get("Authorization", "").strip()
-        bearer_secret = auth_header[7:].strip() if auth_header.startswith("Bearer ") else auth_header
-        provided_secret = (flask_req.headers.get("x-proxy-secret") or bearer_secret or "").strip()
-        if not hmac.compare_digest(provided_secret, expected_secret):
+        provided_secret = (flask_req.headers.get("x-proxy-secret") or "").strip()
+        auth_header = (flask_req.headers.get("Authorization") or "").strip()
+        if not provided_secret and auth_header.startswith("Bearer "):
+            provided_secret = auth_header[7:].strip()
+        if not provided_secret or not hmac.compare_digest(provided_secret, expected_secret):
             return jsonify({"error": "Unauthorized proxy access"}), 401
-    else:
-        logger.warning("[Proxy Warning] PROXY_SHARED_SECRET não configurado. Modo aberto para desenvolvimento.")
 
     target_url = flask_req.args.get("target") or flask_req.headers.get("X-Target-Url")
     if not target_url:
         return jsonify({"error": "Missing target URL"}), 400
+
+    from urllib.parse import urlparse
+    parsed_target = urlparse(target_url)
+    allowed_hosts = {
+        "comunicaapi.pje.jus.br",
+        "api-publica.datajud.cnj.jus.br",
+        "api.portaldatransparencia.gov.br",
+    }
+    if parsed_target.scheme != "https" or parsed_target.hostname not in allowed_hosts:
+        return jsonify({"error": "Host not allowed by proxy whitelist"}), 400
 
     try:
         from app.utils.http_client import request_gov_br_with_fallback
