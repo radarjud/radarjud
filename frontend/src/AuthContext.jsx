@@ -1,8 +1,7 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import {
   AUTH_KEY, EVENTS, apiRequest, clearAuth, clearReturnTo, readAuth, takeSessionNotice, writeAuth,
-} from '../services/apiClient.js';
-import { EMPTY_QUOTA, mergeQuota, normalizeSession } from '../services/session.js';
+} from './apiClient.js';
+import { EMPTY_QUOTA, mergeQuota, normalizeSession } from './Session.js';
 
 const AuthContext = createContext(null);
 
