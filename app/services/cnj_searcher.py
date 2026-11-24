@@ -93,9 +93,9 @@ def parse_iso_date(raw: Any, text_fallback: str = "") -> Optional[datetime.date]
     # Fallback em texto de publicações
     if text_fallback:
         patterns = [
-            r"(?:distribu[ií]d[oa]|ajuizad[oa]|ajuizamento|distribui[cç][aã]o)\s*(?:em|:)?\s*(\d{2}/\d{2}/\d{4})",
+            r"(?:distribu[ií]d[oa]|ajuizad[oa]|ajuizamento|distribui[cç][aã]o)\s*(?:no\s+dia|em|:)?\s*(\d{2}/\d{2}/\d{4})",
             r"(?:data\s+de\s+ajuizamento|data\s+da\s+distribui[cç][aã]o)\s*(?:em|:)?\s*(\d{2}/\d{2}/\d{4})",
-            r"(?:distribu[ií]d[oa]|ajuizad[oa])\s+no\s+dia\s+(\d{2}/\d{2}/\d{4})",
+            r"(?:termo\s+de\s+distribui[cç][aã]o)\s*(?:no\s+dia|em|:)?\s*(\d{2}/\d{2}/\d{4})",
         ]
         for pat in patterns:
             m = re.search(pat, text_fallback, re.IGNORECASE)
@@ -119,6 +119,9 @@ def parse_currency_value(raw: Any, text_fallback: str = "") -> Optional[Decimal]
     """
     def _to_decimal(val_str: str) -> Optional[Decimal]:
         if not val_str:
+            return None
+        val_str = str(val_str).strip()
+        if val_str.startswith("-") or " - " in val_str or "(" in val_str:
             return None
         cleaned = re.sub(r"[^\d,\.]", "", val_str).strip()
         if not cleaned:
@@ -153,6 +156,8 @@ def parse_currency_value(raw: Any, text_fallback: str = "") -> Optional[Decimal]
 
     if raw is not None:
         if isinstance(raw, (int, float, Decimal)):
+            if raw <= 0:
+                return None
             try:
                 dec = Decimal(str(raw)).quantize(Decimal("0.01"))
                 if dec > Decimal("0.00"):
@@ -160,7 +165,10 @@ def parse_currency_value(raw: Any, text_fallback: str = "") -> Optional[Decimal]
             except (InvalidOperation, ValueError, TypeError):
                 pass
         else:
-            dec = _to_decimal(str(raw))
+            raw_s = str(raw).strip()
+            if raw_s.startswith("-") or " - " in raw_s or "(" in raw_s:
+                return None
+            dec = _to_decimal(raw_s)
             if dec:
                 return dec
 
@@ -196,12 +204,14 @@ def normalize_court_code(raw: Any, cnj: Optional[str] = None) -> Optional[str]:
         clean_upper = unicodedata.normalize("NFKD", raw_str)
         clean_upper = "".join(c for c in clean_upper if not unicodedata.combining(c)).upper()
 
-        # 1. TRT 1 a 24
-        m_trt = re.search(r"\bTRT[\s-]*0?([1-9]|1[0-9]|2[0-4])\b", clean_upper)
+        # 1. TRT 1 a 24 (dois dígitos testados antes de um dígito para evitar TRT1 casando em TRT15)
+        m_trt = re.search(r"\bTRT[\s-]*0?(2[0-4]|1[0-9]|[1-9])\b", clean_upper)
         if m_trt:
             return f"TRT{int(m_trt.group(1))}"
 
-        m_trt_ext = re.search(r"TRIBUNAL\s+REGIONAL\s+DO\s+TRABALHO.*?0?([1-9]|1[0-9]|2[0-4])", clean_upper)
+        m_trt_ext = re.search(r"TRIBUNAL\s+REGIONAL\s+DO\s+TRABALHO.*?0?(2[0-4]|1[0-9]|[1-9])(?:\s*A|\s*O|\s*ª|\s*º)?\s+REGIAO", clean_upper)
+        if not m_trt_ext:
+            m_trt_ext = re.search(r"TRIBUNAL\s+REGIONAL\s+DO\s+TRABALHO.*?0?(2[0-4]|1[0-9]|[1-9])\b", clean_upper)
         if m_trt_ext:
             return f"TRT{int(m_trt_ext.group(1))}"
 

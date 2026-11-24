@@ -127,7 +127,7 @@ class CompanySearch(db.Model):
             "cnae": {
                 "codigo": self.cnae_codigo,
                 "descricao": self.cnae_descricao,
-            } if self.cnae_codigo else None,
+            },
             "idoneidade_economica": econ_data,
             "logo": self._sanitize_logo_for_export(econ_data.get("logo", {}) if isinstance(econ_data, dict) else {}),
             "ai_analysis": self.ai_analysis or {},
