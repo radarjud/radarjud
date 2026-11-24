@@ -7,6 +7,7 @@ from typing import Dict, List, Any, Optional, Tuple
 
 import requests
 
+from app.utils.cnj_proxy import cnj_post
 from app.utils.sanitizer import sanitize_company_name, is_cnpj, fetch_cnpj_brasilapi, remove_accents, extract_brand_search_term
 from app.utils.crypto import generate_movements_hash
 from app.utils.rate_limiter import RateLimiter
@@ -273,9 +274,8 @@ class CNJMetadataOrchestrator:
     def __init__(self):
         self.comunica_url = os.getenv("COMUNICA_PJE_URL", "https://comunicaapi.pje.jus.br/api/v1/comunicacao")
         self.datajud_base_url = os.getenv("DATAJUD_BASE_URL", "https://api-publica.datajud.cnj.jus.br")
-        default_key = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="
-        raw_key = os.getenv("DATAJUD_API_KEY")
-        self.datajud_key = raw_key.strip() if (raw_key and raw_key.strip()) else default_key
+        raw_key = os.getenv("DATAJUD_API_KEY", "")
+        self.datajud_key = raw_key.strip() if raw_key else ""
         self.session = requests.Session()
 
         # Suporte a proxy dedicado isolado (não interfere no pip/build do Render)
@@ -523,7 +523,7 @@ class CNJMetadataOrchestrator:
         }
 
         try:
-            resp = self.session.post(endpoint, json=payload, headers=headers, timeout=25)
+            resp = cnj_post(self.session, endpoint, json=payload, headers=headers, timeout=25)
             if resp.ok:
                 return resp.json().get("hits", {}).get("hits", [])
         except Exception as exc:

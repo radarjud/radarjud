@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from app.utils.cnj_proxy import cnj_get, cnj_post
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,8 @@ class CNJClient:
         }
         try:
             logger.info("Consultando Comunica PJe para: %s", company_name)
-            resp = self.session.get(
+            resp = cnj_get(
+                self.session,
                 self.comunica_url,
                 params=params,
                 timeout=self.timeout,
@@ -131,8 +133,12 @@ class CNJClient:
         }
 
         try:
-            resp = self.session.post(
-                endpoint, json=payload, headers=headers, timeout=self.timeout
+            resp = cnj_post(
+                self.session,
+                endpoint,
+                json=payload,
+                headers=headers,
+                timeout=self.timeout,
             )
             if resp.ok:
                 data = resp.json()

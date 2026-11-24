@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Any, Optional, Set, Tuple
 import requests
 
+from app.utils.cnj_proxy import cnj_get, cnj_post
 from app.utils.sanitizer import (
     STOPWORDS_SOCIETARIAS,
     extract_brand_search_term,
@@ -210,11 +211,10 @@ class CNJProcessSearcher:
 
     COMUNICA_URL = "https://comunicaapi.pje.jus.br/api/v1/comunicacao"
     DATAJUD_BASE = "https://api-publica.datajud.cnj.jus.br"
-    DEFAULT_DATAJUD_KEY = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="
 
     def __init__(self, session: Optional[requests.Session] = None):
-        key = os.getenv("DATAJUD_API_KEY") or self.DEFAULT_DATAJUD_KEY
-        self.datajud_key = key.strip() if key else self.DEFAULT_DATAJUD_KEY
+        key = os.getenv("DATAJUD_API_KEY", "").strip()
+        self.datajud_key = key
         self.session = session or requests.Session()
         
         # Suporte a proxy dedicado isolado (não interfere no pip/build do Render)
@@ -380,7 +380,7 @@ class CNJProcessSearcher:
         self.last_page_raw_count = 0
         self.last_page_has_more = False
         try:
-            r = self.session.get(self.COMUNICA_URL, params=p, timeout=timeout)
+            r = cnj_get(self.session, self.COMUNICA_URL, params=p, timeout=timeout)
             if r.status_code == 200:
                 py = r.json()
                 items = py if isinstance(py, list) else (
@@ -426,7 +426,7 @@ class CNJProcessSearcher:
                 "itensPorPagina": 50,
             }
             try:
-                resp = self.session.get(self.COMUNICA_URL, params=params, timeout=timeout)
+                resp = cnj_get(self.session, self.COMUNICA_URL, params=params, timeout=timeout)
                 if not resp.ok:
                     logger.warning("Comunica PJe HTTP %s na página %d para '%s'", resp.status_code, page, query_term)
                     break
@@ -468,7 +468,7 @@ class CNJProcessSearcher:
                     "pagina": 1,
                     "itensPorPagina": 50,
                 }
-                resp_tst = self.session.get(self.COMUNICA_URL, params=params_tst, timeout=timeout)
+                resp_tst = cnj_get(self.session, self.COMUNICA_URL, params=params_tst, timeout=timeout)
                 if resp_tst.ok:
                     py_tst = resp_tst.json()
                     tst_items = py_tst if isinstance(py_tst, list) else (
@@ -526,7 +526,7 @@ class CNJProcessSearcher:
                     "itensPorPagina": 50,  # NUNCA passar de 50! Limite oficial da API.
                 }
                 try:
-                    resp = self.session.get(self.COMUNICA_URL, params=params, timeout=20)
+                    resp = cnj_get(self.session, self.COMUNICA_URL, params=params, timeout=20)
                     if resp.status_code != 200:
                         logger.warning("Comunica PJe HTTP %s para termo '%s'", resp.status_code, term)
                         break
@@ -556,7 +556,7 @@ class CNJProcessSearcher:
                 "pagina": 1,
                 "itensPorPagina": 50,
             }
-            resp_tst = self.session.get(self.COMUNICA_URL, params=params_tst, timeout=10)
+            resp_tst = cnj_get(self.session, self.COMUNICA_URL, params=params_tst, timeout=10)
             if resp_tst.ok:
                 payload_tst = resp_tst.json()
                 tst_items = payload_tst if isinstance(payload_tst, list) else (
@@ -591,7 +591,7 @@ class CNJProcessSearcher:
         total_count = None
         has_more = False
         try:
-            resp = self.session.get(self.COMUNICA_URL, params=params_p1, timeout=5.0)
+            resp = cnj_get(self.session, self.COMUNICA_URL, params=params_p1, timeout=5.0)
             if resp.ok:
                 payload = resp.json()
                 if isinstance(payload, dict):
@@ -617,7 +617,7 @@ class CNJProcessSearcher:
             def _fetch_single_page(p_num: int) -> List[Any]:
                 p = {"nomeParte": clean_brand, "pagina": p_num, "itensPorPagina": 50}
                 try:
-                    r = self.session.get(self.COMUNICA_URL, params=p, timeout=5.0)
+                    r = cnj_get(self.session, self.COMUNICA_URL, params=p, timeout=5.0)
                     if r.ok:
                         py = r.json()
                         return py if isinstance(py, list) else (
@@ -642,7 +642,7 @@ class CNJProcessSearcher:
                 "pagina": 1,
                 "itensPorPagina": 50,
             }
-            resp_tst = self.session.get(self.COMUNICA_URL, params=params_tst, timeout=5.0)
+            resp_tst = cnj_get(self.session, self.COMUNICA_URL, params=params_tst, timeout=5.0)
             if resp_tst.ok:
                 py_tst = resp_tst.json()
                 tst_items = py_tst if isinstance(py_tst, list) else (
@@ -689,7 +689,7 @@ class CNJProcessSearcher:
                     }
                 }
                 try:
-                    resp = self.session.post(url, json=body, headers=headers, timeout=6.0)
+                    resp = cnj_post(self.session, url, json=body, headers=headers, timeout=6.0)
                     if resp.status_code == 200:
                         hits = resp.json().get("hits", {}).get("hits", [])
                         for hit in hits:
@@ -751,7 +751,7 @@ class CNJProcessSearcher:
                 }
             }
             try:
-                resp = self.session.post(url, json=body, headers=headers, timeout=timeout)
+                resp = cnj_post(self.session, url, json=body, headers=headers, timeout=timeout)
                 if resp.status_code == 200:
                     return resp.json().get("hits", {}).get("hits", [])
             except Exception as exc:
