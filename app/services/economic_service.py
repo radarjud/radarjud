@@ -62,6 +62,25 @@ def is_valid_cnpj(cnpj: str) -> bool:
     return compute_cnpj_dv(clean[:12]) == clean[12:]
 
 
+def normalize_cnae_code(raw: Any) -> Optional[str]:
+    """
+    Normaliza código CNAE para a máscara oficial de 7 dígitos 'XXXX-X/XX'.
+    Exemplos de entrada suportados:
+      - 6422100 -> '6422-1/00'
+      - '6422100' -> '6422-1/00'
+      - '64.22-1-00' -> '6422-1/00'
+      - '6422-1/00' -> '6422-1/00'
+      - '64.22-1/00' -> '6422-1/00'
+    Caso inválido (diferente de 7 dígitos numéricos), vazio ou None -> retorna None.
+    """
+    if raw is None:
+        return None
+    digits = re.sub(r"\D", "", str(raw).strip())
+    if len(digits) != 7:
+        return None
+    return f"{digits[:4]}-{digits[4]}/{digits[5:7]}"
+
+
 def extract_qsa_pjs(data: dict) -> List[Tuple[str, str]]:
     """Extrai sócios Pessoa Jurídica (CNPJ de 14 dígitos e razão social) do QSA/socios."""
     pjs: List[Tuple[str, str]] = []
@@ -413,6 +432,8 @@ def _fetch_from_brasilapi(digits: str, headers: dict, timeout: float) -> dict:
         r = requests.get(f"https://brasilapi.com.br/api/cnpj/v1/{digits}", headers=headers, timeout=timeout)
         if r.status_code == 200:
             d = r.json()
+            raw_cnae = d.get("cnae_fiscal")
+            cnae_desc = d.get("cnae_fiscal_descricao") or ""
             return {
                 "cnpj": digits,
                 "raiz": digits[:8],
@@ -422,6 +443,8 @@ def _fetch_from_brasilapi(digits: str, headers: dict, timeout: float) -> dict:
                 "porte": _extract_porte_str(d.get("porte") or d.get("descricao_porte")),
                 "situacao": str(d.get("descricao_situacao_cadastral") or "ATIVA").upper(),
                 "email": d.get("email") or "",
+                "cnae_codigo": normalize_cnae_code(raw_cnae),
+                "cnae_descricao": cnae_desc,
                 "qsa_pjs": extract_qsa_pjs(d),
             }
     except Exception:
@@ -435,6 +458,9 @@ def _fetch_from_cnpjws(digits: str, headers: dict, timeout: float) -> dict:
         if r.status_code == 200:
             d = r.json()
             est = d.get("estabelecimento") or {}
+            atv = est.get("atividade_principal") or d.get("atividade_principal") or {}
+            raw_cnae = atv.get("subclasse") or atv.get("id") or atv.get("codigo")
+            cnae_desc = atv.get("descricao") or atv.get("texto") or ""
             return {
                 "cnpj": digits,
                 "raiz": digits[:8],
@@ -444,6 +470,8 @@ def _fetch_from_cnpjws(digits: str, headers: dict, timeout: float) -> dict:
                 "porte": _extract_porte_str(d.get("porte") or est.get("porte")),
                 "situacao": str(est.get("situacao_cadastral") or "ATIVA").upper(),
                 "email": est.get("email") or "",
+                "cnae_codigo": normalize_cnae_code(raw_cnae),
+                "cnae_descricao": cnae_desc,
                 "qsa_pjs": extract_qsa_pjs(d),
             }
     except Exception:
@@ -456,6 +484,8 @@ def _fetch_from_minhareceita(digits: str, headers: dict, timeout: float) -> dict
         r = requests.get(f"https://minhareceita.org/{digits}", headers=headers, timeout=timeout)
         if r.status_code == 200:
             d = r.json()
+            raw_cnae = d.get("cnae_fiscal")
+            cnae_desc = d.get("cnae_fiscal_descricao") or ""
             return {
                 "cnpj": digits,
                 "raiz": digits[:8],
@@ -465,6 +495,8 @@ def _fetch_from_minhareceita(digits: str, headers: dict, timeout: float) -> dict
                 "porte": _extract_porte_str(d.get("porte") or d.get("descricao_porte")),
                 "situacao": str(d.get("descricao_situacao_cadastral") or d.get("situacao_cadastral") or "ATIVA").upper(),
                 "email": d.get("email") or "",
+                "cnae_codigo": normalize_cnae_code(raw_cnae),
+                "cnae_descricao": cnae_desc,
                 "qsa_pjs": extract_qsa_pjs(d),
             }
     except Exception:
@@ -483,6 +515,10 @@ def _fetch_from_receitaws(digits: str, headers: dict, timeout: float) -> dict:
                     cap_val = float(raw_cap)
                 except ValueError:
                     cap_val = float(raw_cap.replace(".", "").replace(",", ".") or 0.0)
+                atv_list = d.get("atividade_principal") or []
+                atv = atv_list[0] if isinstance(atv_list, list) and atv_list and isinstance(atv_list[0], dict) else (atv_list if isinstance(atv_list, dict) else {})
+                raw_cnae = atv.get("code") or atv.get("codigo")
+                cnae_desc = atv.get("text") or atv.get("descricao") or ""
                 return {
                     "cnpj": digits,
                     "raiz": digits[:8],
@@ -492,6 +528,8 @@ def _fetch_from_receitaws(digits: str, headers: dict, timeout: float) -> dict:
                     "porte": _extract_porte_str(d.get("porte")),
                     "situacao": str(d.get("situacao") or "ATIVA").upper(),
                     "email": d.get("email") or "",
+                    "cnae_codigo": normalize_cnae_code(raw_cnae),
+                    "cnae_descricao": cnae_desc,
                     "qsa_pjs": extract_qsa_pjs(d),
                 }
     except Exception:
@@ -517,8 +555,17 @@ def _fetch_accurate_cnpj_data_impl(digits: str, timeout: float = 4.0) -> dict:
         if fn:
             res = fn(digits, headers, timeout)
             if res and res.get("razao_social"):
+                if not best_res:
+                    best_res = res
+                else:
+                    if not best_res.get("cnae_codigo") and res.get("cnae_codigo"):
+                        best_res["cnae_codigo"] = res["cnae_codigo"]
+                        best_res["cnae_descricao"] = res.get("cnae_descricao", "")
                 cap = float(res.get("capital_social") or 0.0)
                 if cap > 0.0:
+                    if not res.get("cnae_codigo") and best_res.get("cnae_codigo"):
+                        res["cnae_codigo"] = best_res["cnae_codigo"]
+                        res["cnae_descricao"] = best_res.get("cnae_descricao", "")
                     return res
                 if not best_res:
                     best_res = res
@@ -563,6 +610,8 @@ def fetch_accurate_cnpj_data_cached(cnpj: str, timeout: float = 4.0) -> dict:
         meta = OFFICIAL_CORPORATE_METADATA[digits]
         cap_meta = float(meta.get("capital_social") or 0.0)
         if cap_meta > 0.0 or not res:
+            cnae_cod = normalize_cnae_code(meta.get("cnae_codigo")) or (res.get("cnae_codigo") if res else None)
+            cnae_desc = meta.get("cnae_descricao") or (res.get("cnae_descricao") if res else "")
             meta_res = {
                 "cnpj": digits,
                 "raiz": root,
@@ -572,6 +621,8 @@ def fetch_accurate_cnpj_data_cached(cnpj: str, timeout: float = 4.0) -> dict:
                 "porte": "DEMAIS" if cap_meta >= 10_000_000 else "ME/EPP",
                 "situacao": meta.get("descricao_situacao_cadastral") or (res.get("situacao") if res else "ATIVA"),
                 "email": res.get("email", "") if res else "",
+                "cnae_codigo": cnae_cod,
+                "cnae_descricao": cnae_desc,
                 "qsa_pjs": res.get("qsa_pjs", []) if res else [],
             }
             with _CACHE_LOCK:
@@ -588,6 +639,8 @@ def fetch_accurate_cnpj_data_cached(cnpj: str, timeout: float = 4.0) -> dict:
         if reg and reg.razao_social:
             cap_val = float(reg.capital_social or 0.0)
             if cap_val > 0.0 or not res:
+                cnae_cod = normalize_cnae_code(reg.cnae_codigo) or (res.get("cnae_codigo") if res else None)
+                cnae_desc = reg.cnae_descricao or (res.get("cnae_descricao") if res else "")
                 db_res = {
                     "cnpj": reg.cnpj,
                     "raiz": reg.cnpj[:8],
@@ -597,6 +650,8 @@ def fetch_accurate_cnpj_data_cached(cnpj: str, timeout: float = 4.0) -> dict:
                     "porte": "DEMAIS" if cap_val >= 10_000_000 else "ME/EPP",
                     "situacao": reg.situacao_cadastral or "ATIVA",
                     "email": res.get("email", "") if res else "",
+                    "cnae_codigo": cnae_cod,
+                    "cnae_descricao": cnae_desc,
                     "qsa_pjs": res.get("qsa_pjs", []) if res else [],
                 }
                 with _CACHE_LOCK:
@@ -697,6 +752,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "municipio": "OSASCO",
         "identificador_matriz_filial": 1,
         "capital_social": 103770000000.0,
+        "cnae_codigo": "6422-1/00",
+        "cnae_descricao": "Bancos múltiplos, com carteira comercial",
     },
     "60746948000201": {
         "cnpj": "60746948000201",
@@ -707,6 +764,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 2,
         "capital_social": 0.0,
+        "cnae_codigo": "6422-1/00",
+        "cnae_descricao": "Bancos múltiplos, com carteira comercial",
     },
     "33055146000193": {
         "cnpj": "33055146000193",
@@ -717,6 +776,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "municipio": "BARUERI",
         "identificador_matriz_filial": 1,
         "capital_social": 8096444545.22,
+        "cnae_codigo": "6511-1/01",
+        "cnae_descricao": "Sociedade seguradora de seguros vida",
     },
     "92693118000160": {
         "cnpj": "92693118000160",
@@ -727,6 +788,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "municipio": "BARUERI",
         "identificador_matriz_filial": 1,
         "capital_social": 4400000000.0,
+        "cnae_codigo": "6550-2/00",
+        "cnae_descricao": "Planos de saúde",
     },
     "51990695000137": {
         "cnpj": "51990695000137",
@@ -737,6 +800,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "municipio": "BARUERI",
         "identificador_matriz_filial": 1,
         "capital_social": 4301113376.27,
+        "cnae_codigo": "6541-3/00",
+        "cnae_descricao": "Previdência complementar fechada",
     },
     "07207996000150": {
         "cnpj": "07207996000150",
@@ -747,6 +812,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
         "capital_social": 499300000.0,
+        "cnae_codigo": "6436-1/00",
+        "cnae_descricao": "Sociedades de crédito, financiamento e investimento",
     },
     "07207996000158": {
         "cnpj": "07207996000158",
@@ -757,6 +824,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
         "capital_social": 499300000.0,
+        "cnae_codigo": "6436-1/00",
+        "cnae_descricao": "Sociedades de crédito, financiamento e investimento",
     },
     "06271464000119": {
         "cnpj": "06271464000119",
@@ -767,6 +836,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
         "capital_social": 4120000000.0,
+        "cnae_codigo": "6431-0/00",
+        "cnae_descricao": "Bancos de investimento",
     },
     "47509120000182": {
         "cnpj": "47509120000182",
@@ -777,6 +848,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "municipio": "BARUERI",
         "identificador_matriz_filial": 1,
         "capital_social": 2660000000.0,
+        "cnae_codigo": "6440-9/00",
+        "cnae_descricao": "Arrendamento mercantil",
     },
     "59438325000101": {
         "cnpj": "59438325000101",
@@ -787,6 +860,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "municipio": "BARUERI",
         "identificador_matriz_filial": 1,
         "capital_social": 0.0,
+        "cnae_codigo": "6440-9/00",
+        "cnae_descricao": "Arrendamento mercantil",
     },
     "22896431000110": {
         "cnpj": "22896431000110",
@@ -796,6 +871,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6499-9/99",
+        "cnae_descricao": "Outras atividades de serviços financeiros",
     },
     "09516419000175": {
         "cnpj": "09516419000175",
@@ -805,6 +882,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6422-1/00",
+        "cnae_descricao": "Bancos múltiplos, com carteira comercial",
     },
     "60701190000104": {
         "cnpj": "60701190000104",
@@ -814,6 +893,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6422-1/00",
+        "cnae_descricao": "Bancos múltiplos, com carteira comercial",
     },
     "60872504000123": {
         "cnpj": "60872504000123",
@@ -823,6 +904,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6462-0/00",
+        "cnae_descricao": "Holdings de instituições não-financeiras",
     },
     "17192451000170": {
         "cnpj": "17192451000170",
@@ -832,6 +915,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6422-1/00",
+        "cnae_descricao": "Bancos múltiplos, com carteira comercial",
     },
     "59285411000113": {
         "cnpj": "59285411000113",
@@ -841,6 +926,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6422-1/00",
+        "cnae_descricao": "Bancos múltiplos, com carteira comercial",
     },
     "90400888000142": {
         "cnpj": "90400888000142",
@@ -850,6 +937,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6422-1/00",
+        "cnae_descricao": "Bancos múltiplos, com carteira comercial",
     },
     "03502968000104": {
         "cnpj": "03502968000104",
@@ -859,6 +948,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6436-1/00",
+        "cnae_descricao": "Sociedades de crédito, financiamento e investimento",
     },
     "00000000000191": {
         "cnpj": "00000000000191",
@@ -868,6 +959,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "DF",
         "municipio": "BRASILIA",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6422-1/00",
+        "cnae_descricao": "Bancos múltiplos, com carteira comercial",
     },
     "01371416000118": {
         "cnpj": "01371416000118",
@@ -877,6 +970,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "DF",
         "municipio": "BRASILIA",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6613-4/00",
+        "cnae_descricao": "Administração de cartões de crédito",
     },
     "30822936000169": {
         "cnpj": "30822936000169",
@@ -886,6 +981,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "DF",
         "municipio": "BRASILIA",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6462-0/00",
+        "cnae_descricao": "Holdings de instituições não-financeiras",
     },
     "00360305000104": {
         "cnpj": "00360305000104",
@@ -895,6 +992,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "DF",
         "municipio": "BRASILIA",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6423-9/00",
+        "cnae_descricao": "Caixas econômicas",
     },
     "34020354000110": {
         "cnpj": "34020354000110",
@@ -904,6 +1003,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "DF",
         "municipio": "BRASILIA",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6462-0/00",
+        "cnae_descricao": "Holdings de instituições não-financeiras",
     },
     "18236120000158": {
         "cnpj": "18236120000158",
@@ -913,6 +1014,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6499-9/99",
+        "cnae_descricao": "Outras atividades de serviços financeiros",
     },
     "30680829000143": {
         "cnpj": "30680829000143",
@@ -922,6 +1025,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6436-1/00",
+        "cnae_descricao": "Sociedades de crédito, financiamento e investimento",
     },
     "09769035000164": {
         "cnpj": "09769035000164",
@@ -931,6 +1036,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "PE",
         "municipio": "RECIFE",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "3600-6/01",
+        "cnae_descricao": "Captação, tratamento e distribuição de água",
     },
     "43776517000180": {
         "cnpj": "43776517000180",
@@ -940,6 +1047,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "3600-6/01",
+        "cnae_descricao": "Captação, tratamento e distribuição de água",
     },
     "17281106000103": {
         "cnpj": "17281106000103",
@@ -949,6 +1058,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "MG",
         "municipio": "BELO HORIZONTE",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "3600-6/01",
+        "cnae_descricao": "Captação, tratamento e distribuição de água",
     },
     "76484013000145": {
         "cnpj": "76484013000145",
@@ -958,6 +1069,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "PR",
         "municipio": "CURITIBA",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "3600-6/01",
+        "cnae_descricao": "Captação, tratamento e distribuição de água",
     },
     "17155730000164": {
         "cnpj": "17155730000164",
@@ -967,6 +1080,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "MG",
         "municipio": "BELO HORIZONTE",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "3514-0/00",
+        "cnae_descricao": "Distribuição de energia elétrica",
     },
     "10835932000108": {
         "cnpj": "10835932000108",
@@ -976,6 +1091,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "PE",
         "municipio": "RECIFE",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "3514-0/00",
+        "cnae_descricao": "Distribuição de energia elétrica",
     },
     "01083200000118": {
         "cnpj": "01083200000118",
@@ -985,6 +1102,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "RJ",
         "municipio": "RIO DE JANEIRO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6462-0/00",
+        "cnae_descricao": "Holdings de instituições não-financeiras",
     },
     "15139629000194": {
         "cnpj": "15139629000194",
@@ -994,6 +1113,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "BA",
         "municipio": "SALVADOR",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "3514-0/00",
+        "cnae_descricao": "Distribuição de energia elétrica",
     },
     "61695227000193": {
         "cnpj": "61695227000193",
@@ -1003,6 +1124,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "BARUERI",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "3514-0/00",
+        "cnae_descricao": "Distribuição de energia elétrica",
     },
     "07047251000170": {
         "cnpj": "07047251000170",
@@ -1012,6 +1135,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "RJ",
         "municipio": "NITEROI",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "3514-0/00",
+        "cnae_descricao": "Distribuição de energia elétrica",
     },
     "03220438000173": {
         "cnpj": "03220438000173",
@@ -1021,6 +1146,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "DF",
         "municipio": "BRASILIA",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6462-0/00",
+        "cnae_descricao": "Holdings de instituições não-financeiras",
     },
     "33000167000101": {
         "cnpj": "33000167000101",
@@ -1030,6 +1157,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "RJ",
         "municipio": "RIO DE JANEIRO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "1921-7/00",
+        "cnae_descricao": "Fabricação de produtos do refino de petróleo",
     },
     "33592510000154": {
         "cnpj": "33592510000154",
@@ -1039,6 +1168,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "RJ",
         "municipio": "RIO DE JANEIRO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "0710-3/01",
+        "cnae_descricao": "Extração de minério de ferro",
     },
     "07526557000100": {
         "cnpj": "07526557000100",
@@ -1048,6 +1179,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "1113-5/02",
+        "cnae_descricao": "Fabricação de cervejas e chopes",
     },
     "02916265000160": {
         "cnpj": "02916265000160",
@@ -1057,6 +1190,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "1011-2/01",
+        "cnae_descricao": "Frigorífico - abate de bovinos",
     },
     "02558157000162": {
         "cnpj": "02558157000162",
@@ -1066,6 +1201,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6110-8/01",
+        "cnae_descricao": "Serviços de telefonia fixa comutada - STFC",
     },
     "02421421000111": {
         "cnpj": "02421421000111",
@@ -1075,6 +1212,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "RJ",
         "municipio": "RIO DE JANEIRO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6120-5/01",
+        "cnae_descricao": "Telefonia móvel celular",
     },
     "40432544000147": {
         "cnpj": "40432544000147",
@@ -1084,6 +1223,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6120-5/01",
+        "cnae_descricao": "Telefonia móvel celular",
     },
     "34028316000103": {
         "cnpj": "34028316000103",
@@ -1093,6 +1234,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "DF",
         "municipio": "BRASILIA",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "5310-5/01",
+        "cnae_descricao": "Atividades do Correio Nacional",
     },
     "47960950000121": {
         "cnpj": "47960950000121",
@@ -1102,6 +1245,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "FRANCA",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "4713-0/02",
+        "cnae_descricao": "Lojas de departamentos ou magazines",
     },
     "03007331000141": {
         "cnpj": "03007331000141",
@@ -1111,6 +1256,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "OSASCO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6319-4/00",
+        "cnae_descricao": "Portais, provedores de conteúdo e outros serviços de informação na internet",
     },
     "10573521000191": {
         "cnpj": "10573521000191",
@@ -1120,6 +1267,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "OSASCO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6499-9/99",
+        "cnae_descricao": "Outras atividades de serviços financeiros",
     },
     "14380200000121": {
         "cnpj": "14380200000121",
@@ -1129,6 +1278,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "OSASCO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6319-4/00",
+        "cnae_descricao": "Portais, provedores de conteúdo e outros serviços de informação na internet",
     },
     "53113791000122": {
         "cnpj": "53113791000122",
@@ -1138,6 +1289,8 @@ OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
         "uf": "SP",
         "municipio": "SAO PAULO",
         "identificador_matriz_filial": 1,
+        "cnae_codigo": "6202-3/00",
+        "cnae_descricao": "Desenvolvimento e licenciamento de programas de computador customizáveis",
     },
 }
 
@@ -2010,6 +2163,9 @@ class EconomicStandingService:
                 situacao = str(data.get("descricao_situacao_cadastral") or "ATIVA").upper()
                 qsa = data.get("qsa") or []
                 email = data.get("email")
+                raw_cnae = data.get("cnae_fiscal")
+                cnae_cod = normalize_cnae_code(raw_cnae)
+                cnae_desc = data.get("cnae_fiscal_descricao") or ""
 
                 return {
                     "razao_social": data.get("razao_social"),
@@ -2018,7 +2174,9 @@ class EconomicStandingService:
                     "capital_social_formatado": format_brl(capital),
                     "situacao_cadastral": situacao,
                     "data_situacao_cadastral": data.get("data_situacao_cadastral"),
-                    "cnae_fiscal_descricao": data.get("cnae_fiscal_descricao"),
+                    "cnae_codigo": cnae_cod,
+                    "cnae_descricao": cnae_desc,
+                    "cnae_fiscal_descricao": cnae_desc,
                     "porte": data.get("porte") or "DEMAIS",
                     "email": email,
                     "qsa_total": len(qsa),
@@ -2134,6 +2292,16 @@ class EconomicStandingService:
                     effective_cnpj = extract_cnpj_from_processes(processes)
 
         cadastral_data = self.fetch_brasilapi_data(effective_cnpj) if (effective_cnpj and is_cnpj(effective_cnpj)) else {}
+        if effective_cnpj and is_cnpj(effective_cnpj) and (not cadastral_data.get("cnae_codigo") or not cadastral_data.get("razao_social")):
+            fallback_cad = fetch_accurate_cnpj_data(effective_cnpj)
+            if fallback_cad:
+                if not cadastral_data.get("cnae_codigo") and fallback_cad.get("cnae_codigo"):
+                    cadastral_data["cnae_codigo"] = fallback_cad.get("cnae_codigo")
+                    cadastral_data["cnae_descricao"] = fallback_cad.get("cnae_descricao") or ""
+                if not cadastral_data.get("razao_social") and fallback_cad.get("razao_social"):
+                    cadastral_data["razao_social"] = fallback_cad.get("razao_social")
+                if not cadastral_data.get("nome_fantasia") and fallback_cad.get("nome_fantasia"):
+                    cadastral_data["nome_fantasia"] = fallback_cad.get("nome_fantasia")
         razao = cadastral_data.get("razao_social") or company_name
         fantasia = cadastral_data.get("nome_fantasia") or ""
         email_val = cadastral_data.get("email") or ""
@@ -2187,7 +2355,15 @@ class EconomicStandingService:
         econ_result["qsa_total"] = cadastral_data.get("qsa_total", 0)
         econ_result["qsa_nomes"] = cadastral_data.get("qsa_nomes", [])
         econ_result["porte"] = cadastral_data.get("porte", econ_result.get("badge_compatibilidade_porte", "DEMAIS"))
-        econ_result["cnae_fiscal_descricao"] = cadastral_data.get("cnae_fiscal_descricao")
+        cnae_cod = cadastral_data.get("cnae_codigo") or econ_result.get("cnae_codigo")
+        cnae_desc = cadastral_data.get("cnae_descricao") or cadastral_data.get("cnae_fiscal_descricao") or econ_result.get("cnae_descricao", "")
+        econ_result["cnae_codigo"] = cnae_cod
+        econ_result["cnae_descricao"] = cnae_desc
+        econ_result["cnae_fiscal_descricao"] = cnae_desc
+        econ_result["cnae"] = {
+            "codigo": cnae_cod,
+            "descricao": cnae_desc,
+        }
         econ_result["cgu_status"] = cgu_data["status_cgu"]
         econ_result["possui_sancoes_cgu"] = cgu_data["possui_sancoes"]
         econ_result["pgfn_status"] = pgfn_data["status_pgfn"]

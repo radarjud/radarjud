@@ -135,13 +135,23 @@ def create_app(config_name: str = None) -> Flask:
                             municipio=meta.get("municipio", "")[:150] or None,
                             uf=meta.get("uf", "")[:2] or None,
                             capital_social=meta_cap,
+                            cnae_codigo=meta.get("cnae_codigo"),
+                            cnae_descricao=meta.get("cnae_descricao"),
                             created_at=now,
                             updated_at=now,
                         )
                         db.session.add(reg)
-                    elif meta_cap > 0.0 and float(existing.capital_social or 0.0) == 0.0:
-                        existing.capital_social = meta_cap
-                        existing.updated_at = now
+                    else:
+                        changed = False
+                        if meta_cap > 0.0 and float(existing.capital_social or 0.0) == 0.0:
+                            existing.capital_social = meta_cap
+                            changed = True
+                        if not existing.cnae_codigo and meta.get("cnae_codigo"):
+                            existing.cnae_codigo = meta["cnae_codigo"]
+                            existing.cnae_descricao = meta.get("cnae_descricao")
+                            changed = True
+                        if changed:
+                            existing.updated_at = now
                 db.session.commit()
             except Exception as e_seed:
                 db.session.rollback()
