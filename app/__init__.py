@@ -95,6 +95,7 @@ def create_app(config_name: str = None) -> Flask:
             from app.models.company_search import CompanySearch  # noqa: F401
             from app.models.process_record import ProcessRecord  # noqa: F401
             from app.models.CompanyRegistry import CompanyRegistry  # noqa: F401
+            from app.models.monitored_supplier import MonitoredSupplier  # noqa: F401
             db.create_all()
             if db.engine.dialect.name == "postgresql":
                 with db.engine.connect() as conn:
@@ -122,6 +123,24 @@ def create_app(config_name: str = None) -> Flask:
                     conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_tribunal_data ON process_records (company_search_id, tribunal, data_distribuicao);"))
                     conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_valor ON process_records (company_search_id, valor_causa);"))
                     conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_outcome ON process_records (company_search_id, sentence_outcome);"))
+                    conn.execute(db.text("CREATE TABLE IF NOT EXISTS monitored_suppliers ("
+                                         "id SERIAL PRIMARY KEY, "
+                                         "tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, "
+                                         "cnpj VARCHAR(20) NOT NULL, "
+                                         "company_name VARCHAR(255) NOT NULL, "
+                                         "last_movements_hash VARCHAR(64), "
+                                         "last_condenacoes_count INTEGER DEFAULT 0, "
+                                         "last_scenario VARCHAR(20) DEFAULT 'CENARIO_A', "
+                                         "last_rfb_status VARCHAR(50) DEFAULT 'ATIVA', "
+                                         "last_tst_count INTEGER DEFAULT 0, "
+                                         "webhook_url VARCHAR(500), "
+                                         "alert_email VARCHAR(255), "
+                                         "active BOOLEAN DEFAULT TRUE, "
+                                         "last_checked_at TIMESTAMP, "
+                                         "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                                         "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"))
+                    conn.execute(db.text("CREATE UNIQUE INDEX IF NOT EXISTS uq_monitored_suppliers_tenant_cnpj ON monitored_suppliers (tenant_id, cnpj);"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_monitored_suppliers_tenant_active ON monitored_suppliers (tenant_id, active);"))
                     conn.commit()
 
             # Pré-semeia e sincroniza CompanyRegistry com os metadados de grandes corporações para máxima velocidade

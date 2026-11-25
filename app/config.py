@@ -2,6 +2,8 @@ import os
 import secrets
 import socket
 from pathlib import Path
+from typing import Any
+
 from dotenv import load_dotenv
 
 # Carrega variáveis do .env se existir
@@ -12,15 +14,15 @@ load_dotenv(BASE_DIR / ".env")
 def _database_url() -> str:
     """
     Resolve a URI do banco de dados:
-    - Converte postgres:// (e postgresql+psycopg:// / postgresql+psycopg2://) para postgresql:// (psycopg2-binary).
+    - Normaliza postgres:// para postgresql://.
+    - Preserva drivers explícitos como postgresql+psycopg2://.
     - Faz fallback para SQLite local se DATABASE_URL não estiver definida ou apontar para 'db' fora do Docker.
     """
     configured_url = os.getenv("DATABASE_URL", "").strip()
     if configured_url:
-        for driver in ("postgres://", "postgresql+psycopg://", "postgresql+psycopg2://"):
-            if configured_url.startswith(driver):
-                configured_url = "postgresql://" + configured_url[len(driver):]
-                break
+        if configured_url.startswith("postgres://"):
+            configured_url = "postgresql://" + configured_url[len("postgres://"):]
+
         # Se a URL aponta para o host 'db' (Docker) e estamos rodando fora do Docker (sem resolver 'db')
         if "@db:" in configured_url or "@db/" in configured_url:
             try:
@@ -43,7 +45,7 @@ def _database_url() -> str:
     return f"sqlite:///{db_file}"
 
 
-def _build_engine_options(db_uri: str) -> dict:
+def _build_engine_options(db_uri: str) -> dict[str, Any]:
     """
     Configura o pool do SQLAlchemy para compatibilidade com PgBouncer (Supabase Transaction Mode - porta 6543).
     O projeto usa psycopg2-binary (não passa prepare_threshold; preserva SSL da URI).
