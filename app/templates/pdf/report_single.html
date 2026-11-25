@@ -363,15 +363,6 @@
       <div class="kpi-sub">100% da base DataJud</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">Prob. Condenação</div>
-      {% if report.prob_condenacao %}
-        <div class="kpi-value amber">{{ "%.1f"|format(report.prob_condenacao) }}%</div>
-      {% else %}
-        <div class="kpi-value amber">N/D</div>
-      {% endif %}
-      <div class="kpi-sub">Taxa histórica bruta</div>
-    </div>
-    <div class="kpi-card">
       <div class="kpi-label">Confiança Bayesiana</div>
       <div class="kpi-value green">{{ report.conf_label }}</div>
       <div class="kpi-sub">{{ report.conf_detail }}</div>
@@ -441,10 +432,43 @@
     </div>
   </div>
 
-  <!-- Seção 4: Ranking TPU de Motivos de Condenação -->
+  <!-- Seção 4: Condenações por Motivo do Processo (US-18) -->
   <div class="section-card">
-    <div class="section-title">Principais Motivos de Condenação (Tabelas Processuais Unificadas - TPU)</div>
-    {% if report.ranking_condenacoes %}
+    <div class="section-title">Condenações por Motivo do Processo</div>
+    {% if report.condenacao_por_motivo %}
+      <table class="table-ranking">
+        <thead>
+          <tr>
+            <th style="width: 36%;">Motivo / Assunto</th>
+            <th class="text-right" style="width: 16%;">Processos</th>
+            <th class="text-right" style="width: 16%;">Condenações</th>
+            <th class="text-right" style="width: 16%;">Taxa</th>
+            <th class="text-right" style="width: 16%;">Faixa de Variação</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for item in report.condenacao_por_motivo %}
+            <tr>
+              <td><strong>{{ item.motivo }}</strong></td>
+              <td class="text-right">{{ item.total_processos }}</td>
+              <td class="text-right">{{ item.condenacoes }}</td>
+              <td class="text-right">
+                {% if item.condenacoes == 0 %}
+                  <span style="color: #166534; font-weight: 600;">0,0%</span>
+                {% elif item.taxa_condenacao >= 60.0 %}
+                  <span style="color: #991b1b; font-weight: 600;">{{ "%.1f"|format(item.taxa_condenacao) }}%</span>
+                {% elif item.taxa_condenacao >= 35.0 %}
+                  <span style="color: #b45309; font-weight: 600;">{{ "%.1f"|format(item.taxa_condenacao) }}%</span>
+                {% else %}
+                  <span style="color: #166534; font-weight: 600;">{{ "%.1f"|format(item.taxa_condenacao) }}%</span>
+                {% endif %}
+              </td>
+              <td class="text-right" style="color: #64748b; font-size: 8pt;">{{ item.faixa_variacao }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% elif report.ranking_condenacoes %}
       <table class="table-ranking">
         <thead>
           <tr>
