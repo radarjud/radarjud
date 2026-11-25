@@ -63,6 +63,11 @@ def create_app(config_name: str = None) -> Flask:
         from app.routes.api import cnj_proxy
         return cnj_proxy()
 
+    @app.route("/api/searches/<int:company_search_id>/processes", methods=["GET"])
+    def _api_searches_processes(company_search_id: int):
+        from app.routes.api import get_search_processes
+        return get_search_processes(company_search_id=company_search_id)
+
     # Rota raiz informativa
     @app.route("/", methods=["GET"])
     def index():
