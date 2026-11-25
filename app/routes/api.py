@@ -25,6 +25,7 @@ from app.utils.rate_limiter import limit_rate
 from app.extensions import db
 from app.models.company_search import CompanySearch, get_utc_now
 from app.models.process_record import ProcessRecord
+from app.models.monitored_supplier import MonitoredSupplier
 from app.services.orchestrator import CNJMetadataOrchestrator
 from app.services.pdf_report import generate_company_report_pdf, generate_comparative_report_pdf
 from app.services.economic_service import (
@@ -43,6 +44,8 @@ from app.utils.sanitizer import (
     classify_search_mode,
     resolve_search_strategy,
     CORPORATE_SUFFIX_REGEX,
+    validate_webhook_url,
+    validate_alert_email,
 )
 from app.utils.crypto import generate_movements_hash
 from app.utils.auth import get_current_user_optional, require_auth, require_role
@@ -2727,3 +2730,290 @@ def cnj_proxy():
         return resp
     except Exception as exc:
         return jsonify({"error": str(exc)}), 502
+
+
+# ============================================================================
+# US-09: Rotas de Monitoramento Contínuo de Fornecedores Homologados
+# ============================================================================
+
+@api_bp.route("/monitoring", methods=["POST"])
+@require_auth
+def create_monitored_supplier():
+    """
+    Ativa o monitoramento contínuo para um fornecedor homologado no tenant autenticado.
+    Inicializa o baseline snapshot (movements_hash, condenacoes, cenario, status RFB, TST)
+    a partir da última busca homologada do tenant ou parâmetros recebidos.
+    """
+    current_user = g.current_user
+    tenant_id = current_user.tenant_id
+
+    data = request.get_json(silent=True) or {}
+    raw_cnpj = str(data.get("cnpj") or "").strip()
+    clean_cnpj = re.sub(r"\D", "", raw_cnpj)
+    if len(clean_cnpj) != 14:
+        return jsonify({"error": "CNPJ inválido. Forneça um CNPJ com 14 dígitos numéricos."}), 400
+
+    # Proteção Anti-SSRF para webhook_url
+    webhook_url = data.get("webhook_url")
+    if webhook_url:
+        is_testing = current_app.config.get("TESTING", False)
+        valid_wh, wh_err = validate_webhook_url(str(webhook_url).strip(), allow_local_for_testing=is_testing)
+        if not valid_wh:
+            return jsonify({"error": wh_err or "URL de webhook inválida ou insegura."}), 400
+
+    # Validação de formato de e-mail de alerta
+    alert_email = data.get("alert_email")
+    if alert_email:
+        if not validate_alert_email(str(alert_email).strip()):
+            return jsonify({"error": "Endereço de e-mail de alerta inválido."}), 400
+
+    # Verifica unicidade no tenant (uq_monitored_suppliers_tenant_cnpj)
+    existing = MonitoredSupplier.query.filter_by(tenant_id=tenant_id, cnpj=clean_cnpj).first()
+    if existing:
+        return jsonify({
+            "error": "Fornecedor já cadastrado para monitoramento neste tenant.",
+            "supplier": existing.to_dict(),
+        }), 409
+
+    # Busca baseline na última pesquisa homologada da empresa
+    search = (
+        CompanySearch.query.filter_by(tenant_id=tenant_id)
+        .filter(CompanySearch.normalized_name.like(f"%{clean_cnpj}%") | CompanySearch.company_name.like(f"%{clean_cnpj}%"))
+        .order_by(CompanySearch.created_at.desc())
+        .first()
+    )
+    if not search:
+        search = (
+            CompanySearch.query
+            .filter(CompanySearch.normalized_name.like(f"%{clean_cnpj}%") | CompanySearch.company_name.like(f"%{clean_cnpj}%"))
+            .order_by(CompanySearch.created_at.desc())
+            .first()
+        )
+
+    company_name = str(data.get("company_name") or "").strip()
+    if not company_name and search:
+        company_name = search.company_name
+    if not company_name:
+        company_name = f"Fornecedor {clean_cnpj}"
+
+    # Snapshot inicial determinístico
+    if search:
+        last_movements_hash = search.movements_hash
+        last_condenacoes_count = (search.outcomes_summary or {}).get("condenacoes", 0)
+        econ = search.economic_standing or {}
+        last_scenario = econ.get("cenario") or ("CENARIO_A" if (search.overall_risk_score or 0) < 50 else "CENARIO_B")
+        last_rfb_status = econ.get("situacao") or econ.get("situacao_cadastral") or "ATIVA"
+        last_tst_count = sum(1 for p in (search.processes or []) if (getattr(p, "tribunal", None) or getattr(p, "court", None) or "").upper() == "TST")
+    else:
+        last_movements_hash = None
+        last_condenacoes_count = 0
+        last_scenario = "CENARIO_A"
+        last_rfb_status = "ATIVA"
+        last_tst_count = 0
+
+    # Permite sobrescrita explícita de baseline caso enviada (ex: testes ou carga inicial)
+    if "last_movements_hash" in data:
+        last_movements_hash = data.get("last_movements_hash")
+    if "last_condenacoes_count" in data:
+        try:
+            last_condenacoes_count = int(data.get("last_condenacoes_count", 0))
+        except (ValueError, TypeError):
+            pass
+    if "last_scenario" in data:
+        last_scenario = str(data.get("last_scenario") or "CENARIO_A")
+    if "last_rfb_status" in data:
+        last_rfb_status = str(data.get("last_rfb_status") or "ATIVA")
+    if "last_tst_count" in data:
+        try:
+            last_tst_count = int(data.get("last_tst_count", 0))
+        except (ValueError, TypeError):
+            pass
+
+    active = bool(data.get("active", True))
+
+    try:
+        supplier = MonitoredSupplier(
+            tenant_id=tenant_id,
+            cnpj=clean_cnpj,
+            company_name=company_name,
+            last_movements_hash=last_movements_hash,
+            last_condenacoes_count=last_condenacoes_count,
+            last_scenario=last_scenario,
+            last_rfb_status=str(last_rfb_status).upper() if last_rfb_status else "ATIVA",
+            last_tst_count=last_tst_count,
+            webhook_url=str(webhook_url).strip() if webhook_url else None,
+            alert_email=str(alert_email).strip() if alert_email else None,
+            active=active,
+            last_checked_at=get_utc_now(),
+        )
+        db.session.add(supplier)
+        db.session.commit()
+
+        logger.info(
+            "Fornecedor cadastrado para monitoramento: id=%d, tenant=%d, cnpj=%s",
+            supplier.id, tenant_id, clean_cnpj
+        )
+        return jsonify({
+            "status": "success",
+            "message": "Fornecedor homologado ativado para monitoramento contínuo.",
+            "supplier": supplier.to_dict(),
+        }), 201
+
+    except Exception as exc:
+        db.session.rollback()
+        logger.exception("Falha ao registrar fornecedor monitorado: %s", exc)
+        return jsonify({"error": "Falha interna ao cadastrar fornecedor monitorado."}), 500
+
+
+@api_bp.route("/monitoring", methods=["GET"])
+@require_auth
+def list_monitored_suppliers():
+    """
+    Lista fornecedores monitorados do tenant autenticado com suporte a paginação e filtro por active.
+    Anti-IDOR estrito: retorna única e exclusivamente registros do tenant autenticado.
+    """
+    current_user = g.current_user
+    tenant_id = current_user.tenant_id
+
+    page = max(1, int(request.args.get("page", 1)))
+    per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+    active_param = request.args.get("active")
+
+    query = MonitoredSupplier.query.filter_by(tenant_id=tenant_id)
+    if active_param is not None:
+        is_active = str(active_param).lower() in ("true", "1", "yes")
+        query = query.filter_by(active=is_active)
+
+    total = query.count()
+    suppliers = (
+        query.order_by(MonitoredSupplier.created_at.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+
+    return jsonify({
+        "status": "success",
+        "suppliers": [s.to_dict() for s in suppliers],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+    }), 200
+
+
+@api_bp.route("/monitoring/<int:monitoring_id>", methods=["PATCH"])
+@require_auth
+def update_monitored_supplier(monitoring_id: int):
+    """
+    Atualiza status (active), canais de alerta (webhook_url, alert_email) ou razão social.
+    Garante Anti-IDOR: validação obrigatória de tenant_id.
+    """
+    current_user = g.current_user
+    tenant_id = current_user.tenant_id
+
+    supplier = db.session.get(MonitoredSupplier, monitoring_id)
+    if not supplier:
+        return jsonify({"error": "Fornecedor monitorado não encontrado."}), 404
+
+    # Anti-IDOR
+    if supplier.tenant_id != tenant_id:
+        return jsonify({"error": "Acesso negado: fornecedor pertence a outra organização."}), 403
+
+    data = request.get_json(silent=True) or {}
+
+    # Atualização de active
+    if "active" in data:
+        supplier.active = bool(data["active"])
+
+    # Atualização de webhook_url com validação SSRF
+    if "webhook_url" in data:
+        wh = data["webhook_url"]
+        if wh:
+            is_testing = current_app.config.get("TESTING", False)
+            valid_wh, wh_err = validate_webhook_url(str(wh).strip(), allow_local_for_testing=is_testing)
+            if not valid_wh:
+                return jsonify({"error": wh_err or "URL de webhook inválida ou insegura."}), 400
+            supplier.webhook_url = str(wh).strip()
+        else:
+            supplier.webhook_url = None
+
+    # Atualização de alert_email com validação de formato
+    if "alert_email" in data:
+        em = data["alert_email"]
+        if em:
+            if not validate_alert_email(str(em).strip()):
+                return jsonify({"error": "Endereço de e-mail de alerta inválido."}), 400
+            supplier.alert_email = str(em).strip()
+        else:
+            supplier.alert_email = None
+
+    # Atualização de company_name se fornecido
+    if "company_name" in data:
+        cn = str(data["company_name"] or "").strip()
+        if cn:
+            supplier.company_name = cn
+
+    supplier.updated_at = get_utc_now()
+    try:
+        db.session.commit()
+        return jsonify({
+            "status": "success",
+            "message": "Fornecedor monitorado atualizado com sucesso.",
+            "supplier": supplier.to_dict(),
+        }), 200
+    except Exception as exc:
+        db.session.rollback()
+        logger.exception("Erro ao atualizar fornecedor monitorado id=%d: %s", monitoring_id, exc)
+        return jsonify({"error": "Falha interna ao atualizar fornecedor monitorado."}), 500
+
+
+@api_bp.route("/monitoring/<int:monitoring_id>", methods=["DELETE"])
+@require_auth
+def delete_monitored_supplier(monitoring_id: int):
+    """
+    Remove fornecedor do monitoramento contínuo.
+    Garante Anti-IDOR: validação obrigatória de tenant_id.
+    """
+    current_user = g.current_user
+    tenant_id = current_user.tenant_id
+
+    supplier = db.session.get(MonitoredSupplier, monitoring_id)
+    if not supplier:
+        return jsonify({"error": "Fornecedor monitorado não encontrado."}), 404
+
+    # Anti-IDOR
+    if supplier.tenant_id != tenant_id:
+        return jsonify({"error": "Acesso negado: fornecedor pertence a outra organização."}), 403
+
+    try:
+        db.session.delete(supplier)
+        db.session.commit()
+        logger.info("Fornecedor removido do monitoramento: id=%d, tenant=%d", monitoring_id, tenant_id)
+        return jsonify({
+            "status": "success",
+            "message": "Fornecedor removido do monitoramento com sucesso.",
+        }), 200
+    except Exception as exc:
+        db.session.rollback()
+        logger.exception("Erro ao remover fornecedor monitorado id=%d: %s", monitoring_id, exc)
+        return jsonify({"error": "Falha interna ao remover fornecedor monitorado."}), 500
+
+
+@api_bp.route("/monitoring/run", methods=["POST"])
+@require_auth
+def trigger_monitoring_job():
+    """
+    Endpoint administrativo para disparar a execução manual ou sob demanda do job de monitoramento
+    para o tenant autenticado (ou todos os tenants caso admin).
+    """
+    from app.services.monitoring_job import run_monitoring_job
+
+    current_user = g.current_user
+    data = request.get_json(silent=True) or {}
+    batch_size = min(50, max(1, int(data.get("batch_size", 10))))
+
+    # Tenant isolation: se usuário não for admin global, executa apenas para o seu próprio tenant
+    tenant_filter = current_user.tenant_id if current_user.role != "ADMIN" else data.get("tenant_id", current_user.tenant_id)
+
+    summary = run_monitoring_job(batch_size=batch_size, tenant_id=tenant_filter)
+    return jsonify(summary), 200

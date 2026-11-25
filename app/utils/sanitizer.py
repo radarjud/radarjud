@@ -1,7 +1,10 @@
 import re
 import unicodedata
 import logging
-from typing import Optional
+import ipaddress
+import socket
+import urllib.parse
+from typing import Optional, Tuple
 import requests
 
 logger = logging.getLogger(__name__)
@@ -295,4 +298,75 @@ def resolve_search_strategy(user_input: str, brasil_api_fetcher=None) -> dict:
             "raw_input": user_input,
             "cache_key": cache_key,
         }
+
+
+def validate_webhook_url(url: str, allow_local_for_testing: bool = False) -> Tuple[bool, Optional[str]]:
+    """
+    Valida URL de webhook contra vulnerabilidades de SSRF (Server-Side Request Forgery).
+    - Exige esquema https:// (ou http:// se allow_local_for_testing for True).
+    - Bloqueia loopback (127.0.0.1, localhost, ::1, 0.0.0.0).
+    - Bloqueia link-local e metadados de nuvem (169.254.169.254).
+    - Bloqueia faixas de rede privada RFC 1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16).
+    - Inspeciona IPs resolvidos via DNS contra a blocklist.
+    """
+    if not url or not str(url).strip():
+        return True, None
+
+    clean_url = str(url).strip()
+    try:
+        parsed = urllib.parse.urlparse(clean_url)
+    except Exception:
+        return False, "URL de webhook inválida."
+
+    allowed_schemes = ("https", "http") if allow_local_for_testing else ("https",)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in allowed_schemes:
+        if not allow_local_for_testing and scheme == "http":
+            return False, "URLs de webhook devem utilizar o protocolo seguro HTTPS (https://)."
+        return False, "Protocolo inválido. Webhooks devem utilizar HTTPS."
+
+    hostname = (parsed.hostname or "").lower().strip()
+    if not hostname:
+        return False, "URL de webhook deve conter um hostname válido."
+
+    # Bloqueio de hostnames locais, loopback e metadados
+    blocked_hosts = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.169.254"}  # nosec B104
+    if not allow_local_for_testing and hostname in blocked_hosts:
+        return False, "Endereço de webhook inseguro: endereços loopback, link-local e metadados são bloqueados."
+
+    # Checagem de IP direto
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if not allow_local_for_testing and (
+            ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
+        ):
+            return False, "Endereço de webhook inseguro: IPs de rede privada ou reservados são bloqueados."
+        return True, None
+    except ValueError:
+        pass
+
+    # Resolução DNS para inspecionar IPs por trás do domínio
+    if not allow_local_for_testing:
+        try:
+            addr_info = socket.getaddrinfo(hostname, None)
+            for item in addr_info:
+                ip_str = item[4][0]
+                try:
+                    ip = ipaddress.ip_address(ip_str)
+                    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                        return False, f"O domínio '{hostname}' resolve para endereço de rede privada proibido ({ip_str})."
+                except ValueError:
+                    pass
+        except socket.gaierror:
+            pass
+
+    return True, None
+
+
+def validate_alert_email(email: str) -> bool:
+    """Valida se o endereço de e-mail de alerta possui formato sintático válido."""
+    if not email or not str(email).strip():
+        return True
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", str(email).strip()))
+
 
