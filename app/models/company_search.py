@@ -27,16 +27,22 @@ class CompanySearch(db.Model):
     movements_hash = db.Column(db.String(64), index=True, nullable=True)
     last_checked_at = db.Column(db.DateTime, default=get_utc_now, nullable=False)
     scan_status = db.Column(db.String(20), default="COMPLETED", nullable=False, index=True)
-    # Valores possíveis de scan_status: 'COMPLETED', 'PARTIAL_FAST_PATH', 'SCANNING_BACKGROUND'
+    # Estados: COMPLETED, PARTIAL_FAST_PATH, SCANNING_BACKGROUND,
+    # BROWSER_PENDING (cliente coletando), BROWSER_PARTIAL (encerrada incompleta).
 
     # Sumários estruturados em JSON
     outcomes_summary = db.Column(db.JSON, nullable=True)
     ranking_motivos = db.Column(db.JSON, nullable=True)
     ranking_motivos_condenacao = db.Column(db.JSON, nullable=True)
+    condenacao_por_motivo = db.Column(db.JSON, nullable=True)
     predictions_summary = db.Column(db.JSON, nullable=True)
     economic_standing = db.Column(db.JSON, nullable=True)
     overall_risk_score = db.Column(db.Float, default=0.0, nullable=False)
     ai_analysis = db.Column(db.JSON, nullable=True)
+
+    # Metadados Cadastrais RFB (CNAE Principal)
+    cnae_codigo = db.Column(db.String(20), nullable=True, index=True)
+    cnae_descricao = db.Column(db.String(255), nullable=True)
 
     created_at = db.Column(db.DateTime, default=get_utc_now, nullable=False)
     updated_at = db.Column(db.DateTime, default=get_utc_now, onupdate=get_utc_now, nullable=False)
@@ -95,6 +101,11 @@ class CompanySearch(db.Model):
                 p_condenacao_trabalhista=prob_cond_shrunk or self.overall_risk_score or 0.0,
             )
 
+        cond_por_motivo = self.condenacao_por_motivo
+        if cond_por_motivo is None and self.processes:
+            from app.services.prediction_engine import build_condenacao_por_motivo
+            cond_por_motivo = build_condenacao_por_motivo([p.to_dict() for p in self.processes])
+
         return {
             "id": self.id,
             "tenant_id": self.tenant_id,
@@ -111,6 +122,7 @@ class CompanySearch(db.Model):
             "outcomes_summary": self.outcomes_summary or {},
             "ranking_motivos": self.ranking_motivos or [],
             "ranking_motivos_condenacao": self.ranking_motivos_condenacao or [],
+            "condenacao_por_motivo": cond_por_motivo or [],
             "previsao_bloqueada": previsao_bloqueada,
             "motivo_bloqueio_previsao": motivo_bloqueio,
             "plus_previsao_condenacao": plus_previsoes,
@@ -118,6 +130,12 @@ class CompanySearch(db.Model):
             "probabilidade_condenacao_geral_pct": prob_cond_shrunk,
             "taxa_historica_condenacao_pct": taxa_cond_empirica,
             "score_risco_terceirizacao": self.overall_risk_score,
+            "cnae_codigo": self.cnae_codigo,
+            "cnae_descricao": self.cnae_descricao,
+            "cnae": {
+                "codigo": self.cnae_codigo,
+                "descricao": self.cnae_descricao,
+            },
             "idoneidade_economica": econ_data,
             "logo": self._sanitize_logo_for_export(econ_data.get("logo", {}) if isinstance(econ_data, dict) else {}),
             "ai_analysis": self.ai_analysis or {},

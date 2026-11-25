@@ -6,6 +6,7 @@ export function translateScanStatus(status) {
     COMPLETED: 'Concluída',
     PARTIAL_FAST_PATH: 'Em andamento',
     SCANNING_BACKGROUND: 'Varredura em segundo plano',
+    BROWSER_PENDING: 'Aguardando varredura',
     BROWSER_PARTIAL: 'Parcialmente concluída',
     PROCESSING: 'Processando',
     PENDING: 'Pendente',

@@ -499,3 +499,98 @@ def test_endpoint_error_handling_edge_cases(client):
     assert res_blank.status_code == 400
     assert "vazio ou sem identificador" in res_blank.get_json()["error"]
 
+
+def test_scenario_a_solvent_large_company_approved_not_rejected():
+    """
+    Garante que empresas com solvência comprovada (Cenário A) e capital social expressivo
+    (ex: Banco Bradesco com > R$ 100 Bilhões) são classificadas como 'APROVAR' (ou Cautela)
+    e NUNCA como 'REPROVAR', respeitando a Súmula 331 IV TST (risco de calote mitigado).
+    """
+    bradesco_payload = {
+        "empresa": "BANCO BRADESCO S.A.",
+        "cnpj": "60.746.948/0001-12",
+        "total_processos": 1015,
+        "probabilidade_condenacao": 86.2,
+        "score_risco_terceirizacao": 59.7,
+        "overall_risk_score": 59.7,
+        "idoneidade_economica": {
+            "cenario_tipo": "CENARIO_A",
+            "capital_social_num": 117_847_056_921.22,
+            "capital_social_formatado": "R$ 117.847.056.921,22",
+            "probabilidade_insolvencia": 0.8,
+            "risco_calote_subsidiario": 0.7,
+            "indice_exposicao_financeira": 16.3,
+            "situacao_cadastral": "ATIVA",
+        },
+    }
+
+    empresa_critica = {
+        "empresa": "Prestadora Insolvente ME",
+        "cnpj": "99.999.999/0001-99",
+        "total_processos": 50,
+        "probabilidade_condenacao": 70.0,
+        "risco_subsidiario": 60.0,
+        "capital_social_num": 10_000.0,
+        "cenario": "CENARIO_B",
+    }
+
+    res = build_sector_benchmark([bradesco_payload, empresa_critica])
+    ranked = res["empresas_ranqueadas"]
+
+    by_name = {c["empresa"]: c for c in ranked}
+    brad = by_name["BANCO BRADESCO S.A."]
+    assert brad["faixa_decisao"] == "APROVAR"
+    assert brad["posicao_ranking"] == 1
+    assert brad["risco_subsidiario"] <= 1.0
+    assert "Aprovar fornecedor" in brad["recomendacao"]
+    assert "REPROVAR" not in brad["faixa_decisao"]
+
+
+def test_sector_benchmark_preserves_logo_status_and_identifiers():
+    """
+    Verifica se o benchmarking propaga logo, situacao_cadastral e search_id
+    para uso no frontend e exportação de relatórios.
+    """
+    comp1 = {
+        "empresa": "Fornecedora Alpha LTDA",
+        "cnpj": "12.345.678/0001-90",
+        "capital_social_num": 5_000_000.0,
+        "risco_subsidiario": 5.0,
+        "probabilidade_condenacao": 15.0,
+        "search_id": 42,
+        "logo": {"logo_url": "https://img.logo.dev/alpha.com", "is_verified_domain": True},
+        "idoneidade_economica": {
+            "situacao_cadastral": "ATIVA",
+            "cenario_tipo": "CENARIO_A",
+        },
+    }
+    comp2 = {
+        "empresa": "Fornecedora Beta S.A.",
+        "cnpj": "98.765.432/0001-10",
+        "capital_social_num": 1_000_000.0,
+        "risco_subsidiario": 8.0,
+        "probabilidade_condenacao": 25.0,
+        "search_id": 43,
+        "idoneidade_economica": {
+            "situacao_cadastral": "SUSPENSA",
+            "cenario_tipo": "CENARIO_A",
+        },
+    }
+
+    res = build_sector_benchmark([comp1, comp2])
+    ranked = res["empresas_ranqueadas"]
+    assert len(ranked) == 2
+
+    by_name = {c["empresa"]: c for c in ranked}
+    alpha = by_name["Fornecedora Alpha LTDA"]
+    beta = by_name["Fornecedora Beta S.A."]
+
+    assert alpha["logo"]["logo_url"] == "https://img.logo.dev/alpha.com"
+    assert alpha["situacao_cadastral"] == "ATIVA"
+    assert alpha["search_id"] == 42
+
+    assert beta["situacao_cadastral"] == "SUSPENSA"
+    assert beta["search_id"] == 43
+
+
+

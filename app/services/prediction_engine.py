@@ -272,6 +272,179 @@ def build_conviction_ranking_and_vectors(processes: list[dict]) -> tuple[list[di
     return ranking_condenacoes[:8], vetores_recorrentes[:8]
 
 
+def classify_process_canonical_motive(process: Dict[str, Any]) -> str:
+    """
+    Classifica determinísticamente o processo em uma das categorias canônicas de negócio.
+    Avalia os metadados do DataJud/PJe e texto em memória com baixo consumo de RAM.
+    Garante fallback seguro para 'Assunto não especificado' caso nenhum tema seja informado.
+    """
+    candidates: List[str] = []
+
+    raw_assuntos = process.get("assuntos")
+    if isinstance(raw_assuntos, list):
+        for item in raw_assuntos:
+            if isinstance(item, dict):
+                nome = item.get("nome") or item.get("descricao")
+                if nome:
+                    candidates.append(str(nome))
+            elif isinstance(item, str) and item.strip():
+                candidates.append(item.strip())
+
+    raw_subjects = process.get("subjects")
+    if isinstance(raw_subjects, list):
+        for s in raw_subjects:
+            if s and str(s).strip():
+                candidates.append(str(s).strip())
+
+    primary = process.get("primary_subject")
+    if primary and str(primary).strip():
+        candidates.append(str(primary).strip())
+
+    if not candidates:
+        classes = process.get("classes_pje") or []
+        if isinstance(classes, list):
+            for c in classes:
+                if isinstance(c, dict):
+                    nome = c.get("nome") or c.get("descricao")
+                    if nome:
+                        candidates.append(str(nome))
+                elif isinstance(c, str) and c.strip():
+                    candidates.append(c.strip())
+
+        texts = process.get("publicacoes_texto") or []
+        if isinstance(texts, list):
+            for t in texts[:3]:
+                if t and isinstance(t, str):
+                    candidates.append(t[:300])
+
+    if not candidates:
+        return "Assunto não especificado"
+
+    full_normalized = " ".join(normalize_subject_text(c) for c in candidates)
+    if not full_normalized.strip() or full_normalized.strip() in ("assunto nao especificado", "nao informado"):
+        return "Assunto não especificado"
+
+    # Regras de prioridade determinística para classificação canônica:
+    # 1. Execução / Cumprimento de Sentença
+    if any(k in full_normalized for k in (
+        "execuc", "cumprimento de senten", "liquidac", "penhora", "sisbajud",
+        "bloqueio judicial", "expropriac", "desconsideracao da personalidade",
+    )):
+        return "Execução / Cumprimento de Sentença"
+
+    # 2. FGTS / Multa 40% (prioritário sobre rescisórias gerais quando FGTS é o foco)
+    if any(k in full_normalized for k in (
+        "fgts", "fundo de garantia", "multa de 40%", "multa 40%",
+        "levantamento de fgts", "deposito de fgts", "deposito do fgts",
+    )):
+        return "FGTS / Multa 40%"
+
+    # 3. Verbas Rescisórias
+    if any(k in full_normalized for k in (
+        "verbas rescisori", "rescisao", "rescisor", "aviso previo", "decimo terceiro",
+        "13o salario", "13º salario", "saldo de salario", "477", "467", "atraso rescis", "guias rescis",
+    )):
+        return "Verbas Rescisórias"
+
+    # 4. Horas Extras / Jornada
+    if any(k in full_normalized for k in (
+        "hora extra", "horas extras", "sobrejornada", "jornada", "intrajornada",
+        "interjornada", "banco de horas", "cartao de ponto", "controle de ponto",
+        "registro de ponto", "folha de ponto", "trabalho noturno",
+        "adicional noturno", "repouso semanal", "dsr", "sobreaviso", "prontidao",
+    )):
+        return "Horas Extras / Jornada"
+
+    # 5. Adicionais (Insalubridade / Periculosidade)
+    if any(k in full_normalized for k in (
+        "insalubridade", "periculosidade", "adicional de insalubridade",
+        "adicional de periculosidade", "grau maximo", "grau medio", "grau minimo",
+    )):
+        return "Adicionais (Insalubridade / Periculosidade)"
+
+    # 6. Danos Morais / Assédio
+    if any(k in full_normalized for k in (
+        "dano moral", "danos morais", "assedio moral", "assedio sexual",
+        "indenizacao por dano", "ofensa", "acidente de trabalho", "doenca ocupacional",
+    )):
+        return "Danos Morais / Assédio"
+
+    # 7. Vínculo Empregatício
+    if any(k in full_normalized for k in (
+        "vinculo empregaticio", "reconhecimento de vinculo", "relacao de emprego",
+        "pejotizacao", "anotacao na ctps", "anotacao de ctps", "registro em carteira",
+        "fraude trabalhista", "carteira de trabalho",
+    )):
+        return "Vínculo Empregatício"
+
+    # Qualquer outro assunto formal reconhecido cai em Outros
+    return "Outros"
+
+
+def is_process_conviction(p: Dict[str, Any], canonical_motive: Optional[str] = None) -> bool:
+    """
+    Verifica se o processo resultou em condenação judicial confirmada.
+    Considera também execuções e liquidações onde o passivo condenatório já é definitivo.
+    """
+    status_desfecho = str(p.get("statusDesfecho") or "").strip().upper()
+    raw_status = str(p.get("sentence_outcome") or "em_aberto").strip().lower()
+    if status_desfecho == "CONDENACAO" or raw_status == "condenacoes":
+        return True
+    if canonical_motive == "Execução / Cumprimento de Sentença" and raw_status in ("", "em_aberto"):
+        return True
+    return False
+
+
+def build_condenacao_por_motivo(processes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Agrupa 100% dos processos mapeados em categorias canônicas de motivo, calculando
+    a taxa individual de condenação e a faixa de variação amigável (sem slice arbitrário).
+    Invariantes:
+    - sum(item['total_processos'] for item in condenacao_por_motivo) == len(processes)
+    - Regra de bloqueio: condenacoes == 0 -> taxa_condenacao == 0.0 e faixa_variacao == '0,0% a 0,0%'
+    - Ordenação determinística por maior incidência de condenações (desempate por total_processos).
+    """
+    if not processes:
+        return []
+
+    # Agrupa todos os processos por motivo canônico (1 processo = exatamente 1 motivo)
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for p in processes:
+        motive = classify_process_canonical_motive(p)
+        grouped[motive].append(p)
+
+    results: List[Dict[str, Any]] = []
+
+    for motivo, procs in grouped.items():
+        total_proc = len(procs)
+        condenacoes = sum(1 for p in procs if is_process_conviction(p, motivo))
+
+        if condenacoes == 0:
+            taxa_cond = 0.0
+            faixa_var = "0,0% a 0,0%"
+        else:
+            taxa_cond = round((condenacoes / total_proc) * 100.0, 1)
+            # Prior Dirichlet não-informativo (1/3) na simplex tripartida
+            a0 = 1.0 / 3.0
+            b0 = 1.0 / 3.0
+            lo = beta_ppf(0.05, condenacoes + a0, (total_proc - condenacoes) + b0) * 100.0
+            hi = beta_ppf(0.95, condenacoes + a0, (total_proc - condenacoes) + b0) * 100.0
+            lo_str = f"{lo:.1f}".replace(".", ",")
+            hi_str = f"{hi:.1f}".replace(".", ",")
+            faixa_var = f"{lo_str}% a {hi_str}%"
+
+        results.append({
+            "motivo": motivo,
+            "total_processos": total_proc,
+            "condenacoes": condenacoes,
+            "taxa_condenacao": taxa_cond,
+            "faixa_variacao": faixa_var,
+        })
+
+    results.sort(key=lambda x: (x["condenacoes"], x["total_processos"]), reverse=True)
+    return results
+
+
 class BayesianRiskPredictor:
     """
     Motor Bayesiano Empírico (Dirichlet-Multinomial / Beta-Binomial) de Previsão de Risco:
@@ -576,6 +749,8 @@ class BayesianRiskPredictor:
                 "empresa": company_name,
                 "total_processos": 0,
                 "ranking_motivos": [],
+                "ranking_motivos_condenacao": [],
+                "condenacao_por_motivo": [],
                 "desfechos_sentencas": outcomes,
                 "desfechos_detalhados": detailed_outcomes,
                 "niveis_sigilo": {},
@@ -866,6 +1041,7 @@ class BayesianRiskPredictor:
             "total_processos": total,
             "ranking_motivos": ranking,
             "ranking_motivos_condenacao": ranking_condenacoes,
+            "condenacao_por_motivo": build_condenacao_por_motivo(processes),
             "previsao_bloqueada": previsao_bloqueada,
             "motivo_bloqueio_previsao": motivo_bloqueio_previsao,
             "desfechos_sentencas": outcomes,
@@ -1043,20 +1219,41 @@ def build_sector_benchmark(
             or _format_capital_brl(cap_num)
         )
 
+        # Cenário de Idoneidade Econômica
+        cenario_val = str(
+            p.get("cenario")
+            or p.get("cenario_tipo")
+            or econ.get("cenario_tipo")
+            or econ.get("cenario")
+            or ""
+        ).upper()
+        if "CENARIO_A" in cenario_val or "CENÁRIO A" in cenario_val:
+            cenario_clean = "CENARIO_A"
+        elif "CENARIO_B" in cenario_val or "CENÁRIO B" in cenario_val:
+            cenario_clean = "CENARIO_B"
+        else:
+            cenario_clean = None
+
         # Risco Subsidiário (Súmula 331)
+        # Prioriza a métrica calibrada de solvência quando disponível (Súmula 331 TST
+        # condiciona a responsabilidade subsidiária do tomador ao inadimplemento da prestadora).
         r_sub_raw = (
             p.get("risco_subsidiario")
             if p.get("risco_subsidiario") is not None
             else (
-                p.get("score_risco_terceirizacao")
-                if p.get("score_risco_terceirizacao") is not None
+                econ.get("risco_calote_subsidiario")
+                if econ.get("risco_calote_subsidiario") is not None
                 else (
-                    p.get("overall_risk_score")
-                    if p.get("overall_risk_score") is not None
+                    p.get("indice_exposicao_financeira")
+                    if p.get("indice_exposicao_financeira") is not None
                     else (
-                        econ.get("risco_calote_subsidiario")
-                        if econ.get("risco_calote_subsidiario") is not None
-                        else econ.get("indice_exposicao_financeira", 0.0)
+                        econ.get("indice_exposicao_financeira")
+                        if econ.get("indice_exposicao_financeira") is not None
+                        else (
+                            p.get("score_risco_terceirizacao")
+                            if p.get("score_risco_terceirizacao") is not None
+                            else p.get("overall_risk_score", 0.0)
+                        )
                     )
                 )
             )
@@ -1065,6 +1262,9 @@ def build_sector_benchmark(
             r_sub = round(float(r_sub_raw), 1)
         except (ValueError, TypeError):
             r_sub = 0.0
+
+        if cenario_clean is None:
+            cenario_clean = "CENARIO_A" if r_sub < 40.0 else "CENARIO_B"
 
         # Probabilidade de Condenação (Bayes)
         p_cond_raw = (
@@ -1124,26 +1324,18 @@ def build_sector_benchmark(
             "formatado": f"{round(lo, 1)}% a {round(hi, 1)}%",
         }
 
-        # Cenário
-        cenario_val = str(
-            p.get("cenario")
-            or p.get("cenario_tipo")
-            or econ.get("cenario_tipo")
-            or econ.get("cenario")
-            or ("CENARIO_A" if r_sub < 40.0 else "CENARIO_B")
-        ).upper()
-        if "CENARIO_A" in cenario_val or "CENÁRIO A" in cenario_val:
-            cenario_clean = "CENARIO_A"
-        elif "CENARIO_B" in cenario_val or "CENÁRIO B" in cenario_val:
-            cenario_clean = "CENARIO_B"
-        else:
-            cenario_clean = "CENARIO_A" if r_sub < 40.0 else "CENARIO_B"
-
-        # Classificação em 3 faixas de decisão:
-        # APROVAR (Cenário A - baixo risco subsidiário / alta solvência)
-        # CAUTELA (faixa intermediária - recomendação de Retenção de 10% em contrato)
-        # REPROVAR (Cenário B - alto risco subsidiário / insolvência crítica)
-        if r_sub <= 10.0:
+        # Classificação em 3 faixas de decisão (Súmula 331 TST + Solvência):
+        # APROVAR: Cenário A com risco subsidiário baixo a moderado ou lastro patrimonial expressivo (>= R$ 50M)
+        # CAUTELA: Faixa intermediária ou Cenário A com passivo relevante (retenção técnica preventiva sugerida: 10%)
+        # REPROVAR: Cenário B com risco de insolvência / calote crítico (>= 40%)
+        if cenario_clean == "CENARIO_A":
+            if r_sub <= 15.0 or cap_num >= 50_000_000.0:
+                faixa = "APROVAR"
+                rec = "Aprovar fornecedor. Baixo risco subsidiário e solvência econômico-trabalhista preservada."
+            else:
+                faixa = "CAUTELA"
+                rec = "Contratar com cautela. Recomendação de retenção técnica de 10% do valor contratual para contingências."
+        elif r_sub <= 10.0:
             faixa = "APROVAR"
             rec = "Aprovar fornecedor. Baixo risco subsidiário e solvência econômico-trabalhista preservada."
         elif r_sub < 40.0:
@@ -1186,6 +1378,9 @@ def build_sector_benchmark(
             "cnae_descricao": str(cnae_desc).strip() if cnae_desc else None,
             "previsao_bloqueada": previsao_bloqueada,
             "total_processos": p.get("total_processos", 0),
+            "situacao_cadastral": str(econ.get("situacao_cadastral") or p.get("situacao_cadastral") or "ATIVA").upper(),
+            "logo": p.get("logo") or econ.get("logo") or {},
+            "search_id": p.get("search_id") or p.get("id"),
         })
 
     # Ordenação determinística (do melhor para o pior fornecedor):

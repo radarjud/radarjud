@@ -306,6 +306,24 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
     ranking_condenacoes = _normalize_ranking(raw_cond_ranking)
     ranking_motivos = _normalize_ranking(raw_motivos_ranking)
 
+    # Condenações por Motivo do Processo (US-18)
+    condenacao_por_motivo = []
+    raw_cpm = data.get("condenacao_por_motivo")
+    if not raw_cpm and (data.get("processes") or data.get("processos")):
+        from app.services.prediction_engine import build_condenacao_por_motivo
+        raw_cpm = build_condenacao_por_motivo(data.get("processes") or data.get("processos") or [])
+
+    if isinstance(raw_cpm, list):
+        for it in raw_cpm:
+            if isinstance(it, dict):
+                condenacao_por_motivo.append({
+                    "motivo": str(it.get("motivo") or "Assunto não especificado"),
+                    "total_processos": int(it.get("total_processos") or 0),
+                    "condenacoes": int(it.get("condenacoes") or 0),
+                    "taxa_condenacao": float(it.get("taxa_condenacao") or 0.0),
+                    "faixa_variacao": str(it.get("faixa_variacao") or "0,0% a 0,0%"),
+                })
+
     # Parecer Executivo de Compliance (Súmula 331 TST)
     recomendacao = _safe_str(
         ai.get("recomendacao_homologacao") or ai.get("recomendacao") or ai.get("recomendacao_compliance"),
@@ -360,6 +378,7 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         },
         "ranking_condenacoes": ranking_condenacoes,
         "ranking_motivos": ranking_motivos,
+        "condenacao_por_motivo": condenacao_por_motivo,
         "compliance": {
             "recomendacao": recomendacao,
             "perfil_risco": perfil_risco,
@@ -589,31 +608,31 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
     story.append(econ_grid)
     story.append(Spacer(1, 8))
 
-    # 4. Ranking dos Motivos de Condenação / Vetores de Risco
-    ranking_items = report["ranking_condenacoes"] or report["ranking_motivos"]
-    ranking_title = (
-        "Ranking dos Motivos de Condenação"
-        if report["ranking_condenacoes"]
-        else "Principais Vetores de Risco Processual"
-    )
-    story.append(Paragraph(ranking_title, style_h2))
-
-    if ranking_items:
+    # 4. Condenações por Motivo do Processo / Vetores de Risco (US-18)
+    cpm_items = report.get("condenacao_por_motivo") or []
+    if cpm_items:
+        story.append(Paragraph("Condenações por Motivo do Processo", style_h2))
         rows = [[
             Paragraph("<b>#</b>", style_small),
-            Paragraph("<b>Motivo / Vetor Identificado</b>", style_small),
-            Paragraph("<b>Ocorrências</b>", style_small),
-            Paragraph("<b>Participação</b>", style_small),
+            Paragraph("<b>Motivo / Assunto</b>", style_small),
+            Paragraph("<b>Processos</b>", style_small),
+            Paragraph("<b>Condenações</b>", style_small),
+            Paragraph("<b>Taxa</b>", style_small),
+            Paragraph("<b>Faixa de Variação</b>", style_small),
         ]]
-        for idx, item in enumerate(ranking_items[:8], start=1):
-            pct_str = _format_pct(item["percentual"], "—") if item.get("percentual") is not None else "—"
+        for idx, item in enumerate(cpm_items, start=1):
             rows.append([
                 Paragraph(str(idx), style_small),
                 Paragraph(_xml_escape(item["motivo"]), style_body),
-                Paragraph(str(item["quantidade"]), style_body),
-                Paragraph(pct_str, style_body),
+                Paragraph(str(item["total_processos"]), style_body),
+                Paragraph(str(item["condenacoes"]), style_body),
+                Paragraph(f"{item['taxa_condenacao']:.1f}%", style_body),
+                Paragraph(_xml_escape(item["faixa_variacao"]), style_small),
             ])
-        rank_table = Table(rows, colWidths=[page_w * 0.07, page_w * 0.65, page_w * 0.14, page_w * 0.14])
+        rank_table = Table(
+            rows,
+            colWidths=[page_w * 0.05, page_w * 0.39, page_w * 0.13, page_w * 0.13, page_w * 0.12, page_w * 0.18],
+        )
         rank_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), bg_soft),
             ("BOX", (0, 0), (-1, -1), 0.6, border_col),
@@ -626,7 +645,43 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
         ]))
         story.append(rank_table)
     else:
-        story.append(Paragraph("Nenhuma condenação ou vetor de risco recorrente mapeado para esta empresa.", style_small))
+        ranking_items = report["ranking_condenacoes"] or report["ranking_motivos"]
+        ranking_title = (
+            "Ranking dos Motivos de Condenação"
+            if report["ranking_condenacoes"]
+            else "Principais Vetores de Risco Processual"
+        )
+        story.append(Paragraph(ranking_title, style_h2))
+
+        if ranking_items:
+            rows = [[
+                Paragraph("<b>#</b>", style_small),
+                Paragraph("<b>Motivo / Vetor Identificado</b>", style_small),
+                Paragraph("<b>Ocorrências</b>", style_small),
+                Paragraph("<b>Participação</b>", style_small),
+            ]]
+            for idx, item in enumerate(ranking_items[:8], start=1):
+                pct_str = _format_pct(item["percentual"], "—") if item.get("percentual") is not None else "—"
+                rows.append([
+                    Paragraph(str(idx), style_small),
+                    Paragraph(_xml_escape(item["motivo"]), style_body),
+                    Paragraph(str(item["quantidade"]), style_body),
+                    Paragraph(pct_str, style_body),
+                ])
+            rank_table = Table(rows, colWidths=[page_w * 0.07, page_w * 0.65, page_w * 0.14, page_w * 0.14])
+            rank_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), bg_soft),
+                ("BOX", (0, 0), (-1, -1), 0.6, border_col),
+                ("INNERGRID", (0, 0), (-1, -1), 0.4, border_col),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]))
+            story.append(rank_table)
+        else:
+            story.append(Paragraph("Nenhuma condenação ou vetor de risco recorrente mapeado para esta empresa.", style_small))
 
     story.append(Spacer(1, 8))
 
@@ -709,16 +764,30 @@ def _generate_pdf_pure_python(report: Dict[str, Any]) -> bytes:
         f"   Unidades: {econ['subtitulo_unidades']}",
         f"   Situacao Cadastral RFB: {econ['situacao_rfb']} | Sancoes/Debitos: {econ['sancoes_texto']}",
         f"   Probabilidade de Insolvencia: {_format_pct(econ['prob_insolv'])} | Risco Subsidiario: {_format_pct(econ['risco_sub'])}",
-        "-" * 78,
-        "3. RANKING DOS MOTIVOS DE CONDENACAO / VETORES DE RISCO",
     ]
 
-    ranking_items = report["ranking_condenacoes"] or report["ranking_motivos"]
-    if ranking_items:
-        for idx, item in enumerate(ranking_items[:8], start=1):
-            lines.append(f"   {idx}. {item['motivo']} ({item['quantidade']} ocorrencias)")
+    cpm_items = report.get("condenacao_por_motivo") or []
+    if cpm_items:
+        lines.extend([
+            "-" * 78,
+            "3. CONDENAÇÕES POR MOTIVO DO PROCESSO",
+        ])
+        for idx, item in enumerate(cpm_items, start=1):
+            lines.append(
+                f"   {idx}. {item['motivo']}: {item['condenacoes']}/{item['total_processos']} "
+                f"({item['taxa_condenacao']:.1f}%) | Faixa: {item['faixa_variacao']}"
+            )
     else:
-        lines.append("   Nenhuma condenacao ou vetor recorrente mapeado.")
+        lines.extend([
+            "-" * 78,
+            "3. RANKING DOS MOTIVOS DE CONDENACAO / VETORES DE RISCO",
+        ])
+        ranking_items = report["ranking_condenacoes"] or report["ranking_motivos"]
+        if ranking_items:
+            for idx, item in enumerate(ranking_items[:8], start=1):
+                lines.append(f"   {idx}. {item['motivo']} ({item['quantidade']} ocorrencias)")
+        else:
+            lines.append("   Nenhuma condenacao ou vetor recorrente mapeado.")
 
     lines.extend([
         "-" * 78,

@@ -1,34 +1,35 @@
 import hashlib
 import json
-from typing import List, Dict, Any
+from typing import Any
 
 
-def _sort_by_process_number(entry: Dict[str, Any]) -> str:
+def _sort_by_process_number(entry: dict[str, Any]) -> str:
     """Extrai o número do processo para ordenação canônica determinística do hash."""
     return str(entry.get("processo", ""))
 
 
-def generate_movements_hash(processes_data: List[Dict[str, Any]]) -> str:
+def generate_movements_hash(processes_data: list[dict[str, Any]], rfb_status: str | None = None) -> str:
     """
-    Gera um hash SHA-256 representativo do estado atual das movimentações e metadados
-    dos processos judiciais de uma empresa.
+    Gera um hash SHA-256 representativo do estado consolidado de movimentações,
+    desfechos, tribunais e metadados dos processos e situação RFB de uma empresa.
 
     O hash é calculado de forma determinística ordenando:
     1. Número do processo.
     2. Data da última atualização processual (dataHoraUltimaAtualizacao).
     3. Lista ordenada de códigos de movimentação e suas respectivas datas/horas.
-
-    Se os metadados dos processos não mudarem entre consultas, o hash gerado
-    será exatamente idêntico, permitindo o curto-circuito antes de chamar o Gemini/IA.
+    4. Desfecho processual e tribunal.
+    5. Situação cadastral RFB (se informada).
     """
-    if not processes_data:
+    if not processes_data and not rfb_status:
         return hashlib.sha256(b"empty_movements").hexdigest()
 
     normalized_entries = []
 
-    for item in processes_data:
+    for item in (processes_data or []):
         proc_num = str(item.get("numero_processo") or item.get("numeroProcesso") or "").strip()
         last_update = str(item.get("dataHoraUltimaAtualizacao") or item.get("dataHora") or "").strip()
+        court = str(item.get("tribunal") or item.get("court") or item.get("siglaTribunal") or "").strip().upper()
+        desfecho = str(item.get("sentence_outcome") or item.get("desfecho") or "")
 
         # Extrai movimentos de raw_metadata ou do dicionário direto
         raw_meta = item.get("raw_metadata") or {}
@@ -48,12 +49,19 @@ def generate_movements_hash(processes_data: List[Dict[str, Any]]) -> str:
             "processo": proc_num,
             "ultima_atualizacao": last_update,
             "movimentos": movement_tuples,
-            "desfecho": item.get("sentence_outcome", ""),
+            "desfecho": desfecho,
+            "tribunal": court,
         })
 
     # Ordena pelo número do processo para garantir determinismo
     normalized_entries.sort(key=_sort_by_process_number)
 
-    serialized = json.dumps(normalized_entries, sort_keys=True, separators=(",", ":"))
+    payload = {
+        "processes": normalized_entries,
+    }
+    if rfb_status is not None:
+        payload["rfb_status"] = str(rfb_status).strip().upper()
+
+    serialized = json.dumps(payload if rfb_status is not None else normalized_entries, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 

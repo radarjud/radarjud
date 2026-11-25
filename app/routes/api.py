@@ -25,6 +25,7 @@ from app.utils.rate_limiter import limit_rate
 from app.extensions import db
 from app.models.company_search import CompanySearch, get_utc_now
 from app.models.process_record import ProcessRecord
+from app.models.monitored_supplier import MonitoredSupplier
 from app.services.orchestrator import CNJMetadataOrchestrator
 from app.services.pdf_report import generate_company_report_pdf, generate_comparative_report_pdf
 from app.services.economic_service import (
@@ -43,12 +44,15 @@ from app.utils.sanitizer import (
     classify_search_mode,
     resolve_search_strategy,
     CORPORATE_SUFFIX_REGEX,
+    validate_webhook_url,
+    validate_alert_email,
 )
 from app.utils.crypto import generate_movements_hash
 from app.utils.auth import get_current_user_optional, require_auth, require_role
 from app.models.tenant import Tenant
 from app.models.audit_log import AuditLog
 from app.services.quota_service import QuotaService
+from app.services.cnj_searcher import normalize_court_code
 
 logger = logging.getLogger(__name__)
 
@@ -241,9 +245,13 @@ def _deep_scan_background_worker(
                 "capital_social_display": cap_display,
             }
 
-            # 3. Enriquecimento no DataJud APENAS para os Top 3 Tribunais com timeout de 6s
-            enriched_list = orchestrator.searcher.enrich_top_tribunals_datajud(
-                all_processes_map, max_tribunals=3, timeout=6.0
+            # 3. Enriquecimento incremental no DataJud (pula processos já encerrados com log de economia)
+            enriched_list, diff_stats = orchestrator.process_incremental_diff(
+                company_search_id=search_id,
+                all_processes_map=all_processes_map,
+                max_tribunals=3,
+                timeout=6.0,
+                sync_db=True,
             )
 
             # 4. Métricas e parecer de IA
@@ -292,18 +300,28 @@ def _deep_scan_background_worker(
             search.outcomes_summary = deep_results.get("desfechos_sentencas", {})
             search.ranking_motivos = deep_results.get("ranking_motivos", [])
             search.ranking_motivos_condenacao = deep_results.get("ranking_motivos_condenacao", [])
+            search.condenacao_por_motivo = deep_results.get("condenacao_por_motivo", [])
             search.predictions_summary = deep_results.get("plus_previsao_condenacao", [])
             search.overall_risk_score = deep_results.get("score_risco_terceirizacao", 0.0)
             search.ai_analysis = deep_results.get("ai_analysis", {})
             search.movements_hash = deep_results.get("movements_hash")
             search.economic_standing = deep_results["idoneidade_economica"]
+            if search.economic_standing and isinstance(search.economic_standing, dict):
+                search.cnae_codigo = search.economic_standing.get("cnae_codigo") or search.cnae_codigo
+                search.cnae_descricao = search.economic_standing.get("cnae_descricao") or search.cnae_descricao
             search.scan_status = "COMPLETED"
             search.last_checked_at = get_utc_now()
             db.session.commit()
 
-            # Persiste os registros de processos individuais em lote protegido
+            # Persiste os registros de processos individuais em lote protegido (projeção leve de IDs)
             try:
-                existing_numbers = {p.numero_processo for p in search.processes}
+                existing_numbers = {
+                    r[0]
+                    for r in db.session.query(ProcessRecord.numero_processo)
+                    .filter(ProcessRecord.company_search_id == search.id)
+                    .all()
+                    if r[0]
+                }
                 new_records = []
                 for proc in enriched_list:
                     num = proc.get("numero_processo")
@@ -319,6 +337,8 @@ def _deep_scan_background_worker(
                             observation=proc.get("observation"),
                             sentence_outcome=proc.get("sentence_outcome", "em_aberto"),
                             has_expert_report=proc.get("has_expert_report", False),
+                            data_distribuicao=proc.get("data_distribuicao"),
+                            valor_causa=proc.get("valor_causa"),
                             raw_metadata=proc.get("raw_metadata"),
                         )
                         new_records.append(record)
@@ -422,6 +442,7 @@ def run_agent_pipeline():
 @api_bp.route("/company-dashboard", methods=["POST"])
 @api_bp.route("/search-company", methods=["POST", "GET"])
 @api_bp.route("/search", methods=["POST", "GET"])
+@api_bp.route("/overview", methods=["POST", "GET"])
 @limit_rate(max_requests=60, window_seconds=60)
 def search_company():
     """
@@ -435,6 +456,9 @@ def search_company():
     - Suporte a client_prefetched_items para fallback invisível anti-geoblocking.
     """
     client_prefetched_items = []
+    browser_requested = False
+    browser_count = None
+    browser_term = None
     current_user = get_current_user_optional()
     current_tenant_id = current_user.tenant_id if current_user else None
     if request.method == "POST":
@@ -442,6 +466,9 @@ def search_company():
         company_input = data.get("company_name") or data.get("name")
         force_refresh = bool(data.get("force_refresh", False))
         client_prefetched_items = data.get("client_prefetched_items") or []
+        browser_requested = data.get("browser_deep_scan") is True
+        browser_count = data.get("browser_page1_count")
+        browser_term = data.get("browser_query_term")
     else:
         company_input = request.args.get("name") or request.args.get("company_name")
         force_refresh = request.args.get("force_refresh", "false").lower() in ("true", "1")
@@ -460,6 +487,25 @@ def search_company():
     is_broad_brand = search_strategy["is_broad_brand"]
     cnpj_used = search_strategy["target_cnpj"]
 
+    # A busca do navegador deve usar o mesmo termo empresarial da estratégia do servidor.
+    # Nunca aceitar uma página sem filtro identificado como prefetch de uma empresa.
+    browser_owned = (
+        browser_requested
+        and isinstance(browser_term, str)
+        and bool(sanitize_company_name(browser_term))
+        and sanitize_company_name(browser_term) == sanitize_company_name(query_term)
+        and not is_cnpj(browser_term)
+        and type(browser_count) is int and browser_count >= 0
+        and isinstance(client_prefetched_items, list)
+        and 0 < len(client_prefetched_items) <= 100
+        and len(client_prefetched_items) == min(browser_count, 100)
+        and all(isinstance(item, dict) and orchestrator.searcher.normalize_cnj(
+            item.get("numero_processo") or item.get("numeroProcesso") or item.get("numeroprocessocommascara")
+        ) for item in client_prefetched_items)
+    )
+    if browser_requested and not browser_owned:
+        client_prefetched_items = []
+
     sanitized = sanitize_company_name(query_term)
     normalized_name = sanitized.upper() if sanitized else query_term.upper()
 
@@ -474,7 +520,7 @@ def search_company():
     # =========================================================================
     # REGRA 4: Cache em Memória com TTL de 15 minutos (0.05s de resposta)
     # =========================================================================
-    if not force_refresh:
+    if not force_refresh and not browser_requested:
         cached_entry = SEARCH_CACHE.get(cache_key)
         if cached_entry:
             ts, cached_data = cached_entry
@@ -502,6 +548,7 @@ def search_company():
         try:
             cached_search = (
                 CompanySearch.query.filter(
+                    CompanySearch.tenant_id == current_tenant_id,
                     (CompanySearch.normalized_name == normalized_name) |
                     (CompanySearch.company_name == display_title)
                 )
@@ -515,6 +562,8 @@ def search_company():
                 and (cached_search.total_processes or 0) > 0
                 and cached_search.is_recent(hours=24)
                 and cached_search.scan_status == "COMPLETED"
+                and (not browser_requested or ((cached_search.economic_standing or {})
+                     .get("browser_search_strategy", {}).get("cache_key") == cache_key))
             ):
                 logger.info("Curto-circuito Nível 1 ativado para '%s' (search_id=%d).", normalized_name, cached_search.id)
                 proc_dicts = [p.to_dict() for p in cached_search.processes]
@@ -526,6 +575,7 @@ def search_company():
                 res["desfechos_sentencas"] = cached_search.outcomes_summary or {}
                 res["ranking_motivos"] = cached_search.ranking_motivos or []
                 res["ranking_motivos_condenacao"] = cached_search.ranking_motivos_condenacao or []
+                res["condenacao_por_motivo"] = cached_search.condenacao_por_motivo or []
                 res["plus_previsao_condenacao"] = cached_search.predictions_summary or []
                 res["score_risco_terceirizacao"] = cached_search.overall_risk_score or 0.0
                 res["overall_risk_score"] = cached_search.overall_risk_score or 0.0
@@ -541,10 +591,12 @@ def search_company():
                     res["overall_risk_score"] = fresh_metrics["score_risco_terceirizacao"]
                     res["ranking_motivos"] = fresh_metrics.get("ranking_motivos", cached_search.ranking_motivos or [])
                     res["ranking_motivos_condenacao"] = fresh_metrics.get("ranking_motivos_condenacao", cached_search.ranking_motivos_condenacao or [])
+                    res["condenacao_por_motivo"] = fresh_metrics.get("condenacao_por_motivo", cached_search.condenacao_por_motivo or [])
                     res["probabilidade_condenacao_geral_pct"] = fresh_metrics.get("probabilidade_condenacao_geral_pct")
                     res["taxa_historica_condenacao_pct"] = fresh_metrics.get("taxa_historica_condenacao_pct")
                     cached_search.ranking_motivos = fresh_metrics.get("ranking_motivos", cached_search.ranking_motivos or [])
                     cached_search.ranking_motivos_condenacao = fresh_metrics.get("ranking_motivos_condenacao", cached_search.ranking_motivos_condenacao or [])
+                    cached_search.condenacao_por_motivo = fresh_metrics.get("condenacao_por_motivo", cached_search.condenacao_por_motivo or [])
                     cached_search.predictions_summary = fresh_metrics["plus_previsao_condenacao"]
                     cached_search.overall_risk_score = fresh_metrics["score_risco_terceirizacao"]
                 # Análise de Idoneidade Econômica & Risco de Calote Subsidiário (Súmula 331 TST)
@@ -555,6 +607,9 @@ def search_company():
                     p_condenacao_trabalhista=res.get("probabilidade_condenacao_geral_pct") or 0.0,
                     search_strategy=search_strategy,
                 )
+                saved_browser_strategy = (cached_search.economic_standing or {}).get("browser_search_strategy")
+                if saved_browser_strategy:
+                    econ_data = {**econ_data, "browser_search_strategy": saved_browser_strategy}
                 res["idoneidade_economica"] = econ_data
                 res["logo"] = econ_data.get("logo", {})
                 res["capital_social_consolidado"] = econ_data.get("valor_formatado") or econ_data.get("capital_social_formatado")
@@ -579,6 +634,9 @@ def search_company():
                 # Atualiza os dados de idoneidade no banco de dados para eliminar dados defasados
                 try:
                     cached_search.economic_standing = econ_data
+                    if econ_data and isinstance(econ_data, dict):
+                        cached_search.cnae_codigo = econ_data.get("cnae_codigo") or cached_search.cnae_codigo
+                        cached_search.cnae_descricao = econ_data.get("cnae_descricao") or cached_search.cnae_descricao
                     db.session.commit()
                 except Exception:
                     pass
@@ -647,6 +705,10 @@ def search_company():
 
         new_hash = fast_results.get("movements_hash")
         initial_status = fast_results.get("scan_status", "COMPLETED")
+        if browser_owned and fast_results.get("total_processos", 0) > 0:
+            initial_status = "BROWSER_PENDING" if browser_count > 100 else "COMPLETED"
+        else:
+            browser_owned = False
 
         # =====================================================================
         # CURTO-CIRCUITO NÍVEL 2 (Antes da IA): Invalidação inteligente por Hash
@@ -682,6 +744,8 @@ def search_company():
             discovered_entities=fast_results.get("discovered_entities", []),
             search_strategy=search_strategy,
         )
+        if browser_owned:
+            econ_data = {**econ_data, "browser_search_strategy": search_strategy}
         fast_results["idoneidade_economica"] = econ_data
         fast_results["logo"] = econ_data.get("logo", {})
         fast_results["capital_social_consolidado"] = econ_data.get("valor_formatado") or econ_data.get("capital_social_formatado")
@@ -713,8 +777,11 @@ def search_company():
                 outcomes_summary=fast_results.get("desfechos_sentencas", {}),
                 ranking_motivos=fast_results.get("ranking_motivos", []),
                 ranking_motivos_condenacao=fast_results.get("ranking_motivos_condenacao", []),
+                condenacao_por_motivo=fast_results.get("condenacao_por_motivo", []),
                 predictions_summary=fast_results.get("plus_previsao_condenacao", []),
                 economic_standing=econ_data,
+                cnae_codigo=econ_data.get("cnae_codigo") if isinstance(econ_data, dict) else None,
+                cnae_descricao=econ_data.get("cnae_descricao") if isinstance(econ_data, dict) else None,
                 overall_risk_score=fast_results.get("score_risco_terceirizacao", 0.0),
                 ai_analysis=fast_results.get("ai_analysis", {}),
                 movements_hash=new_hash,
@@ -739,6 +806,8 @@ def search_company():
                     observation=proc.get("observation"),
                     sentence_outcome=proc.get("sentence_outcome", "em_aberto"),
                     has_expert_report=proc.get("has_expert_report", False),
+                    data_distribuicao=proc.get("data_distribuicao"),
+                    valor_causa=proc.get("valor_causa"),
                     raw_metadata=proc.get("raw_metadata"),
                 )
                 db.session.add(record)
@@ -762,8 +831,12 @@ def search_company():
                 fast_results.get("processos", []),
             )
 
-        fast_results["scan_status"] = initial_status
-        SEARCH_CACHE[cache_key] = (time.time(), fast_results)
+        fast_results["scan_status"] = (
+            "BROWSER_PARTIAL" if browser_owned and not search_id else initial_status
+        )
+        # O estado provisório do navegador não deve sobreviver no cache L0.
+        if not browser_owned:
+            SEARCH_CACHE[cache_key] = (time.time(), fast_results)
         resp = jsonify(fast_results)
         if quota_header_val is not None:
             # Recalcula o saldo restante após a persistência da nova consulta
@@ -1270,6 +1343,16 @@ def search_companies_catalog():
         return jsonify(body), 500
 
 
+def _expire_browser_scan(search):
+    """Uma aba fechada ou conexão perdida não deixa a busca pendente indefinidamente."""
+    if (search.scan_status == "BROWSER_PENDING" and search.last_checked_at
+            and (get_utc_now() - search.last_checked_at).total_seconds() > 120):
+        CompanySearch.query.filter_by(id=search.id, scan_status="BROWSER_PENDING").update(
+            {CompanySearch.scan_status: "BROWSER_PARTIAL"}, synchronize_session=False)
+        db.session.commit()
+        db.session.refresh(search)
+
+
 @api_bp.route("/search_status/<int:search_id>", methods=["GET"])
 @api_bp.route("/search-status/<int:search_id>", methods=["GET"])
 def get_search_status(search_id: int):
@@ -1288,18 +1371,21 @@ def get_search_status(search_id: int):
             if not current_user or current_user.tenant_id != search.tenant_id:
                 return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
         
+        _expire_browser_scan(search)
         is_completed = search.scan_status == "COMPLETED"
+        is_terminal = is_completed or search.scan_status == "BROWSER_PARTIAL"
         response = {
             "search_id": search.id,
             "company_name": search.company_name,
             "scan_status": search.scan_status,
             "is_completed": is_completed,
+            "is_terminal": is_terminal,
             "total_processes": search.total_processes,
             "last_checked_at": search.last_checked_at.isoformat() if search.last_checked_at else None,
             "updated_at": search.updated_at.isoformat() if search.updated_at else None,
         }
         # Quando completado, retorna os dados atualizados para atualizar o dashboard sem reload
-        if is_completed:
+        if is_terminal:
             proc_dicts = [p.to_dict() for p in search.processes]
             response["data"] = search.to_dict()
             response["data"]["empresa"] = search.company_name
@@ -1312,6 +1398,7 @@ def get_search_status(search_id: int):
             response["data"]["desfechos_sentencas"] = search.outcomes_summary or {}
             response["data"]["ranking_motivos"] = search.ranking_motivos or []
             response["data"]["ranking_motivos_condenacao"] = search.ranking_motivos_condenacao or []
+            response["data"]["condenacao_por_motivo"] = search.condenacao_por_motivo or []
             response["data"]["plus_previsao_condenacao"] = search.predictions_summary or []
             response["data"]["score_risco_terceirizacao"] = search.overall_risk_score or 0.0
             response["data"]["overall_risk_score"] = search.overall_risk_score or 0.0
@@ -1325,6 +1412,7 @@ def get_search_status(search_id: int):
                 response["data"]["desfechos_sentencas"] = fresh_metrics.get("desfechos_sentencas", search.outcomes_summary)
                 response["data"]["ranking_motivos"] = fresh_metrics.get("ranking_motivos", search.ranking_motivos)
                 response["data"]["ranking_motivos_condenacao"] = fresh_metrics.get("ranking_motivos_condenacao", search.ranking_motivos_condenacao)
+                response["data"]["condenacao_por_motivo"] = fresh_metrics.get("condenacao_por_motivo", search.condenacao_por_motivo)
                 response["data"]["plus_previsao_condenacao"] = fresh_metrics.get("plus_previsao_condenacao", search.predictions_summary)
                 response["data"]["score_risco_terceirizacao"] = fresh_metrics.get("score_risco_terceirizacao", search.overall_risk_score)
                 response["data"]["overall_risk_score"] = fresh_metrics.get("score_risco_terceirizacao", search.overall_risk_score)
@@ -1368,7 +1456,9 @@ def incremental_sync(search_id: int):
                 "message": "Nenhuma alteração recente encontrada no CNJ."
             }), 200
 
-        delta_processes = orchestrator._enrich_with_datajud(processes_map, since_date=since_date)
+        delta_processes = orchestrator._enrich_with_datajud(
+            processes_map, since_date=since_date, company_search_id=search_id
+        )
         if not delta_processes:
             search.last_checked_at = get_utc_now()
             db.session.commit()
@@ -1440,16 +1530,19 @@ def ingest_deep_scan():
         return jsonify({"error": "Campo 'search_id' obrigatório e deve ser um número inteiro."}), 400
 
     items = data.get("items")
-    if items is None or not isinstance(items, list) or len(items) == 0:
+    browser_finished = data.get("browser_scan_finished") is True
+    if not isinstance(items, list) or (not items and not browser_finished):
         return jsonify({"error": "Campo 'items' obrigatório e deve ser uma lista não vazia."}), 400
 
     if len(items) > 2000:
         return jsonify({"error": "O lote de ingestão excede o limite máximo de 2.000 itens por requisição."}), 413
 
-    is_final_batch = bool(data.get("is_final_batch", True))
+    is_final_batch = data.get("is_final_batch", True)
+    if type(is_final_batch) is not bool:
+        return jsonify({"error": "is_final_batch deve ser booleano."}), 400
 
     try:
-        search = db.session.get(CompanySearch, search_id) if hasattr(db.session, "get") else CompanySearch.query.get(search_id)
+        search = db.session.get(CompanySearch, search_id, with_for_update=True)
         if not search:
             return jsonify({"error": f"Registro de busca ID {search_id} não encontrado."}), 404
 
@@ -1467,6 +1560,21 @@ def ingest_deep_scan():
 
             if tenant_val is not None and str(tenant_val) != str(req_tenant_id):
                 return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
+
+        # Para buscas reais vinculadas a uma organização, o JWT (não o header informado
+        # pelo cliente) é a autoridade de acesso.
+        if isinstance(search.tenant_id, int):
+            user = get_current_user_optional()
+            if not user or user.tenant_id != search.tenant_id:
+                return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
+
+        if browser_finished and (
+            search.scan_status not in ("BROWSER_PENDING", "BROWSER_PARTIAL", "COMPLETED")
+            or not (search.economic_standing or {}).get("browser_search_strategy")
+        ):
+            return jsonify({"error": "A busca não está sob paginação do navegador."}), 409
+        if search.scan_status in ("BROWSER_PENDING", "BROWSER_PARTIAL") and not browser_finished:
+            return jsonify({"error": "A conclusão da paginação do navegador deve ser informada."}), 409
 
         existing_records = {p.numero_processo: p for p in search.processes if p.numero_processo}
 
@@ -1532,6 +1640,8 @@ def ingest_deep_scan():
                 observation=obs,
                 sentence_outcome=outcome,
                 has_expert_report=has_expert,
+                data_distribuicao=parsed_proc.get("data_distribuicao"),
+                valor_causa=parsed_proc.get("valor_causa"),
                 raw_metadata=parsed_proc,
             )
             new_records.append(record)
@@ -1540,7 +1650,7 @@ def ingest_deep_scan():
         if new_records:
             for i in range(0, len(new_records), 50):
                 db.session.bulk_save_objects(new_records[i : i + 50])
-                db.session.commit()
+            db.session.flush()
 
         # Recarrega a totalidade dos processos consolidados (100% da base sem truncamentos)
         all_processes = ProcessRecord.query.filter_by(company_search_id=search.id).all()
@@ -1556,11 +1666,16 @@ def ingest_deep_scan():
         fresh_metrics = orchestrator.predictor.generate_dashboard_metrics(search.company_name, proc_dicts)
 
         p_cond = fresh_metrics.get("probabilidade_condenacao_geral_pct") or fresh_metrics.get("score_risco_terceirizacao") or 0.0
+        browser_strategy = (search.economic_standing or {}).get("browser_search_strategy")
         econ_data = economic_service.evaluate_economic_standing(
             company_name=search.company_name,
             company_processes=proc_dicts,
             p_condenacao_trabalhista=p_cond,
+            **({"cnpj": browser_strategy.get("target_cnpj"), "search_strategy": browser_strategy}
+               if browser_strategy else {}),
         )
+        if browser_strategy:
+            econ_data = {**econ_data, "browser_search_strategy": browser_strategy}
 
         ai_payload = {**fresh_metrics, "empresa": search.company_name, "processos": proc_dicts}
         ai_res = orchestrator.ai_analyzer.analyze_company(ai_payload)
@@ -1572,17 +1687,28 @@ def ingest_deep_scan():
         search.outcomes_summary = fresh_metrics.get("desfechos_sentencas", {})
         search.ranking_motivos = fresh_metrics.get("ranking_motivos", [])
         search.ranking_motivos_condenacao = fresh_metrics.get("ranking_motivos_condenacao", [])
+        search.condenacao_por_motivo = fresh_metrics.get("condenacao_por_motivo", [])
         search.predictions_summary = fresh_metrics.get("plus_previsao_condenacao", [])
         search.overall_risk_score = fresh_metrics.get("score_risco_terceirizacao", 0.0)
         search.economic_standing = econ_data
+        if econ_data and isinstance(econ_data, dict):
+            search.cnae_codigo = econ_data.get("cnae_codigo") or search.cnae_codigo
+            search.cnae_descricao = econ_data.get("cnae_descricao") or search.cnae_descricao
         search.ai_analysis = ai_res
-        search.scan_status = "COMPLETED" if is_final_batch else "PARTIAL_FAST_PATH"
+        if browser_finished:
+            if search.scan_status != "COMPLETED":
+                search.scan_status = "COMPLETED" if is_final_batch else "BROWSER_PARTIAL"
+        else:
+            search.scan_status = "COMPLETED" if is_final_batch else "PARTIAL_FAST_PATH"
         search.movements_hash = generate_movements_hash(proc_dicts)
         search.last_checked_at = get_utc_now()
         db.session.commit()
 
-        cache_key = search.normalized_name.upper()
-        SEARCH_CACHE[cache_key] = (time.time(), search.to_dict())
+        # Invalida as chaves reais de busca que apontam para este ID, sem criar
+        # uma chave incompatível com STRICT_CNPJ/BROAD_BRAND.
+        for cache_key, (_, cached) in list(SEARCH_CACHE.items()):
+            if cached.get("search_id", cached.get("id")) == search.id:
+                SEARCH_CACHE.pop(cache_key, None)
         _prune_search_cache_if_needed()
 
         condenacoes = search.outcomes_summary.get("condenacoes", 0) if search.outcomes_summary else 0
@@ -1608,66 +1734,141 @@ def ingest_deep_scan():
         return jsonify({"error": f"Erro interno ao processar ingestão: {str(exc)}"}), 500
 
 
-@api_bp.route("/searches/<int:search_id>/processes", methods=["GET"])
-def get_search_processes(search_id: int):
+@api_bp.route("/searches/<int:company_search_id>/processes", methods=["GET"])
+@api_bp.route("/searches/<int:company_search_id>/processes/", methods=["GET"])
+def get_search_processes(company_search_id: int):
     """
     Retorna a listagem paginada e filtrada dos processos consolidados de uma empresa.
+    Endpoint: GET /api/v1/searches/{company_search_id}/processes
     Query parameters:
-    - page: int (padrão 1)
-    - per_page: int (padrão 20, máximo 100)
-    - tribunal: string opcional (ex: TRT2, TST)
+    - page: int (padrão 1, >= 1)
+    - per_page: int (padrão 50, máximo 100)
+    - tribunal: string opcional normalizada (ex: TRT6, TST)
+    - date_from: data ISO YYYY-MM-DD
+    - date_to: data ISO YYYY-MM-DD
+    - min_value: float/decimal >= 0
+    - max_value: float/decimal >= 0
     - outcome: string opcional (condenacao, acordo, improcedente, em_aberto)
     - search: string opcional (busca textual por CNJ, assunto ou observação)
     """
     try:
-        search = db.session.get(CompanySearch, search_id) if hasattr(db.session, "get") else CompanySearch.query.get(search_id)
+        search = (
+            db.session.get(CompanySearch, company_search_id)
+            if hasattr(db.session, "get")
+            else CompanySearch.query.get(company_search_id)
+        )
         if not search:
-            return jsonify({"error": f"Pesquisa ID {search_id} não encontrada."}), 404
+            return jsonify({"error": f"Pesquisa ID {company_search_id} não encontrada."}), 404
 
-        req_tenant_id = getattr(g, "tenant_id", None)
-        if req_tenant_id is None and request.headers.get("X-Tenant-ID"):
-            req_tenant_id = request.headers.get("X-Tenant-ID")
+        # Anti-IDOR Obrigatório: Se a busca pertencer a um tenant específico, valida permissão estrita
+        current_user = get_current_user_optional()
+        req_tenant_id = getattr(g, "tenant_id", None) or request.headers.get("X-Tenant-ID")
 
-        if req_tenant_id is not None:
-            rec_tenant_id = getattr(CompanySearch, "tenant_id", None)
-            if isinstance(rec_tenant_id, (int, str)):
-                tenant_val = rec_tenant_id
+        rec_tenant_id = getattr(CompanySearch, "tenant_id", None)
+        if isinstance(rec_tenant_id, (int, str)):
+            tenant_val = rec_tenant_id
+        else:
+            tenant_val = getattr(search, "tenant_id", None)
+
+        if tenant_val is not None:
+            if current_user:
+                if str(current_user.tenant_id) != str(tenant_val):
+                    return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
+            elif req_tenant_id is not None:
+                if str(tenant_val) != str(req_tenant_id):
+                    return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
             else:
-                tenant_val = getattr(search, "tenant_id", None)
-
-            if tenant_val is not None and str(tenant_val) != str(req_tenant_id):
                 return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
 
+        # Paginação sanitizada: page (default 1, >= 1) e per_page (default 50, teto 100)
         try:
-            page = max(1, int(request.args.get("page", 1)))
+            page = int(request.args.get("page", 1))
+            if page < 1:
+                page = 1
         except (ValueError, TypeError):
             page = 1
 
         try:
-            per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+            per_page = int(request.args.get("per_page", 50))
+            if per_page < 1:
+                per_page = 50
+            per_page = min(100, per_page)
         except (ValueError, TypeError):
-            per_page = 20
+            per_page = 50
 
         query = ProcessRecord.query.filter_by(company_search_id=search.id)
 
+        # Filtro: tribunal (normalizado case-insensitive e flexível)
         tribunal = request.args.get("tribunal")
         if tribunal and tribunal.strip():
-            query = query.filter(ProcessRecord.tribunal.ilike(f"%{tribunal.strip()}%"))
+            t_raw = tribunal.strip()
+            norm_t = normalize_court_code(t_raw)
+            clauses = [ProcessRecord.tribunal.ilike(f"%{t_raw}%")]
+            if norm_t:
+                clauses.append(ProcessRecord.tribunal.ilike(f"%{norm_t}%"))
+                clauses.append(ProcessRecord.tribunal == norm_t)
+            query = query.filter(db.or_(*clauses))
 
+        # Filtros de data: date_from e date_to (ISO YYYY-MM-DD)
+        date_from = request.args.get("date_from")
+        if date_from and date_from.strip():
+            try:
+                d_from = datetime.strptime(date_from.strip(), "%Y-%m-%d").date()
+                query = query.filter(ProcessRecord.data_distribuicao >= d_from)
+            except ValueError:
+                return jsonify({"error": "Formato de data inválido para 'date_from'. Utilize YYYY-MM-DD."}), 400
+
+        date_to = request.args.get("date_to")
+        if date_to and date_to.strip():
+            try:
+                d_to = datetime.strptime(date_to.strip(), "%Y-%m-%d").date()
+                query = query.filter(ProcessRecord.data_distribuicao <= d_to)
+            except ValueError:
+                return jsonify({"error": "Formato de data inválido para 'date_to'. Utilize YYYY-MM-DD."}), 400
+
+        # Filtros de valor da causa: min_value e max_value (>= 0)
+        min_value = request.args.get("min_value")
+        if min_value is not None and str(min_value).strip() != "":
+            try:
+                mv = float(str(min_value).strip())
+                if mv < 0:
+                    return jsonify({"error": "'min_value' deve ser maior ou igual a zero."}), 400
+                query = query.filter(ProcessRecord.valor_causa >= mv)
+            except (ValueError, TypeError):
+                return jsonify({"error": "'min_value' deve ser um valor numérico válido."}), 400
+
+        max_value = request.args.get("max_value")
+        if max_value is not None and str(max_value).strip() != "":
+            try:
+                xv = float(str(max_value).strip())
+                if xv < 0:
+                    return jsonify({"error": "'max_value' deve ser maior ou igual a zero."}), 400
+                query = query.filter(ProcessRecord.valor_causa <= xv)
+            except (ValueError, TypeError):
+                return jsonify({"error": "'max_value' deve ser um valor numérico válido."}), 400
+
+        # Filtro: outcome (desfecho/status mapeado)
         outcome = request.args.get("outcome")
         if outcome and outcome.strip():
             o = outcome.strip().lower()
             if o in ("condenacao", "condenacoes", "condenação", "condenações"):
-                query = query.filter(ProcessRecord.sentence_outcome.in_(["condenacoes", "condenacao"]))
+                query = query.filter(
+                    ProcessRecord.sentence_outcome.in_([
+                        "condenacoes", "condenacao", "procedencia_total", "procedencia_parcial"
+                    ])
+                )
             elif o in ("acordo", "acordos"):
-                query = query.filter(ProcessRecord.sentence_outcome.in_(["acordos", "acordo"]))
+                query = query.filter(ProcessRecord.sentence_outcome.in_(["acordos", "acordo", "acordo_homologado"]))
             elif o in ("improcedente", "improcedentes"):
                 query = query.filter(ProcessRecord.sentence_outcome.in_(["improcedentes", "improcedente"]))
             elif o in ("em_aberto", "aberto"):
                 query = query.filter(ProcessRecord.sentence_outcome.in_(["em_aberto", "aberto"]))
+            elif o in ("extintos_sem_merito", "extinto_sem_merito", "extincao"):
+                query = query.filter(ProcessRecord.sentence_outcome.in_(["extintos_sem_merito", "extinto_sem_merito"]))
             else:
                 query = query.filter(ProcessRecord.sentence_outcome == o)
 
+        # Filtro opcional de busca textual
         search_query = request.args.get("search")
         if search_query and search_query.strip():
             sq = f"%{search_query.strip()}%"
@@ -1680,20 +1881,24 @@ def get_search_processes(search_id: int):
             )
 
         total_matches = query.count()
-        total_pages = max(1, math.ceil(total_matches / per_page))
+        total_pages = max(1, math.ceil(total_matches / per_page)) if total_matches > 0 else 1
         offset = (page - 1) * per_page
         records = query.order_by(ProcessRecord.id.asc()).offset(offset).limit(per_page).all()
 
-        processes_data = [
+        items = [
             {
                 "id": r.id,
                 "numero_processo": r.numero_processo,
                 "tribunal": r.tribunal,
                 "grau": r.grau,
+                "data_distribuicao": r.data_distribuicao.isoformat() if r.data_distribuicao else None,
+                "valor_causa": float(r.valor_causa) if r.valor_causa is not None else None,
                 "primary_subject": r.primary_subject,
+                "primary_subject_code": r.primary_subject_code,
+                "subjects": r.subjects_json or [],
+                "observation": r.observation,
                 "sentence_outcome": r.sentence_outcome,
                 "has_expert_report": r.has_expert_report,
-                "observation": r.observation,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             }
             for r in records
@@ -1705,12 +1910,14 @@ def get_search_processes(search_id: int):
             "page": page,
             "per_page": per_page,
             "total": total_matches,
+            "pages": total_pages,
             "total_pages": total_pages,
-            "processes": processes_data,
+            "items": items,
+            "processes": items,
         }), 200
 
     except Exception as exc:
-        logger.exception("Erro ao listar processos da busca ID %d: %s", search_id, exc)
+        logger.exception("Erro ao listar processos da busca ID %d: %s", company_search_id, exc)
         return jsonify({"error": f"Erro interno ao listar processos: {str(exc)}"}), 500
 
 
@@ -1807,6 +2014,7 @@ def get_search_detail(search_id: int):
             logger.error("Erro ao deletar search_id %d: %s", search_id, exc)
             return jsonify({"error": "Falha ao remover o registro."}), 500
     try:
+        _expire_browser_scan(search)
         proc_dicts = [p.to_dict() for p in search.processes]
         result = search.to_dict()
         result["empresa"] = search.company_name
@@ -1818,6 +2026,7 @@ def get_search_detail(search_id: int):
             result["plus_previsao_condenacao"] = fresh_metrics["plus_previsao_condenacao"]
             result["score_risco_terceirizacao"] = fresh_metrics["score_risco_terceirizacao"]
             result["ranking_motivos_condenacao"] = fresh_metrics.get("ranking_motivos_condenacao", [])
+            result["condenacao_por_motivo"] = fresh_metrics.get("condenacao_por_motivo", search.condenacao_por_motivo or [])
             result["previsao_bloqueada"] = fresh_metrics.get("previsao_bloqueada", False)
             result["motivo_bloqueio_previsao"] = fresh_metrics.get("motivo_bloqueio_previsao")
         result["parecer_agente_adk"] = result.get("ai_analysis", {})
@@ -1965,10 +2174,10 @@ def compare_companies():
             target_cnpj = strat.get("target_cnpj")
 
             fast_res = orchestrator.analyze_company_by_name(
-                company_name=q_term,
-                target_cnpj=target_cnpj,
-                max_items_first_page=50,
+                company_name=d_title,
                 search_strategy=strat,
+                fast_path=True,
+                limit_processes=50,
             )
             fast_res["empresa"] = d_title
             fast_res["is_broad_brand"] = strat.get("is_broad_brand", False)
@@ -1982,6 +2191,15 @@ def compare_companies():
                 search_strategy=strat,
             )
             fast_res["idoneidade_economica"] = econ
+            fast_res["logo"] = econ.get("logo", {})
+            if econ.get("cnpj_utilizado"):
+                fast_res["cnpj"] = econ.get("cnpj_utilizado")
+            elif target_cnpj:
+                fast_res["cnpj"] = target_cnpj
+            if econ.get("risco_calote_subsidiario") is not None:
+                fast_res["risco_subsidiario"] = econ["risco_calote_subsidiario"]
+            elif econ.get("indice_exposicao_financeira") is not None:
+                fast_res["risco_subsidiario"] = econ["indice_exposicao_financeira"]
             if econ.get("indice_exposicao_financeira") is not None:
                 fast_res["indice_exposicao_financeira"] = econ["indice_exposicao_financeira"]
                 fast_res["score_risco_terceirizacao"] = econ["indice_exposicao_financeira"]
@@ -2055,6 +2273,11 @@ def _search_record_to_pdf_payload(search: CompanySearch) -> dict:
     result["desfechos_sentencas"] = search.outcomes_summary or {}
     result["ranking_motivos"] = search.ranking_motivos or []
     result["ranking_motivos_condenacao"] = search.ranking_motivos_condenacao or []
+    result["condenacao_por_motivo"] = (
+        search.condenacao_por_motivo
+        if search.condenacao_por_motivo is not None
+        else result.get("condenacao_por_motivo", [])
+    )
     result["plus_previsao_condenacao"] = search.predictions_summary or []
     result["score_risco_terceirizacao"] = search.overall_risk_score or 0.0
     result["overall_risk_score"] = search.overall_risk_score or 0.0
@@ -2062,6 +2285,8 @@ def _search_record_to_pdf_payload(search: CompanySearch) -> dict:
         result["idoneidade_economica"] = search.economic_standing
         if search.economic_standing.get("indice_exposicao_financeira") is not None:
             result["indice_exposicao_financeira"] = search.economic_standing["indice_exposicao_financeira"]
+        if search.economic_standing.get("risco_calote_subsidiario") is not None:
+            result["risco_subsidiario"] = search.economic_standing["risco_calote_subsidiario"]
     result["parecer_agente_adk"] = result.get("ai_analysis") or {}
     return result
 
@@ -2339,6 +2564,7 @@ def handle_pdf_export_request(
         "desfechos_sentencas": {"condenacoes": 0, "acordos": 0, "improcedentes": 0, "em_aberto": 0},
         "ranking_motivos": [],
         "ranking_motivos_condenacao": [],
+        "condenacao_por_motivo": [],
         "plus_previsao_condenacao": [],
         "indice_exposicao_financeira": econ_data.get("indice_exposicao_financeira", 0.0),
         "score_risco_terceirizacao": econ_data.get("indice_exposicao_financeira", 0.0),
@@ -2488,17 +2714,26 @@ def cnj_proxy():
 
     expected_secret = (os.getenv("PROXY_SHARED_SECRET") or os.getenv("CNJ_PROXY_SECRET") or "").strip()
     if expected_secret:
-        auth_header = flask_req.headers.get("Authorization", "").strip()
-        bearer_secret = auth_header[7:].strip() if auth_header.startswith("Bearer ") else auth_header
-        provided_secret = (flask_req.headers.get("x-proxy-secret") or bearer_secret or "").strip()
-        if not hmac.compare_digest(provided_secret, expected_secret):
+        provided_secret = (flask_req.headers.get("x-proxy-secret") or "").strip()
+        auth_header = (flask_req.headers.get("Authorization") or "").strip()
+        if not provided_secret and auth_header.startswith("Bearer "):
+            provided_secret = auth_header[7:].strip()
+        if not provided_secret or not hmac.compare_digest(provided_secret, expected_secret):
             return jsonify({"error": "Unauthorized proxy access"}), 401
-    else:
-        logger.warning("[Proxy Warning] PROXY_SHARED_SECRET não configurado. Modo aberto para desenvolvimento.")
 
     target_url = flask_req.args.get("target") or flask_req.headers.get("X-Target-Url")
     if not target_url:
         return jsonify({"error": "Missing target URL"}), 400
+
+    from urllib.parse import urlparse
+    parsed_target = urlparse(target_url)
+    allowed_hosts = {
+        "comunicaapi.pje.jus.br",
+        "api-publica.datajud.cnj.jus.br",
+        "api.portaldatransparencia.gov.br",
+    }
+    if parsed_target.scheme != "https" or parsed_target.hostname not in allowed_hosts:
+        return jsonify({"error": "Host not allowed by proxy whitelist"}), 400
 
     try:
         from app.utils.http_client import request_gov_br_with_fallback
@@ -2511,3 +2746,290 @@ def cnj_proxy():
         return resp
     except Exception as exc:
         return jsonify({"error": str(exc)}), 502
+
+
+# ============================================================================
+# US-09: Rotas de Monitoramento Contínuo de Fornecedores Homologados
+# ============================================================================
+
+@api_bp.route("/monitoring", methods=["POST"])
+@require_auth
+def create_monitored_supplier() -> Response:
+    """
+    Ativa o monitoramento contínuo para um fornecedor homologado no tenant autenticado.
+    Inicializa o baseline snapshot (movements_hash, condenacoes, cenario, status RFB, TST)
+    a partir da última busca homologada do tenant ou parâmetros recebidos.
+    """
+    current_user = g.current_user
+    tenant_id = current_user.tenant_id
+
+    data = request.get_json(silent=True) or {}
+    raw_cnpj = str(data.get("cnpj") or "").strip()
+    clean_cnpj = re.sub(r"\D", "", raw_cnpj)
+    if len(clean_cnpj) != 14:
+        return jsonify({"error": "CNPJ inválido. Forneça um CNPJ com 14 dígitos numéricos."}), 400
+
+    # Proteção Anti-SSRF para webhook_url
+    webhook_url = data.get("webhook_url")
+    if webhook_url:
+        is_testing = current_app.config.get("TESTING", False)
+        valid_wh, wh_err = validate_webhook_url(str(webhook_url).strip(), allow_local_for_testing=is_testing)
+        if not valid_wh:
+            return jsonify({"error": wh_err or "URL de webhook inválida ou insegura."}), 400
+
+    # Validação de formato de e-mail de alerta
+    alert_email = data.get("alert_email")
+    if alert_email:
+        if not validate_alert_email(str(alert_email).strip()):
+            return jsonify({"error": "Endereço de e-mail de alerta inválido."}), 400
+
+    # Verifica unicidade no tenant (uq_monitored_suppliers_tenant_cnpj)
+    existing = MonitoredSupplier.query.filter_by(tenant_id=tenant_id, cnpj=clean_cnpj).first()
+    if existing:
+        return jsonify({
+            "error": "Fornecedor já cadastrado para monitoramento neste tenant.",
+            "supplier": existing.to_dict(),
+        }), 409
+
+    # Busca baseline na última pesquisa homologada da empresa
+    search = (
+        CompanySearch.query.filter_by(tenant_id=tenant_id)
+        .filter(CompanySearch.normalized_name.like(f"%{clean_cnpj}%") | CompanySearch.company_name.like(f"%{clean_cnpj}%"))
+        .order_by(CompanySearch.created_at.desc())
+        .first()
+    )
+    if not search:
+        search = (
+            CompanySearch.query
+            .filter(CompanySearch.normalized_name.like(f"%{clean_cnpj}%") | CompanySearch.company_name.like(f"%{clean_cnpj}%"))
+            .order_by(CompanySearch.created_at.desc())
+            .first()
+        )
+
+    company_name = str(data.get("company_name") or "").strip()
+    if not company_name and search:
+        company_name = search.company_name
+    if not company_name:
+        company_name = f"Fornecedor {clean_cnpj}"
+
+    # Snapshot inicial determinístico
+    if search:
+        last_movements_hash = search.movements_hash
+        last_condenacoes_count = (search.outcomes_summary or {}).get("condenacoes", 0)
+        econ = search.economic_standing or {}
+        last_scenario = econ.get("cenario") or ("CENARIO_A" if (search.overall_risk_score or 0) < 50 else "CENARIO_B")
+        last_rfb_status = econ.get("situacao") or econ.get("situacao_cadastral") or "ATIVA"
+        last_tst_count = sum(1 for p in (search.processes or []) if (getattr(p, "tribunal", None) or getattr(p, "court", None) or "").upper() == "TST")
+    else:
+        last_movements_hash = None
+        last_condenacoes_count = 0
+        last_scenario = "CENARIO_A"
+        last_rfb_status = "ATIVA"
+        last_tst_count = 0
+
+    # Permite sobrescrita explícita de baseline caso enviada (ex: testes ou carga inicial)
+    if "last_movements_hash" in data:
+        last_movements_hash = data.get("last_movements_hash")
+    if "last_condenacoes_count" in data:
+        try:
+            last_condenacoes_count = int(data.get("last_condenacoes_count", 0))
+        except (ValueError, TypeError):
+            pass
+    if "last_scenario" in data:
+        last_scenario = str(data.get("last_scenario") or "CENARIO_A")
+    if "last_rfb_status" in data:
+        last_rfb_status = str(data.get("last_rfb_status") or "ATIVA")
+    if "last_tst_count" in data:
+        try:
+            last_tst_count = int(data.get("last_tst_count", 0))
+        except (ValueError, TypeError):
+            pass
+
+    active = bool(data.get("active", True))
+
+    try:
+        supplier = MonitoredSupplier(
+            tenant_id=tenant_id,
+            cnpj=clean_cnpj,
+            company_name=company_name,
+            last_movements_hash=last_movements_hash,
+            last_condenacoes_count=last_condenacoes_count,
+            last_scenario=last_scenario,
+            last_rfb_status=str(last_rfb_status).upper() if last_rfb_status else "ATIVA",
+            last_tst_count=last_tst_count,
+            webhook_url=str(webhook_url).strip() if webhook_url else None,
+            alert_email=str(alert_email).strip() if alert_email else None,
+            active=active,
+            last_checked_at=get_utc_now(),
+        )
+        db.session.add(supplier)
+        db.session.commit()
+
+        logger.info(
+            "Fornecedor cadastrado para monitoramento: id=%d, tenant=%d, cnpj=%s",
+            supplier.id, tenant_id, clean_cnpj
+        )
+        return jsonify({
+            "status": "success",
+            "message": "Fornecedor homologado ativado para monitoramento contínuo.",
+            "supplier": supplier.to_dict(),
+        }), 201
+
+    except Exception as exc:
+        db.session.rollback()
+        logger.exception("Falha ao registrar fornecedor monitorado: %s", exc)
+        return jsonify({"error": "Falha interna ao cadastrar fornecedor monitorado."}), 500
+
+
+@api_bp.route("/monitoring", methods=["GET"])
+@require_auth
+def list_monitored_suppliers() -> Response:
+    """
+    Lista fornecedores monitorados do tenant autenticado com suporte a paginação e filtro por active.
+    Anti-IDOR estrito: retorna única e exclusivamente registros do tenant autenticado.
+    """
+    current_user = g.current_user
+    tenant_id = current_user.tenant_id
+
+    page = max(1, int(request.args.get("page", 1)))
+    per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+    active_param = request.args.get("active")
+
+    query = MonitoredSupplier.query.filter_by(tenant_id=tenant_id)
+    if active_param is not None:
+        is_active = str(active_param).lower() in ("true", "1", "yes")
+        query = query.filter_by(active=is_active)
+
+    total = query.count()
+    suppliers = (
+        query.order_by(MonitoredSupplier.created_at.desc())
+        .offset((page - 1) * per_page)
+        .limit(per_page)
+        .all()
+    )
+
+    return jsonify({
+        "status": "success",
+        "suppliers": [s.to_dict() for s in suppliers],
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+    }), 200
+
+
+@api_bp.route("/monitoring/<int:monitoring_id>", methods=["PATCH"])
+@require_auth
+def update_monitored_supplier(monitoring_id: int) -> Response:
+    """
+    Atualiza status (active), canais de alerta (webhook_url, alert_email) ou razão social.
+    Garante Anti-IDOR: validação obrigatória de tenant_id.
+    """
+    current_user = g.current_user
+    tenant_id = current_user.tenant_id
+
+    supplier = db.session.get(MonitoredSupplier, monitoring_id)
+    if not supplier:
+        return jsonify({"error": "Fornecedor monitorado não encontrado."}), 404
+
+    # Anti-IDOR
+    if supplier.tenant_id != tenant_id:
+        return jsonify({"error": "Acesso negado: fornecedor pertence a outra organização."}), 403
+
+    data = request.get_json(silent=True) or {}
+
+    # Atualização de active
+    if "active" in data:
+        supplier.active = bool(data["active"])
+
+    # Atualização de webhook_url com validação SSRF
+    if "webhook_url" in data:
+        wh = data["webhook_url"]
+        if wh:
+            is_testing = current_app.config.get("TESTING", False)
+            valid_wh, wh_err = validate_webhook_url(str(wh).strip(), allow_local_for_testing=is_testing)
+            if not valid_wh:
+                return jsonify({"error": wh_err or "URL de webhook inválida ou insegura."}), 400
+            supplier.webhook_url = str(wh).strip()
+        else:
+            supplier.webhook_url = None
+
+    # Atualização de alert_email com validação de formato
+    if "alert_email" in data:
+        em = data["alert_email"]
+        if em:
+            if not validate_alert_email(str(em).strip()):
+                return jsonify({"error": "Endereço de e-mail de alerta inválido."}), 400
+            supplier.alert_email = str(em).strip()
+        else:
+            supplier.alert_email = None
+
+    # Atualização de company_name se fornecido
+    if "company_name" in data:
+        cn = str(data["company_name"] or "").strip()
+        if cn:
+            supplier.company_name = cn
+
+    supplier.updated_at = get_utc_now()
+    try:
+        db.session.commit()
+        return jsonify({
+            "status": "success",
+            "message": "Fornecedor monitorado atualizado com sucesso.",
+            "supplier": supplier.to_dict(),
+        }), 200
+    except Exception as exc:
+        db.session.rollback()
+        logger.exception("Erro ao atualizar fornecedor monitorado id=%d: %s", monitoring_id, exc)
+        return jsonify({"error": "Falha interna ao atualizar fornecedor monitorado."}), 500
+
+
+@api_bp.route("/monitoring/<int:monitoring_id>", methods=["DELETE"])
+@require_auth
+def delete_monitored_supplier(monitoring_id: int) -> Response:
+    """
+    Remove fornecedor do monitoramento contínuo.
+    Garante Anti-IDOR: validação obrigatória de tenant_id.
+    """
+    current_user = g.current_user
+    tenant_id = current_user.tenant_id
+
+    supplier = db.session.get(MonitoredSupplier, monitoring_id)
+    if not supplier:
+        return jsonify({"error": "Fornecedor monitorado não encontrado."}), 404
+
+    # Anti-IDOR
+    if supplier.tenant_id != tenant_id:
+        return jsonify({"error": "Acesso negado: fornecedor pertence a outra organização."}), 403
+
+    try:
+        db.session.delete(supplier)
+        db.session.commit()
+        logger.info("Fornecedor removido do monitoramento: id=%d, tenant=%d", monitoring_id, tenant_id)
+        return jsonify({
+            "status": "success",
+            "message": "Fornecedor removido do monitoramento com sucesso.",
+        }), 200
+    except Exception as exc:
+        db.session.rollback()
+        logger.exception("Erro ao remover fornecedor monitorado id=%d: %s", monitoring_id, exc)
+        return jsonify({"error": "Falha interna ao remover fornecedor monitorado."}), 500
+
+
+@api_bp.route("/monitoring/run", methods=["POST"])
+@require_auth
+def trigger_monitoring_job() -> Response:
+    """
+    Endpoint administrativo para disparar a execução manual ou sob demanda do job de monitoramento
+    para o tenant autenticado (ou todos os tenants caso admin).
+    """
+    from app.services.monitoring_job import run_monitoring_job
+
+    current_user = g.current_user
+    data = request.get_json(silent=True) or {}
+    batch_size = min(50, max(1, int(data.get("batch_size", 10))))
+
+    # Tenant isolation: se usuário não for admin global, executa apenas para o seu próprio tenant
+    tenant_filter = current_user.tenant_id if current_user.role != "ADMIN" else data.get("tenant_id", current_user.tenant_id)
+
+    summary = run_monitoring_job(batch_size=batch_size, tenant_id=tenant_filter)
+    return jsonify(summary), 200
