@@ -14,7 +14,7 @@ redis>=5.0.0
 
 # Configurações & Validação
 python-dotenv>=1.0.1
-pydantic>=2.6.4
+pydantic>=2.14.4
 PyJWT>=2.8.0
 
 # Geração de Relatórios Executivos em PDF
