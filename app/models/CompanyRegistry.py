@@ -19,6 +19,9 @@ class CompanyRegistry(db.Model):
 
     capital_social = db.Column(db.Numeric(15, 2), nullable=True)
 
+    cnae_codigo = db.Column(db.String(20), nullable=True, index=True)
+    cnae_descricao = db.Column(db.String(255), nullable=True)
+
     created_at = db.Column(db.DateTime, default=get_utc_now, nullable=False)
     updated_at = db.Column(
         db.DateTime,
@@ -26,3 +29,20 @@ class CompanyRegistry(db.Model):
         onupdate=get_utc_now,
         nullable=False
     )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "cnpj": self.cnpj,
+            "razao_social": self.razao_social,
+            "nome_fantasia": self.nome_fantasia,
+            "situacao_cadastral": self.situacao_cadastral,
+            "matriz_filial": self.matriz_filial,
+            "municipio": self.municipio,
+            "uf": self.uf,
+            "capital_social": float(self.capital_social) if self.capital_social is not None else None,
+            "cnae_codigo": self.cnae_codigo,
+            "cnae_descricao": self.cnae_descricao,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }

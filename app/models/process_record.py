@@ -33,6 +33,10 @@ class ProcessRecord(db.Model):
     sentence_outcome = db.Column(db.String(50), default="em_aberto", nullable=False, index=True)
     has_expert_report = db.Column(db.Boolean, default=False, nullable=False)
 
+    # Metadados Processuais Avançados (DataJud / PJe)
+    data_distribuicao = db.Column(db.Date, nullable=True, index=True)
+    valor_causa = db.Column(db.Numeric(15, 2), nullable=True)
+
     # Armazena metadados brutos do Elasticsearch / PJe para rastreabilidade
     raw_metadata = db.Column(db.JSON, nullable=True)
 
@@ -45,6 +49,8 @@ class ProcessRecord(db.Model):
             "tribunal": self.tribunal,
             "grau": self.grau,
             "nivel_sigilo": self.nivel_sigilo,
+            "data_distribuicao": self.data_distribuicao.isoformat() if hasattr(self.data_distribuicao, "isoformat") else (str(self.data_distribuicao) if self.data_distribuicao else None),
+            "valor_causa": float(self.valor_causa) if self.valor_causa is not None else None,
             "primary_subject": self.primary_subject,
             "primary_subject_code": self.primary_subject_code,
             "subjects": self.subjects_json or [],

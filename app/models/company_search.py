@@ -39,6 +39,10 @@ class CompanySearch(db.Model):
     overall_risk_score = db.Column(db.Float, default=0.0, nullable=False)
     ai_analysis = db.Column(db.JSON, nullable=True)
 
+    # Metadados Cadastrais RFB (CNAE Principal)
+    cnae_codigo = db.Column(db.String(20), nullable=True, index=True)
+    cnae_descricao = db.Column(db.String(255), nullable=True)
+
     created_at = db.Column(db.DateTime, default=get_utc_now, nullable=False)
     updated_at = db.Column(db.DateTime, default=get_utc_now, onupdate=get_utc_now, nullable=False)
 
@@ -119,6 +123,12 @@ class CompanySearch(db.Model):
             "probabilidade_condenacao_geral_pct": prob_cond_shrunk,
             "taxa_historica_condenacao_pct": taxa_cond_empirica,
             "score_risco_terceirizacao": self.overall_risk_score,
+            "cnae_codigo": self.cnae_codigo,
+            "cnae_descricao": self.cnae_descricao,
+            "cnae": {
+                "codigo": self.cnae_codigo,
+                "descricao": self.cnae_descricao,
+            },
             "idoneidade_economica": econ_data,
             "logo": self._sanitize_logo_for_export(econ_data.get("logo", {}) if isinstance(econ_data, dict) else {}),
             "ai_analysis": self.ai_analysis or {},

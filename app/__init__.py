@@ -100,9 +100,19 @@ def create_app(config_name: str = None) -> Flask:
                     conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS ai_analysis JSON;"))
                     conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS economic_standing JSON;"))
                     conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS ranking_motivos_condenacao JSON;"))
+                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS cnae_codigo VARCHAR(20);"))
+                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS cnae_descricao VARCHAR(255);"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_company_searches_cnae_codigo ON company_searches (cnae_codigo);"))
+                    conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS cnae_codigo VARCHAR(20);"))
+                    conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS cnae_descricao VARCHAR(255);"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_company_registry_cnae_codigo ON company_registry (cnae_codigo);"))
                     conn.execute(db.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS observation VARCHAR(500);"))
                     conn.execute(db.text("ALTER TABLE process_records ALTER COLUMN grau TYPE VARCHAR(50);"))
                     conn.execute(db.text("ALTER TABLE process_records ALTER COLUMN tribunal TYPE VARCHAR(50);"))
+                    conn.execute(db.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS data_distribuicao DATE;"))
+                    conn.execute(db.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS valor_causa NUMERIC(15, 2);"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_data_distribuicao ON process_records (data_distribuicao);"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_tribunal ON process_records (tribunal);"))
                     conn.commit()
 
             # Pré-semeia e sincroniza CompanyRegistry com os metadados de grandes corporações para máxima velocidade
@@ -126,13 +136,23 @@ def create_app(config_name: str = None) -> Flask:
                             municipio=meta.get("municipio", "")[:150] or None,
                             uf=meta.get("uf", "")[:2] or None,
                             capital_social=meta_cap,
+                            cnae_codigo=meta.get("cnae_codigo"),
+                            cnae_descricao=meta.get("cnae_descricao"),
                             created_at=now,
                             updated_at=now,
                         )
                         db.session.add(reg)
-                    elif meta_cap > 0.0 and float(existing.capital_social or 0.0) == 0.0:
-                        existing.capital_social = meta_cap
-                        existing.updated_at = now
+                    else:
+                        changed = False
+                        if meta_cap > 0.0 and float(existing.capital_social or 0.0) == 0.0:
+                            existing.capital_social = meta_cap
+                            changed = True
+                        if not existing.cnae_codigo and meta.get("cnae_codigo"):
+                            existing.cnae_codigo = meta["cnae_codigo"]
+                            existing.cnae_descricao = meta.get("cnae_descricao")
+                            changed = True
+                        if changed:
+                            existing.updated_at = now
                 db.session.commit()
             except Exception as e_seed:
                 db.session.rollback()

@@ -297,6 +297,9 @@ def _deep_scan_background_worker(
             search.ai_analysis = deep_results.get("ai_analysis", {})
             search.movements_hash = deep_results.get("movements_hash")
             search.economic_standing = deep_results["idoneidade_economica"]
+            if search.economic_standing and isinstance(search.economic_standing, dict):
+                search.cnae_codigo = search.economic_standing.get("cnae_codigo") or search.cnae_codigo
+                search.cnae_descricao = search.economic_standing.get("cnae_descricao") or search.cnae_descricao
             search.scan_status = "COMPLETED"
             search.last_checked_at = get_utc_now()
             db.session.commit()
@@ -319,6 +322,8 @@ def _deep_scan_background_worker(
                             observation=proc.get("observation"),
                             sentence_outcome=proc.get("sentence_outcome", "em_aberto"),
                             has_expert_report=proc.get("has_expert_report", False),
+                            data_distribuicao=proc.get("data_distribuicao"),
+                            valor_causa=proc.get("valor_causa"),
                             raw_metadata=proc.get("raw_metadata"),
                         )
                         new_records.append(record)
@@ -610,6 +615,9 @@ def search_company():
                 # Atualiza os dados de idoneidade no banco de dados para eliminar dados defasados
                 try:
                     cached_search.economic_standing = econ_data
+                    if econ_data and isinstance(econ_data, dict):
+                        cached_search.cnae_codigo = econ_data.get("cnae_codigo") or cached_search.cnae_codigo
+                        cached_search.cnae_descricao = econ_data.get("cnae_descricao") or cached_search.cnae_descricao
                     db.session.commit()
                 except Exception:
                     pass
@@ -752,6 +760,8 @@ def search_company():
                 ranking_motivos_condenacao=fast_results.get("ranking_motivos_condenacao", []),
                 predictions_summary=fast_results.get("plus_previsao_condenacao", []),
                 economic_standing=econ_data,
+                cnae_codigo=econ_data.get("cnae_codigo") if isinstance(econ_data, dict) else None,
+                cnae_descricao=econ_data.get("cnae_descricao") if isinstance(econ_data, dict) else None,
                 overall_risk_score=fast_results.get("score_risco_terceirizacao", 0.0),
                 ai_analysis=fast_results.get("ai_analysis", {}),
                 movements_hash=new_hash,
@@ -776,6 +786,8 @@ def search_company():
                     observation=proc.get("observation"),
                     sentence_outcome=proc.get("sentence_outcome", "em_aberto"),
                     has_expert_report=proc.get("has_expert_report", False),
+                    data_distribuicao=proc.get("data_distribuicao"),
+                    valor_causa=proc.get("valor_causa"),
                     raw_metadata=proc.get("raw_metadata"),
                 )
                 db.session.add(record)
@@ -1604,6 +1616,8 @@ def ingest_deep_scan():
                 observation=obs,
                 sentence_outcome=outcome,
                 has_expert_report=has_expert,
+                data_distribuicao=parsed_proc.get("data_distribuicao"),
+                valor_causa=parsed_proc.get("valor_causa"),
                 raw_metadata=parsed_proc,
             )
             new_records.append(record)
@@ -1652,6 +1666,9 @@ def ingest_deep_scan():
         search.predictions_summary = fresh_metrics.get("plus_previsao_condenacao", [])
         search.overall_risk_score = fresh_metrics.get("score_risco_terceirizacao", 0.0)
         search.economic_standing = econ_data
+        if econ_data and isinstance(econ_data, dict):
+            search.cnae_codigo = econ_data.get("cnae_codigo") or search.cnae_codigo
+            search.cnae_descricao = econ_data.get("cnae_descricao") or search.cnae_descricao
         search.ai_analysis = ai_res
         if browser_finished:
             if search.scan_status != "COMPLETED":
