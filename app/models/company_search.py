@@ -34,6 +34,7 @@ class CompanySearch(db.Model):
     outcomes_summary = db.Column(db.JSON, nullable=True)
     ranking_motivos = db.Column(db.JSON, nullable=True)
     ranking_motivos_condenacao = db.Column(db.JSON, nullable=True)
+    condenacao_por_motivo = db.Column(db.JSON, nullable=True)
     predictions_summary = db.Column(db.JSON, nullable=True)
     economic_standing = db.Column(db.JSON, nullable=True)
     overall_risk_score = db.Column(db.Float, default=0.0, nullable=False)
@@ -100,6 +101,11 @@ class CompanySearch(db.Model):
                 p_condenacao_trabalhista=prob_cond_shrunk or self.overall_risk_score or 0.0,
             )
 
+        cond_por_motivo = self.condenacao_por_motivo
+        if cond_por_motivo is None and self.processes:
+            from app.services.prediction_engine import build_condenacao_por_motivo
+            cond_por_motivo = build_condenacao_por_motivo([p.to_dict() for p in self.processes])
+
         return {
             "id": self.id,
             "tenant_id": self.tenant_id,
@@ -116,6 +122,7 @@ class CompanySearch(db.Model):
             "outcomes_summary": self.outcomes_summary or {},
             "ranking_motivos": self.ranking_motivos or [],
             "ranking_motivos_condenacao": self.ranking_motivos_condenacao or [],
+            "condenacao_por_motivo": cond_por_motivo or [],
             "previsao_bloqueada": previsao_bloqueada,
             "motivo_bloqueio_previsao": motivo_bloqueio,
             "plus_previsao_condenacao": plus_previsoes,
