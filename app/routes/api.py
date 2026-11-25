@@ -49,6 +49,7 @@ from app.utils.auth import get_current_user_optional, require_auth, require_role
 from app.models.tenant import Tenant
 from app.models.audit_log import AuditLog
 from app.services.quota_service import QuotaService
+from app.services.cnj_searcher import normalize_court_code
 
 logger = logging.getLogger(__name__)
 
@@ -241,9 +242,13 @@ def _deep_scan_background_worker(
                 "capital_social_display": cap_display,
             }
 
-            # 3. Enriquecimento no DataJud APENAS para os Top 3 Tribunais com timeout de 6s
-            enriched_list = orchestrator.searcher.enrich_top_tribunals_datajud(
-                all_processes_map, max_tribunals=3, timeout=6.0
+            # 3. Enriquecimento incremental no DataJud (pula processos já encerrados com log de economia)
+            enriched_list, diff_stats = orchestrator.process_incremental_diff(
+                company_search_id=search_id,
+                all_processes_map=all_processes_map,
+                max_tribunals=3,
+                timeout=6.0,
+                sync_db=True,
             )
 
             # 4. Métricas e parecer de IA
@@ -304,9 +309,15 @@ def _deep_scan_background_worker(
             search.last_checked_at = get_utc_now()
             db.session.commit()
 
-            # Persiste os registros de processos individuais em lote protegido
+            # Persiste os registros de processos individuais em lote protegido (projeção leve de IDs)
             try:
-                existing_numbers = {p.numero_processo for p in search.processes}
+                existing_numbers = {
+                    r[0]
+                    for r in db.session.query(ProcessRecord.numero_processo)
+                    .filter(ProcessRecord.company_search_id == search.id)
+                    .all()
+                    if r[0]
+                }
                 new_records = []
                 for proc in enriched_list:
                     num = proc.get("numero_processo")
@@ -1434,7 +1445,9 @@ def incremental_sync(search_id: int):
                 "message": "Nenhuma alteração recente encontrada no CNJ."
             }), 200
 
-        delta_processes = orchestrator._enrich_with_datajud(processes_map, since_date=since_date)
+        delta_processes = orchestrator._enrich_with_datajud(
+            processes_map, since_date=since_date, company_search_id=search_id
+        )
         if not delta_processes:
             search.last_checked_at = get_utc_now()
             db.session.commit()
@@ -1709,66 +1722,141 @@ def ingest_deep_scan():
         return jsonify({"error": f"Erro interno ao processar ingestão: {str(exc)}"}), 500
 
 
-@api_bp.route("/searches/<int:search_id>/processes", methods=["GET"])
-def get_search_processes(search_id: int):
+@api_bp.route("/searches/<int:company_search_id>/processes", methods=["GET"])
+@api_bp.route("/searches/<int:company_search_id>/processes/", methods=["GET"])
+def get_search_processes(company_search_id: int):
     """
     Retorna a listagem paginada e filtrada dos processos consolidados de uma empresa.
+    Endpoint: GET /api/v1/searches/{company_search_id}/processes
     Query parameters:
-    - page: int (padrão 1)
-    - per_page: int (padrão 20, máximo 100)
-    - tribunal: string opcional (ex: TRT2, TST)
+    - page: int (padrão 1, >= 1)
+    - per_page: int (padrão 50, máximo 100)
+    - tribunal: string opcional normalizada (ex: TRT6, TST)
+    - date_from: data ISO YYYY-MM-DD
+    - date_to: data ISO YYYY-MM-DD
+    - min_value: float/decimal >= 0
+    - max_value: float/decimal >= 0
     - outcome: string opcional (condenacao, acordo, improcedente, em_aberto)
     - search: string opcional (busca textual por CNJ, assunto ou observação)
     """
     try:
-        search = db.session.get(CompanySearch, search_id) if hasattr(db.session, "get") else CompanySearch.query.get(search_id)
+        search = (
+            db.session.get(CompanySearch, company_search_id)
+            if hasattr(db.session, "get")
+            else CompanySearch.query.get(company_search_id)
+        )
         if not search:
-            return jsonify({"error": f"Pesquisa ID {search_id} não encontrada."}), 404
+            return jsonify({"error": f"Pesquisa ID {company_search_id} não encontrada."}), 404
 
-        req_tenant_id = getattr(g, "tenant_id", None)
-        if req_tenant_id is None and request.headers.get("X-Tenant-ID"):
-            req_tenant_id = request.headers.get("X-Tenant-ID")
+        # Anti-IDOR Obrigatório: Se a busca pertencer a um tenant específico, valida permissão estrita
+        current_user = get_current_user_optional()
+        req_tenant_id = getattr(g, "tenant_id", None) or request.headers.get("X-Tenant-ID")
 
-        if req_tenant_id is not None:
-            rec_tenant_id = getattr(CompanySearch, "tenant_id", None)
-            if isinstance(rec_tenant_id, (int, str)):
-                tenant_val = rec_tenant_id
+        rec_tenant_id = getattr(CompanySearch, "tenant_id", None)
+        if isinstance(rec_tenant_id, (int, str)):
+            tenant_val = rec_tenant_id
+        else:
+            tenant_val = getattr(search, "tenant_id", None)
+
+        if tenant_val is not None:
+            if current_user:
+                if str(current_user.tenant_id) != str(tenant_val):
+                    return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
+            elif req_tenant_id is not None:
+                if str(tenant_val) != str(req_tenant_id):
+                    return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
             else:
-                tenant_val = getattr(search, "tenant_id", None)
-
-            if tenant_val is not None and str(tenant_val) != str(req_tenant_id):
                 return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
 
+        # Paginação sanitizada: page (default 1, >= 1) e per_page (default 50, teto 100)
         try:
-            page = max(1, int(request.args.get("page", 1)))
+            page = int(request.args.get("page", 1))
+            if page < 1:
+                page = 1
         except (ValueError, TypeError):
             page = 1
 
         try:
-            per_page = min(100, max(1, int(request.args.get("per_page", 20))))
+            per_page = int(request.args.get("per_page", 50))
+            if per_page < 1:
+                per_page = 50
+            per_page = min(100, per_page)
         except (ValueError, TypeError):
-            per_page = 20
+            per_page = 50
 
         query = ProcessRecord.query.filter_by(company_search_id=search.id)
 
+        # Filtro: tribunal (normalizado case-insensitive e flexível)
         tribunal = request.args.get("tribunal")
         if tribunal and tribunal.strip():
-            query = query.filter(ProcessRecord.tribunal.ilike(f"%{tribunal.strip()}%"))
+            t_raw = tribunal.strip()
+            norm_t = normalize_court_code(t_raw)
+            clauses = [ProcessRecord.tribunal.ilike(f"%{t_raw}%")]
+            if norm_t:
+                clauses.append(ProcessRecord.tribunal.ilike(f"%{norm_t}%"))
+                clauses.append(ProcessRecord.tribunal == norm_t)
+            query = query.filter(db.or_(*clauses))
 
+        # Filtros de data: date_from e date_to (ISO YYYY-MM-DD)
+        date_from = request.args.get("date_from")
+        if date_from and date_from.strip():
+            try:
+                d_from = datetime.strptime(date_from.strip(), "%Y-%m-%d").date()
+                query = query.filter(ProcessRecord.data_distribuicao >= d_from)
+            except ValueError:
+                return jsonify({"error": "Formato de data inválido para 'date_from'. Utilize YYYY-MM-DD."}), 400
+
+        date_to = request.args.get("date_to")
+        if date_to and date_to.strip():
+            try:
+                d_to = datetime.strptime(date_to.strip(), "%Y-%m-%d").date()
+                query = query.filter(ProcessRecord.data_distribuicao <= d_to)
+            except ValueError:
+                return jsonify({"error": "Formato de data inválido para 'date_to'. Utilize YYYY-MM-DD."}), 400
+
+        # Filtros de valor da causa: min_value e max_value (>= 0)
+        min_value = request.args.get("min_value")
+        if min_value is not None and str(min_value).strip() != "":
+            try:
+                mv = float(str(min_value).strip())
+                if mv < 0:
+                    return jsonify({"error": "'min_value' deve ser maior ou igual a zero."}), 400
+                query = query.filter(ProcessRecord.valor_causa >= mv)
+            except (ValueError, TypeError):
+                return jsonify({"error": "'min_value' deve ser um valor numérico válido."}), 400
+
+        max_value = request.args.get("max_value")
+        if max_value is not None and str(max_value).strip() != "":
+            try:
+                xv = float(str(max_value).strip())
+                if xv < 0:
+                    return jsonify({"error": "'max_value' deve ser maior ou igual a zero."}), 400
+                query = query.filter(ProcessRecord.valor_causa <= xv)
+            except (ValueError, TypeError):
+                return jsonify({"error": "'max_value' deve ser um valor numérico válido."}), 400
+
+        # Filtro: outcome (desfecho/status mapeado)
         outcome = request.args.get("outcome")
         if outcome and outcome.strip():
             o = outcome.strip().lower()
             if o in ("condenacao", "condenacoes", "condenação", "condenações"):
-                query = query.filter(ProcessRecord.sentence_outcome.in_(["condenacoes", "condenacao"]))
+                query = query.filter(
+                    ProcessRecord.sentence_outcome.in_([
+                        "condenacoes", "condenacao", "procedencia_total", "procedencia_parcial"
+                    ])
+                )
             elif o in ("acordo", "acordos"):
-                query = query.filter(ProcessRecord.sentence_outcome.in_(["acordos", "acordo"]))
+                query = query.filter(ProcessRecord.sentence_outcome.in_(["acordos", "acordo", "acordo_homologado"]))
             elif o in ("improcedente", "improcedentes"):
                 query = query.filter(ProcessRecord.sentence_outcome.in_(["improcedentes", "improcedente"]))
             elif o in ("em_aberto", "aberto"):
                 query = query.filter(ProcessRecord.sentence_outcome.in_(["em_aberto", "aberto"]))
+            elif o in ("extintos_sem_merito", "extinto_sem_merito", "extincao"):
+                query = query.filter(ProcessRecord.sentence_outcome.in_(["extintos_sem_merito", "extinto_sem_merito"]))
             else:
                 query = query.filter(ProcessRecord.sentence_outcome == o)
 
+        # Filtro opcional de busca textual
         search_query = request.args.get("search")
         if search_query and search_query.strip():
             sq = f"%{search_query.strip()}%"
@@ -1781,20 +1869,24 @@ def get_search_processes(search_id: int):
             )
 
         total_matches = query.count()
-        total_pages = max(1, math.ceil(total_matches / per_page))
+        total_pages = max(1, math.ceil(total_matches / per_page)) if total_matches > 0 else 1
         offset = (page - 1) * per_page
         records = query.order_by(ProcessRecord.id.asc()).offset(offset).limit(per_page).all()
 
-        processes_data = [
+        items = [
             {
                 "id": r.id,
                 "numero_processo": r.numero_processo,
                 "tribunal": r.tribunal,
                 "grau": r.grau,
+                "data_distribuicao": r.data_distribuicao.isoformat() if r.data_distribuicao else None,
+                "valor_causa": float(r.valor_causa) if r.valor_causa is not None else None,
                 "primary_subject": r.primary_subject,
+                "primary_subject_code": r.primary_subject_code,
+                "subjects": r.subjects_json or [],
+                "observation": r.observation,
                 "sentence_outcome": r.sentence_outcome,
                 "has_expert_report": r.has_expert_report,
-                "observation": r.observation,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             }
             for r in records
@@ -1806,12 +1898,14 @@ def get_search_processes(search_id: int):
             "page": page,
             "per_page": per_page,
             "total": total_matches,
+            "pages": total_pages,
             "total_pages": total_pages,
-            "processes": processes_data,
+            "items": items,
+            "processes": items,
         }), 200
 
     except Exception as exc:
-        logger.exception("Erro ao listar processos da busca ID %d: %s", search_id, exc)
+        logger.exception("Erro ao listar processos da busca ID %d: %s", company_search_id, exc)
         return jsonify({"error": f"Erro interno ao listar processos: {str(exc)}"}), 500
 
 

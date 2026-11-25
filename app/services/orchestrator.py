@@ -237,6 +237,23 @@ CLASS_INFERENCE_MAP: List[Tuple[str, str]] = [
     ("MANDADO DE SEGURANCA", "Mandado de Segurança Trabalhista"),
 ]
 
+# Conjunto de desfechos processuais transitados em julgado / encerrados (não requerem nova consulta DataJud)
+CLOSED_OUTCOMES: Set[str] = {
+    "condenacoes",
+    "condenacao",
+    "procedencia_total",
+    "procedencia_parcial",
+    "improcedentes",
+    "improcedente",
+    "acordos",
+    "acordo",
+    "acordo_homologado",
+    "extintos_sem_merito",
+    "extinto_sem_merito",
+    "baixa_arquivado",
+    "arquivado",
+}
+
 
 class CNJMetadataOrchestrator:
     """
@@ -546,14 +563,225 @@ class CNJMetadataOrchestrator:
         self,
         processes_map: Dict[str, Any],
         since_date: Optional[str] = None,
+        company_search_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         Enriquece os processos com o DataJud utilizando busca otimizada
         agrupada nos Top Tribunais (timeout 6.0s) e fallback semântico do Comunica PJe.
+        Se company_search_id for informado, utiliza diff incremental para pular casos encerrados.
         """
+        if company_search_id:
+            consolidated, _ = self.process_incremental_diff(
+                company_search_id=company_search_id,
+                all_processes_map=processes_map,
+                max_tribunals=3,
+                timeout=6.0,
+                sync_db=True,
+            )
+            return consolidated
+
         self.searcher.session = self.session
         self.searcher.datajud_key = self.datajud_key
         return self.searcher.enrich_top_tribunals_datajud(processes_map, max_tribunals=3, timeout=6.0)
+
+    def process_incremental_diff(
+        self,
+        company_search_id: Optional[int],
+        all_processes_map: Dict[str, Any],
+        max_tribunals: int = 3,
+        timeout: float = 6.0,
+        sync_db: bool = True,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Executa indexação incremental e diff inteligente entre os processos coletados
+        e a base persistida no PostgreSQL:
+        - Carrega apenas as projeções necessárias dos registros existentes da empresa (sem blobs).
+        - Processos já encerrados (Improcedente, Acordo, Condenação transitada): preserva os dados
+          já gravados sem disparar novas chamadas externas ao DataJud.
+        - Processos novos ou com status 'Em aberto': enviados exclusivamente para
+          enriquecimento no DataJud.
+        - Reúne 100% dos processos (preservados + novos/atualizados) para integridade estatística
+          e cálculo bayesiano simplex 100%.
+        - Mede e registra em log estruturado o percentual de redução de chamadas DataJud.
+        - Realiza upsert seguro impedindo duplicidades por (company_search_id, numero_processo).
+        """
+        total_incoming = len(all_processes_map) if all_processes_map else 0
+        if total_incoming == 0:
+            return [], {
+                "total_cnjs": 0,
+                "skipped_closed": 0,
+                "queried_datajud": 0,
+                "reduction_pct": 0.0,
+            }
+
+        existing_map: Dict[str, Any] = {}
+        if company_search_id:
+            try:
+                from app.models.process_record import ProcessRecord
+                from app.extensions import db
+
+                rows = (
+                    db.session.query(
+                        ProcessRecord.id,
+                        ProcessRecord.numero_processo,
+                        ProcessRecord.sentence_outcome,
+                        ProcessRecord.tribunal,
+                        ProcessRecord.grau,
+                        ProcessRecord.nivel_sigilo,
+                        ProcessRecord.primary_subject,
+                        ProcessRecord.primary_subject_code,
+                        ProcessRecord.subjects_json,
+                        ProcessRecord.observation,
+                        ProcessRecord.has_expert_report,
+                        ProcessRecord.data_distribuicao,
+                        ProcessRecord.valor_causa,
+                        ProcessRecord.raw_metadata,
+                    )
+                    .filter(ProcessRecord.company_search_id == company_search_id)
+                    .all()
+                )
+                for r in rows:
+                    if r.numero_processo:
+                        norm_k = self.searcher.normalize_cnj(r.numero_processo) or r.numero_processo
+                        existing_map[norm_k] = r
+            except Exception as q_exc:
+                logger.debug("Consulta a processos existentes para diff incremental falhou: %s", q_exc)
+
+        to_query_datajud: Dict[str, Any] = {}
+        preserved_closed_list: List[Dict[str, Any]] = []
+
+        for cnj, com_data in all_processes_map.items():
+            norm_cnj = self.searcher.normalize_cnj(cnj) or cnj
+            existing_rec = existing_map.get(norm_cnj) or existing_map.get(cnj)
+
+            if existing_rec:
+                out_status = str(existing_rec.sentence_outcome or "").strip().lower()
+                if out_status in CLOSED_OUTCOMES:
+                    # Processo encerrado / transitado: preserva metadados existentes e pula DataJud
+                    preserved_closed_list.append({
+                        "numero_processo": existing_rec.numero_processo,
+                        "tribunal": existing_rec.tribunal,
+                        "grau": existing_rec.grau,
+                        "nivel_sigilo": existing_rec.nivel_sigilo,
+                        "nivelSigilo": existing_rec.nivel_sigilo,
+                        "primary_subject": existing_rec.primary_subject,
+                        "primary_subject_code": existing_rec.primary_subject_code,
+                        "subjects": existing_rec.subjects_json or [],
+                        "assuntos": (
+                            [{"nome": s} for s in existing_rec.subjects_json if s]
+                            if isinstance(existing_rec.subjects_json, list)
+                            else []
+                        ),
+                        "observation": existing_rec.observation,
+                        "sentence_outcome": existing_rec.sentence_outcome,
+                        "has_expert_report": existing_rec.has_expert_report,
+                        "data_distribuicao": (
+                            existing_rec.data_distribuicao.isoformat()
+                            if hasattr(existing_rec.data_distribuicao, "isoformat")
+                            else str(existing_rec.data_distribuicao) if existing_rec.data_distribuicao else None
+                        ),
+                        "valor_causa": (
+                            float(existing_rec.valor_causa)
+                            if existing_rec.valor_causa is not None
+                            else None
+                        ),
+                        "raw_metadata": existing_rec.raw_metadata or {},
+                    })
+                    continue
+
+            # Processo novo ou em aberto: consulta no DataJud
+            to_query_datajud[cnj] = com_data
+
+        skipped_closed = len(preserved_closed_list)
+        queried_count = len(to_query_datajud)
+        reduction_pct = (skipped_closed / total_incoming * 100.0) if total_incoming > 0 else 0.0
+
+        logger.info(
+            "Indexação incremental DataJud: total_cnjs=%d, skipped_closed=%d, queried_datajud=%d, reduction_pct=%.1f%%",
+            total_incoming,
+            skipped_closed,
+            queried_count,
+            reduction_pct,
+        )
+
+        # Consulta DataJud exclusivamente para os processos pendentes/novos
+        self.searcher.session = self.session
+        self.searcher.datajud_key = self.datajud_key
+        if to_query_datajud:
+            new_enriched = self.searcher.enrich_top_tribunals_datajud(
+                to_query_datajud, max_tribunals=max_tribunals, timeout=timeout
+            )
+        else:
+            new_enriched = []
+
+        # Preserva 100% da integridade da base: consolida encerrados preservados + novos/atualizados
+        consolidated = preserved_closed_list + new_enriched
+
+        # Upsert seguro no banco de dados para evitar registros duplicados por (company_search_id, numero_processo)
+        if sync_db and company_search_id and new_enriched:
+            try:
+                from app.models.process_record import ProcessRecord
+                from app.extensions import db
+
+                for proc in new_enriched:
+                    p_num = proc.get("numero_processo")
+                    if not p_num:
+                        continue
+                    norm_num = self.searcher.normalize_cnj(p_num) or p_num
+                    existing_entry = existing_map.get(norm_num) or existing_map.get(p_num)
+
+                    if existing_entry:
+                        # Atualiza registro existente (em aberto que mudou de status ou metadados)
+                        rec = db.session.get(ProcessRecord, existing_entry.id)
+                        if rec:
+                            rec.tribunal = str(proc.get("tribunal") or rec.tribunal or "")[:50]
+                            rec.grau = str(proc.get("grau") or rec.grau or "G1")[:50]
+                            rec.nivel_sigilo = proc.get("nivelSigilo", rec.nivel_sigilo)
+                            rec.primary_subject = proc.get("primary_subject") or rec.primary_subject
+                            rec.primary_subject_code = proc.get("primary_subject_code", rec.primary_subject_code)
+                            rec.subjects_json = proc.get("subjects") or rec.subjects_json
+                            rec.observation = proc.get("observation") or rec.observation
+                            rec.sentence_outcome = proc.get("sentence_outcome") or rec.sentence_outcome
+                            rec.has_expert_report = proc.get("has_expert_report", rec.has_expert_report)
+                            if proc.get("data_distribuicao"):
+                                rec.data_distribuicao = proc.get("data_distribuicao")
+                            if proc.get("valor_causa") is not None:
+                                rec.valor_causa = proc.get("valor_causa")
+                            if proc.get("raw_metadata"):
+                                rec.raw_metadata = proc.get("raw_metadata")
+                    else:
+                        # Insere novo processo
+                        new_record = ProcessRecord(
+                            company_search_id=company_search_id,
+                            numero_processo=p_num,
+                            tribunal=str(proc.get("tribunal") or "")[:50],
+                            grau=str(proc.get("grau") or "G1")[:50],
+                            nivel_sigilo=proc.get("nivelSigilo", 0),
+                            primary_subject=proc.get("primary_subject"),
+                            primary_subject_code=proc.get("primary_subject_code"),
+                            subjects_json=proc.get("subjects"),
+                            observation=proc.get("observation"),
+                            sentence_outcome=proc.get("sentence_outcome", "em_aberto"),
+                            has_expert_report=proc.get("has_expert_report", False),
+                            data_distribuicao=proc.get("data_distribuicao"),
+                            valor_causa=proc.get("valor_causa"),
+                            raw_metadata=proc.get("raw_metadata"),
+                        )
+                        db.session.add(new_record)
+                        existing_map[norm_num] = new_record
+
+                db.session.commit()
+            except Exception as upsert_err:
+                db.session.rollback()
+                logger.debug("Upsert incremental de processos tratado defensivamente: %s", upsert_err)
+
+        stats = {
+            "total_cnjs": total_incoming,
+            "skipped_closed": skipped_closed,
+            "queried_datajud": queried_count,
+            "reduction_pct": reduction_pct,
+        }
+        return consolidated, stats
 
     def _calculate_metrics(
         self,
