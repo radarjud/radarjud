@@ -36,7 +36,7 @@ services:
       DEBUG: ${DEBUG:-True}
       PORT: 5000
       SECRET_KEY: ${SECRET_KEY:-change_me_in_production}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-radarjud}:${POSTGRES_PASSWORD:-change_me}@db:5432/${POSTGRES_DB:-radarjud}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-radarjud}:${POSTGRES_PASSWORD:-change_me}@db:5432/${POSTGRES_DB:-radarjud}
       POSTGRES_HOST: db
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-radarjud}
