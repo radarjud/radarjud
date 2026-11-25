@@ -1,0 +1,22 @@
+name: Daily Supplier Monitoring (US-11)
+
+on:
+  schedule:
+    - cron: '0 11 * * *' # 08:00 BRT (UTC-3) diariamente em horário comercial
+  workflow_dispatch:
+
+concurrency:
+  group: daily-supplier-monitoring
+  cancel-in-progress: false
+
+jobs:
+  run-monitoring:
+    name: Trigger Internal Monitoring & Alert Queue
+    runs-on: ubuntu-latest
+    steps:
+      - name: Execute scheduled monitoring sweep
+        run: |
+          curl -f -s -S -X POST "${{ secrets.RENDER_API_URL }}/api/v1/internal/run-monitoring" \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{"batch_size": 10, "max_items": 25}'
