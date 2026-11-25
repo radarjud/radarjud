@@ -242,9 +242,13 @@ def _deep_scan_background_worker(
                 "capital_social_display": cap_display,
             }
 
-            # 3. Enriquecimento no DataJud APENAS para os Top 3 Tribunais com timeout de 6s
-            enriched_list = orchestrator.searcher.enrich_top_tribunals_datajud(
-                all_processes_map, max_tribunals=3, timeout=6.0
+            # 3. Enriquecimento incremental no DataJud (pula processos já encerrados com log de economia)
+            enriched_list, diff_stats = orchestrator.process_incremental_diff(
+                company_search_id=search_id,
+                all_processes_map=all_processes_map,
+                max_tribunals=3,
+                timeout=6.0,
+                sync_db=True,
             )
 
             # 4. Métricas e parecer de IA
@@ -305,9 +309,15 @@ def _deep_scan_background_worker(
             search.last_checked_at = get_utc_now()
             db.session.commit()
 
-            # Persiste os registros de processos individuais em lote protegido
+            # Persiste os registros de processos individuais em lote protegido (projeção leve de IDs)
             try:
-                existing_numbers = {p.numero_processo for p in search.processes}
+                existing_numbers = {
+                    r[0]
+                    for r in db.session.query(ProcessRecord.numero_processo)
+                    .filter(ProcessRecord.company_search_id == search.id)
+                    .all()
+                    if r[0]
+                }
                 new_records = []
                 for proc in enriched_list:
                     num = proc.get("numero_processo")
@@ -1435,7 +1445,9 @@ def incremental_sync(search_id: int):
                 "message": "Nenhuma alteração recente encontrada no CNJ."
             }), 200
 
-        delta_processes = orchestrator._enrich_with_datajud(processes_map, since_date=since_date)
+        delta_processes = orchestrator._enrich_with_datajud(
+            processes_map, since_date=since_date, company_search_id=search_id
+        )
         if not delta_processes:
             search.last_checked_at = get_utc_now()
             db.session.commit()
