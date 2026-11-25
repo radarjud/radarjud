@@ -1043,20 +1043,41 @@ def build_sector_benchmark(
             or _format_capital_brl(cap_num)
         )
 
+        # Cenário de Idoneidade Econômica
+        cenario_val = str(
+            p.get("cenario")
+            or p.get("cenario_tipo")
+            or econ.get("cenario_tipo")
+            or econ.get("cenario")
+            or ""
+        ).upper()
+        if "CENARIO_A" in cenario_val or "CENÁRIO A" in cenario_val:
+            cenario_clean = "CENARIO_A"
+        elif "CENARIO_B" in cenario_val or "CENÁRIO B" in cenario_val:
+            cenario_clean = "CENARIO_B"
+        else:
+            cenario_clean = None
+
         # Risco Subsidiário (Súmula 331)
+        # Prioriza a métrica calibrada de solvência quando disponível (Súmula 331 TST
+        # condiciona a responsabilidade subsidiária do tomador ao inadimplemento da prestadora).
         r_sub_raw = (
             p.get("risco_subsidiario")
             if p.get("risco_subsidiario") is not None
             else (
-                p.get("score_risco_terceirizacao")
-                if p.get("score_risco_terceirizacao") is not None
+                econ.get("risco_calote_subsidiario")
+                if econ.get("risco_calote_subsidiario") is not None
                 else (
-                    p.get("overall_risk_score")
-                    if p.get("overall_risk_score") is not None
+                    p.get("indice_exposicao_financeira")
+                    if p.get("indice_exposicao_financeira") is not None
                     else (
-                        econ.get("risco_calote_subsidiario")
-                        if econ.get("risco_calote_subsidiario") is not None
-                        else econ.get("indice_exposicao_financeira", 0.0)
+                        econ.get("indice_exposicao_financeira")
+                        if econ.get("indice_exposicao_financeira") is not None
+                        else (
+                            p.get("score_risco_terceirizacao")
+                            if p.get("score_risco_terceirizacao") is not None
+                            else p.get("overall_risk_score", 0.0)
+                        )
                     )
                 )
             )
@@ -1065,6 +1086,9 @@ def build_sector_benchmark(
             r_sub = round(float(r_sub_raw), 1)
         except (ValueError, TypeError):
             r_sub = 0.0
+
+        if cenario_clean is None:
+            cenario_clean = "CENARIO_A" if r_sub < 40.0 else "CENARIO_B"
 
         # Probabilidade de Condenação (Bayes)
         p_cond_raw = (
@@ -1124,26 +1148,18 @@ def build_sector_benchmark(
             "formatado": f"{round(lo, 1)}% a {round(hi, 1)}%",
         }
 
-        # Cenário
-        cenario_val = str(
-            p.get("cenario")
-            or p.get("cenario_tipo")
-            or econ.get("cenario_tipo")
-            or econ.get("cenario")
-            or ("CENARIO_A" if r_sub < 40.0 else "CENARIO_B")
-        ).upper()
-        if "CENARIO_A" in cenario_val or "CENÁRIO A" in cenario_val:
-            cenario_clean = "CENARIO_A"
-        elif "CENARIO_B" in cenario_val or "CENÁRIO B" in cenario_val:
-            cenario_clean = "CENARIO_B"
-        else:
-            cenario_clean = "CENARIO_A" if r_sub < 40.0 else "CENARIO_B"
-
-        # Classificação em 3 faixas de decisão:
-        # APROVAR (Cenário A - baixo risco subsidiário / alta solvência)
-        # CAUTELA (faixa intermediária - recomendação de Retenção de 10% em contrato)
-        # REPROVAR (Cenário B - alto risco subsidiário / insolvência crítica)
-        if r_sub <= 10.0:
+        # Classificação em 3 faixas de decisão (Súmula 331 TST + Solvência):
+        # APROVAR: Cenário A com risco subsidiário baixo a moderado ou lastro patrimonial expressivo (>= R$ 50M)
+        # CAUTELA: Faixa intermediária ou Cenário A com passivo relevante (retenção técnica preventiva sugerida: 10%)
+        # REPROVAR: Cenário B com risco de insolvência / calote crítico (>= 40%)
+        if cenario_clean == "CENARIO_A":
+            if r_sub <= 15.0 or cap_num >= 50_000_000.0:
+                faixa = "APROVAR"
+                rec = "Aprovar fornecedor. Baixo risco subsidiário e solvência econômico-trabalhista preservada."
+            else:
+                faixa = "CAUTELA"
+                rec = "Contratar com cautela. Recomendação de retenção técnica de 10% do valor contratual para contingências."
+        elif r_sub <= 10.0:
             faixa = "APROVAR"
             rec = "Aprovar fornecedor. Baixo risco subsidiário e solvência econômico-trabalhista preservada."
         elif r_sub < 40.0:
@@ -1186,6 +1202,9 @@ def build_sector_benchmark(
             "cnae_descricao": str(cnae_desc).strip() if cnae_desc else None,
             "previsao_bloqueada": previsao_bloqueada,
             "total_processos": p.get("total_processos", 0),
+            "situacao_cadastral": str(econ.get("situacao_cadastral") or p.get("situacao_cadastral") or "ATIVA").upper(),
+            "logo": p.get("logo") or econ.get("logo") or {},
+            "search_id": p.get("search_id") or p.get("id"),
         })
 
     # Ordenação determinística (do melhor para o pior fornecedor):
