@@ -605,3 +605,196 @@ def test_monitoring_pagination_and_patch_validation(client):
     assert s_updated["alert_email"] == "valido@compliance.com"
     assert s_updated["active"] is False
 
+
+def test_update_monitored_supplier_webhook_scenarios(client):
+    """
+    Cobre detalhadamente os cenários de atualização de webhook via PATCH /api/v1/monitoring/{id}:
+    - Atualização para nova URL válida HTTPS
+    - Limpeza de webhook_url (passando None ou string vazia)
+    - Rejeição de URLs inseguras / SSRF (loopback, link-local, rede privada RFC 1918)
+    """
+    user = _create_tenant_and_user(client, "Empresa Webhook", "wh@empresa.com")
+    headers = user["headers"]
+
+    # 1. Cria fornecedor com webhook inicial
+    resp_create = client.post("/api/v1/monitoring", headers=headers, json={
+        "cnpj": "33444555000188",
+        "company_name": "Fornecedor Webhook Teste",
+        "webhook_url": "https://hooks.original.com/alert",
+    })
+    assert resp_create.status_code == 201
+    supplier_id = resp_create.get_json()["supplier"]["id"]
+
+    # 2. Atualiza para nova URL válida
+    resp_update = client.patch(
+        f"/api/v1/monitoring/{supplier_id}",
+        headers=headers,
+        json={"webhook_url": "https://hooks.novodominio.com/webhook-v2"},
+    )
+    assert resp_update.status_code == 200
+    assert resp_update.get_json()["supplier"]["webhook_url"] == "https://hooks.novodominio.com/webhook-v2"
+
+    # 3. Tenta atualizar com URLs SSRF maliciosas
+    for malicious_url in [
+        "https://127.0.0.1:8443/alert",
+        "https://169.254.169.254/latest/meta-data",
+        "https://localhost:9000/hook",
+        "ftp://inseguro.com/alert",
+        "https://10.0.0.1/webhook",
+        "https://192.168.1.1/webhook",
+    ]:
+        resp_bad = client.patch(
+            f"/api/v1/monitoring/{supplier_id}",
+            headers=headers,
+            json={"webhook_url": malicious_url},
+        )
+        assert resp_bad.status_code == 400
+        assert "webhook" in resp_bad.get_json()["error"].lower()
+
+    # Validação direta de bloqueio do esquema HTTP fora de ambiente de teste
+    from app.utils.sanitizer import validate_webhook_url
+    valid_prod_http, msg_prod_http = validate_webhook_url("http://inseguro.com/alert", allow_local_for_testing=False)
+    assert not valid_prod_http
+    assert "HTTPS" in msg_prod_http
+
+    # 4. Limpeza de webhook_url com string vazia
+    resp_clear = client.patch(
+        f"/api/v1/monitoring/{supplier_id}",
+        headers=headers,
+        json={"webhook_url": ""},
+    )
+    assert resp_clear.status_code == 200
+    assert resp_clear.get_json()["supplier"]["webhook_url"] is None
+
+
+def test_delta_detection_with_simulated_rfb_network_failure(app, client):
+    """
+    Valida a resiliência do detector de delta quando a consulta externa à RFB
+    falha por timeout de rede: o job deve utilizar fallback seguro sem interromper
+    a detecção de passivos judiciais (+N condenações) nem abortar o lote.
+    """
+    user = _create_tenant_and_user(client, "Empresa RFB Fallback", "rfb_fallback@empresa.com")
+    tenant_id = user["tenant_id"]
+    cnpj = "77888999000122"
+
+    with app.app_context():
+        # Cria fornecedor com baseline de 1 condenação
+        supplier = MonitoredSupplier(
+            tenant_id=tenant_id,
+            cnpj=cnpj,
+            company_name="Fornecedor RFB Timeout Ltda",
+            last_movements_hash="hash_old_rfb_test",
+            last_condenacoes_count=1,
+            last_scenario="CENARIO_A",
+            last_rfb_status="ATIVA",
+            last_tst_count=0,
+            webhook_url="https://hooks.test.com/alert",
+            active=True,
+        )
+        db.session.add(supplier)
+        db.session.commit()
+        supplier_id = supplier.id
+
+        # Insere pesquisa com 3 condenações (+2 delta)
+        search = CompanySearch(
+            tenant_id=tenant_id,
+            company_name="Fornecedor RFB Timeout Ltda",
+            normalized_name=f"FORNECEDOR RFB {cnpj}",
+            total_processes=5,
+            movements_hash="hash_new_judicial_data",
+            outcomes_summary={"condenacoes": 3, "acordos": 1},
+            overall_risk_score=35.0,
+            economic_standing={"cenario": "CENARIO_A", "situacao": "ATIVA"},
+        )
+        db.session.add(search)
+        db.session.commit()
+
+    # Simula falha de timeout na consulta externa da Receita Federal
+    with patch(
+        "app.services.monitoring_job.fetch_accurate_cnpj_data",
+        side_effect=requests.Timeout("RFB gateway connection timeout (simulado)"),
+    ), patch("requests.post") as mock_post, app.app_context():
+        mock_post.return_value.status_code = 200
+
+        # Executa o job sem custom evaluator_fn, exercitando evaluate_monitored_supplier real
+        summary = run_monitoring_job(tenant_id=tenant_id)
+        assert summary["processed"] == 1
+        assert summary["alerts_emitted"] == 1
+        assert summary["errors"] == 0
+
+        event = summary["alert_events"][0]
+        assert "NEW_CONVICTIONS" in event["payload"]["triggers"]
+        assert event["payload"]["deltas"]["condenacoes"]["before"] == 1
+        assert event["payload"]["deltas"]["condenacoes"]["after"] == 3
+        assert event["payload"]["deltas"]["condenacoes"]["delta"] == 2
+
+        # Situação RFB preservou fallback com segurança e baseline foi atualizado
+        updated_supplier = db.session.get(MonitoredSupplier, supplier_id)
+        assert updated_supplier.last_condenacoes_count == 3
+        assert updated_supplier.last_rfb_status == "ATIVA"
+
+
+def test_delta_detection_with_simulated_webhook_timeout_failure(app, client):
+    """
+    Valida a tolerância a falhas quando o disparo do webhook de notificação
+    sofre timeout de rede (requests.Timeout):
+    - O evento de alerta registra erro com webhook_sent=False
+    - O loop do job conclui sem exceção não tratada
+    - O baseline snapshot do fornecedor é persistido para preservar a idempotência
+      (impedindo tempestade de alertas repetidos em caso de instabilidade no endpoint externo)
+    """
+    user = _create_tenant_and_user(client, "Empresa Webhook Flaky", "wh_flaky@empresa.com")
+    tenant_id = user["tenant_id"]
+
+    with app.app_context():
+        supplier = MonitoredSupplier(
+            tenant_id=tenant_id,
+            cnpj="55666777000133",
+            company_name="Fornecedor Webhook Flaky",
+            last_movements_hash="hash_baseline_v0",
+            last_condenacoes_count=0,
+            last_scenario="CENARIO_A",
+            last_rfb_status="ATIVA",
+            last_tst_count=0,
+            webhook_url="https://hooks.flaky.com/timeout-alert",
+            active=True,
+        )
+        db.session.add(supplier)
+        db.session.commit()
+        supplier_id = supplier.id
+
+    def eval_delta(sup):
+        return {
+            "movements_hash": "hash_baseline_v1_new",
+            "condenacoes_count": 2,
+            "scenario": "CENARIO_A",
+            "rfb_status": "ATIVA",
+            "tst_count": 0,
+        }
+
+    # Simula timeout de rede durante a chamada HTTP de webhook
+    with patch(
+        "requests.post",
+        side_effect=requests.Timeout("Conexão com o webhook expirou após 5.0 segundos"),
+    ), app.app_context():
+        # Execução 1: timeout capturado defensivamente
+        summary1 = run_monitoring_job(tenant_id=tenant_id, evaluator_fn=eval_delta)
+        assert summary1["processed"] == 1
+        assert summary1["alerts_emitted"] == 1
+        assert len(summary1["alert_events"]) == 1
+
+        ev = summary1["alert_events"][0]
+        assert ev["webhook_sent"] is False
+        assert "expirou após 5.0 segundos" in ev["error"]
+
+        # Baseline foi atualizado no banco mesmo com timeout no webhook externo
+        s_db = db.session.get(MonitoredSupplier, supplier_id)
+        assert s_db.last_condenacoes_count == 2
+        assert s_db.last_movements_hash == "hash_baseline_v1_new"
+
+        # Execução 2: idempotência preservada (0 alertas duplicados)
+        summary2 = run_monitoring_job(tenant_id=tenant_id, evaluator_fn=eval_delta)
+        assert summary2["processed"] == 1
+        assert summary2["alerts_emitted"] == 0
+        assert len(summary2["alert_events"]) == 0
+

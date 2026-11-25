@@ -2,6 +2,8 @@ import os
 import secrets
 import socket
 from pathlib import Path
+from typing import Any
+
 from dotenv import load_dotenv
 
 # Carrega variáveis do .env se existir
@@ -51,7 +53,7 @@ def _database_url() -> str:
     return f"sqlite:///{db_file}"
 
 
-def _build_engine_options(db_uri: str) -> dict:
+def _build_engine_options(db_uri: str) -> dict[str, Any]:
     """
     Configura o pool do SQLAlchemy para compatibilidade com PgBouncer (Supabase Transaction Mode - porta 6543).
     O projeto usa psycopg2-binary (não passa prepare_threshold; preserva SSL da URI).

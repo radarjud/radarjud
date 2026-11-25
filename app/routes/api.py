@@ -2738,7 +2738,7 @@ def cnj_proxy():
 
 @api_bp.route("/monitoring", methods=["POST"])
 @require_auth
-def create_monitored_supplier():
+def create_monitored_supplier() -> Response:
     """
     Ativa o monitoramento contínuo para um fornecedor homologado no tenant autenticado.
     Inicializa o baseline snapshot (movements_hash, condenacoes, cenario, status RFB, TST)
@@ -2867,7 +2867,7 @@ def create_monitored_supplier():
 
 @api_bp.route("/monitoring", methods=["GET"])
 @require_auth
-def list_monitored_suppliers():
+def list_monitored_suppliers() -> Response:
     """
     Lista fornecedores monitorados do tenant autenticado com suporte a paginação e filtro por active.
     Anti-IDOR estrito: retorna única e exclusivamente registros do tenant autenticado.
@@ -2903,7 +2903,7 @@ def list_monitored_suppliers():
 
 @api_bp.route("/monitoring/<int:monitoring_id>", methods=["PATCH"])
 @require_auth
-def update_monitored_supplier(monitoring_id: int):
+def update_monitored_supplier(monitoring_id: int) -> Response:
     """
     Atualiza status (active), canais de alerta (webhook_url, alert_email) ou razão social.
     Garante Anti-IDOR: validação obrigatória de tenant_id.
@@ -2969,7 +2969,7 @@ def update_monitored_supplier(monitoring_id: int):
 
 @api_bp.route("/monitoring/<int:monitoring_id>", methods=["DELETE"])
 @require_auth
-def delete_monitored_supplier(monitoring_id: int):
+def delete_monitored_supplier(monitoring_id: int) -> Response:
     """
     Remove fornecedor do monitoramento contínuo.
     Garante Anti-IDOR: validação obrigatória de tenant_id.
@@ -3001,7 +3001,7 @@ def delete_monitored_supplier(monitoring_id: int):
 
 @api_bp.route("/monitoring/run", methods=["POST"])
 @require_auth
-def trigger_monitoring_job():
+def trigger_monitoring_job() -> Response:
     """
     Endpoint administrativo para disparar a execução manual ou sob demanda do job de monitoramento
     para o tenant autenticado (ou todos os tenants caso admin).

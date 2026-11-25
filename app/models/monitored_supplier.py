@@ -2,11 +2,12 @@
 # Proibida a reprodução, distribuição ou uso comercial sem autorização expressa dos autores.
 
 from datetime import UTC, datetime
+from typing import Any
 
 from app.extensions import db
 
 
-def get_utc_now():
+def get_utc_now() -> datetime:
     """Retorna timestamp UTC naive compatível com SQLAlchemy."""
     return datetime.now(UTC).replace(tzinfo=None)
 
@@ -49,7 +50,7 @@ class MonitoredSupplier(db.Model):
     # Relacionamento com Tenant
     tenant = db.relationship("Tenant", backref=db.backref("monitored_suppliers", cascade="all, delete-orphan", lazy="select"))
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "tenant_id": self.tenant_id,

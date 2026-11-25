@@ -1,14 +1,14 @@
 import hashlib
 import json
-from typing import List, Dict, Any, Optional
+from typing import Any
 
 
-def _sort_by_process_number(entry: Dict[str, Any]) -> str:
+def _sort_by_process_number(entry: dict[str, Any]) -> str:
     """Extrai o número do processo para ordenação canônica determinística do hash."""
     return str(entry.get("processo", ""))
 
 
-def generate_movements_hash(processes_data: List[Dict[str, Any]], rfb_status: Optional[str] = None) -> str:
+def generate_movements_hash(processes_data: list[dict[str, Any]], rfb_status: str | None = None) -> str:
     """
     Gera um hash SHA-256 representativo do estado consolidado de movimentações,
     desfechos, tribunais e metadados dos processos e situação RFB de uma empresa.

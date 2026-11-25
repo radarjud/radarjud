@@ -1,10 +1,10 @@
-import re
-import unicodedata
-import logging
 import ipaddress
+import logging
+import re
 import socket
+import unicodedata
 import urllib.parse
-from typing import Optional, Tuple
+
 import requests
 
 logger = logging.getLogger(__name__)
@@ -164,7 +164,7 @@ def sanitize_company_name(name: str) -> str:
     return cleaned
 
 
-def fetch_cnpj_brasilapi(cnpj: str, timeout: int = 6) -> Optional[str]:
+def fetch_cnpj_brasilapi(cnpj: str, timeout: int = 6) -> str | None:
     """
     Consulta a API pública da BrasilAPI para triangulação reversa de CNPJ em Razão Social.
     Retorna a razão social oficial ou None em caso de falha de conexão ou timeout.
@@ -300,7 +300,7 @@ def resolve_search_strategy(user_input: str, brasil_api_fetcher=None) -> dict:
         }
 
 
-def validate_webhook_url(url: str, allow_local_for_testing: bool = False) -> Tuple[bool, Optional[str]]:
+def validate_webhook_url(url: str, allow_local_for_testing: bool = False) -> tuple[bool, str | None]:
     """
     Valida URL de webhook contra vulnerabilidades de SSRF (Server-Side Request Forgery).
     - Exige esquema https:// (ou http:// se allow_local_for_testing for True).
@@ -315,7 +315,7 @@ def validate_webhook_url(url: str, allow_local_for_testing: bool = False) -> Tup
     clean_url = str(url).strip()
     try:
         parsed = urllib.parse.urlparse(clean_url)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False, "URL de webhook inválida."
 
     allowed_schemes = ("https", "http") if allow_local_for_testing else ("https",)
@@ -331,34 +331,31 @@ def validate_webhook_url(url: str, allow_local_for_testing: bool = False) -> Tup
 
     # Bloqueio de hostnames locais, loopback e metadados
     blocked_hosts = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.169.254"}  # nosec B104
-    if not allow_local_for_testing and hostname in blocked_hosts:
+    if hostname in blocked_hosts:
         return False, "Endereço de webhook inseguro: endereços loopback, link-local e metadados são bloqueados."
 
     # Checagem de IP direto
     try:
         ip = ipaddress.ip_address(hostname)
-        if not allow_local_for_testing and (
-            ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast
-        ):
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
             return False, "Endereço de webhook inseguro: IPs de rede privada ou reservados são bloqueados."
         return True, None
     except ValueError:
         pass
 
     # Resolução DNS para inspecionar IPs por trás do domínio
-    if not allow_local_for_testing:
-        try:
-            addr_info = socket.getaddrinfo(hostname, None)
-            for item in addr_info:
-                ip_str = item[4][0]
-                try:
-                    ip = ipaddress.ip_address(ip_str)
-                    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-                        return False, f"O domínio '{hostname}' resolve para endereço de rede privada proibido ({ip_str})."
-                except ValueError:
-                    pass
-        except socket.gaierror:
-            pass
+    try:
+        addr_info = socket.getaddrinfo(hostname, None)
+        for item in addr_info:
+            ip_str = item[4][0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+                    return False, f"O domínio '{hostname}' resolve para endereço de rede privada proibido ({ip_str})."
+            except ValueError:
+                pass
+    except socket.gaierror:
+        pass
 
     return True, None
 
