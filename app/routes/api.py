@@ -300,6 +300,7 @@ def _deep_scan_background_worker(
             search.outcomes_summary = deep_results.get("desfechos_sentencas", {})
             search.ranking_motivos = deep_results.get("ranking_motivos", [])
             search.ranking_motivos_condenacao = deep_results.get("ranking_motivos_condenacao", [])
+            search.condenacao_por_motivo = deep_results.get("condenacao_por_motivo", [])
             search.predictions_summary = deep_results.get("plus_previsao_condenacao", [])
             search.overall_risk_score = deep_results.get("score_risco_terceirizacao", 0.0)
             search.ai_analysis = deep_results.get("ai_analysis", {})
@@ -441,6 +442,7 @@ def run_agent_pipeline():
 @api_bp.route("/company-dashboard", methods=["POST"])
 @api_bp.route("/search-company", methods=["POST", "GET"])
 @api_bp.route("/search", methods=["POST", "GET"])
+@api_bp.route("/overview", methods=["POST", "GET"])
 @limit_rate(max_requests=60, window_seconds=60)
 def search_company():
     """
@@ -573,6 +575,7 @@ def search_company():
                 res["desfechos_sentencas"] = cached_search.outcomes_summary or {}
                 res["ranking_motivos"] = cached_search.ranking_motivos or []
                 res["ranking_motivos_condenacao"] = cached_search.ranking_motivos_condenacao or []
+                res["condenacao_por_motivo"] = cached_search.condenacao_por_motivo or []
                 res["plus_previsao_condenacao"] = cached_search.predictions_summary or []
                 res["score_risco_terceirizacao"] = cached_search.overall_risk_score or 0.0
                 res["overall_risk_score"] = cached_search.overall_risk_score or 0.0
@@ -588,10 +591,12 @@ def search_company():
                     res["overall_risk_score"] = fresh_metrics["score_risco_terceirizacao"]
                     res["ranking_motivos"] = fresh_metrics.get("ranking_motivos", cached_search.ranking_motivos or [])
                     res["ranking_motivos_condenacao"] = fresh_metrics.get("ranking_motivos_condenacao", cached_search.ranking_motivos_condenacao or [])
+                    res["condenacao_por_motivo"] = fresh_metrics.get("condenacao_por_motivo", cached_search.condenacao_por_motivo or [])
                     res["probabilidade_condenacao_geral_pct"] = fresh_metrics.get("probabilidade_condenacao_geral_pct")
                     res["taxa_historica_condenacao_pct"] = fresh_metrics.get("taxa_historica_condenacao_pct")
                     cached_search.ranking_motivos = fresh_metrics.get("ranking_motivos", cached_search.ranking_motivos or [])
                     cached_search.ranking_motivos_condenacao = fresh_metrics.get("ranking_motivos_condenacao", cached_search.ranking_motivos_condenacao or [])
+                    cached_search.condenacao_por_motivo = fresh_metrics.get("condenacao_por_motivo", cached_search.condenacao_por_motivo or [])
                     cached_search.predictions_summary = fresh_metrics["plus_previsao_condenacao"]
                     cached_search.overall_risk_score = fresh_metrics["score_risco_terceirizacao"]
                 # Análise de Idoneidade Econômica & Risco de Calote Subsidiário (Súmula 331 TST)
@@ -772,6 +777,7 @@ def search_company():
                 outcomes_summary=fast_results.get("desfechos_sentencas", {}),
                 ranking_motivos=fast_results.get("ranking_motivos", []),
                 ranking_motivos_condenacao=fast_results.get("ranking_motivos_condenacao", []),
+                condenacao_por_motivo=fast_results.get("condenacao_por_motivo", []),
                 predictions_summary=fast_results.get("plus_previsao_condenacao", []),
                 economic_standing=econ_data,
                 cnae_codigo=econ_data.get("cnae_codigo") if isinstance(econ_data, dict) else None,
@@ -1392,6 +1398,7 @@ def get_search_status(search_id: int):
             response["data"]["desfechos_sentencas"] = search.outcomes_summary or {}
             response["data"]["ranking_motivos"] = search.ranking_motivos or []
             response["data"]["ranking_motivos_condenacao"] = search.ranking_motivos_condenacao or []
+            response["data"]["condenacao_por_motivo"] = search.condenacao_por_motivo or []
             response["data"]["plus_previsao_condenacao"] = search.predictions_summary or []
             response["data"]["score_risco_terceirizacao"] = search.overall_risk_score or 0.0
             response["data"]["overall_risk_score"] = search.overall_risk_score or 0.0
@@ -1405,6 +1412,7 @@ def get_search_status(search_id: int):
                 response["data"]["desfechos_sentencas"] = fresh_metrics.get("desfechos_sentencas", search.outcomes_summary)
                 response["data"]["ranking_motivos"] = fresh_metrics.get("ranking_motivos", search.ranking_motivos)
                 response["data"]["ranking_motivos_condenacao"] = fresh_metrics.get("ranking_motivos_condenacao", search.ranking_motivos_condenacao)
+                response["data"]["condenacao_por_motivo"] = fresh_metrics.get("condenacao_por_motivo", search.condenacao_por_motivo)
                 response["data"]["plus_previsao_condenacao"] = fresh_metrics.get("plus_previsao_condenacao", search.predictions_summary)
                 response["data"]["score_risco_terceirizacao"] = fresh_metrics.get("score_risco_terceirizacao", search.overall_risk_score)
                 response["data"]["overall_risk_score"] = fresh_metrics.get("score_risco_terceirizacao", search.overall_risk_score)
@@ -1679,6 +1687,7 @@ def ingest_deep_scan():
         search.outcomes_summary = fresh_metrics.get("desfechos_sentencas", {})
         search.ranking_motivos = fresh_metrics.get("ranking_motivos", [])
         search.ranking_motivos_condenacao = fresh_metrics.get("ranking_motivos_condenacao", [])
+        search.condenacao_por_motivo = fresh_metrics.get("condenacao_por_motivo", [])
         search.predictions_summary = fresh_metrics.get("plus_previsao_condenacao", [])
         search.overall_risk_score = fresh_metrics.get("score_risco_terceirizacao", 0.0)
         search.economic_standing = econ_data
@@ -2017,6 +2026,7 @@ def get_search_detail(search_id: int):
             result["plus_previsao_condenacao"] = fresh_metrics["plus_previsao_condenacao"]
             result["score_risco_terceirizacao"] = fresh_metrics["score_risco_terceirizacao"]
             result["ranking_motivos_condenacao"] = fresh_metrics.get("ranking_motivos_condenacao", [])
+            result["condenacao_por_motivo"] = fresh_metrics.get("condenacao_por_motivo", search.condenacao_por_motivo or [])
             result["previsao_bloqueada"] = fresh_metrics.get("previsao_bloqueada", False)
             result["motivo_bloqueio_previsao"] = fresh_metrics.get("motivo_bloqueio_previsao")
         result["parecer_agente_adk"] = result.get("ai_analysis", {})
@@ -2263,6 +2273,11 @@ def _search_record_to_pdf_payload(search: CompanySearch) -> dict:
     result["desfechos_sentencas"] = search.outcomes_summary or {}
     result["ranking_motivos"] = search.ranking_motivos or []
     result["ranking_motivos_condenacao"] = search.ranking_motivos_condenacao or []
+    result["condenacao_por_motivo"] = (
+        search.condenacao_por_motivo
+        if search.condenacao_por_motivo is not None
+        else result.get("condenacao_por_motivo", [])
+    )
     result["plus_previsao_condenacao"] = search.predictions_summary or []
     result["score_risco_terceirizacao"] = search.overall_risk_score or 0.0
     result["overall_risk_score"] = search.overall_risk_score or 0.0
@@ -2549,6 +2564,7 @@ def handle_pdf_export_request(
         "desfechos_sentencas": {"condenacoes": 0, "acordos": 0, "improcedentes": 0, "em_aberto": 0},
         "ranking_motivos": [],
         "ranking_motivos_condenacao": [],
+        "condenacao_por_motivo": [],
         "plus_previsao_condenacao": [],
         "indice_exposicao_financeira": econ_data.get("indice_exposicao_financeira", 0.0),
         "score_risco_terceirizacao": econ_data.get("indice_exposicao_financeira", 0.0),

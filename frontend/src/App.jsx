@@ -117,6 +117,7 @@ function normalize(raw) {
     overallRiskScore: effectiveRiskScore,
     reasons: Array.isArray(payload.ranking_motivos) ? payload.ranking_motivos : [],
     rankingCondenacoes: Array.isArray(payload.ranking_motivos_condenacao) ? payload.ranking_motivos_condenacao : [],
+    condenacaoPorMotivo: Array.isArray(payload.condenacao_por_motivo) ? payload.condenacao_por_motivo : [],
     outcomes: outcomesObj,
     secrecy: isRecord(payload.niveis_sigilo) ? payload.niveis_sigilo : null,
     predictions: Array.isArray(payload.plus_previsao_condenacao) ? payload.plus_previsao_condenacao : [],
@@ -529,14 +530,6 @@ function Overview({ data, navigate, catalogTerm }) {
             </p>
             {ai.taxa_historica_vitoria_empresa_pct != null && (
               <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap', padding: '12px 16px', background: '#f5f8fa', borderRadius: '10px' }}>
-                {ai.taxa_historica_condenacao_pct != null && (
-                  <div>
-                    <small style={{ color: '#68798a', display: 'block' }}>Taxa Histórica de Impactos Confirmados:</small>
-                    <strong style={{ fontSize: '18px', color: ai.taxa_historica_condenacao_pct >= 60 ? '#c34a4a' : ai.taxa_historica_condenacao_pct >= 35 ? '#b67b23' : '#25865a' }}>
-                      {formatPercent(ai.taxa_historica_condenacao_pct)}
-                    </strong>
-                  </div>
-                )}
                 <div>
                   <small style={{ color: '#68798a', display: 'block' }}>Taxa Histórica de Risco Mitigado (Favorável):</small>
                   <strong style={{ fontSize: '18px', color: '#25865a' }}>{formatPercent(ai.taxa_historica_vitoria_empresa_pct)}</strong>
@@ -573,31 +566,63 @@ function Overview({ data, navigate, catalogTerm }) {
         </Panel>
       )}
 
-      {/* Ranking de Vetores Principais de Exposição */}
-      {Array.isArray(data?.rankingCondenacoes) && data.rankingCondenacoes.length > 0 && (
+      {/* Condenações por Motivo do Processo (US-18) */}
+      {((Array.isArray(data?.condenacaoPorMotivo) && data.condenacaoPorMotivo.length > 0) ||
+        (Array.isArray(data?.rankingCondenacoes) && data.rankingCondenacoes.length > 0)) && (
         <Panel
-          title="Ranking de Vetores Principais de Exposição"
-          subtitle="Assuntos com histórico confirmado de desembolso financeiro que calibram o motor preditivo"
+          title="Condenações por Motivo do Processo"
+          subtitle="Distribuição empírica de condenações por motivo com faixa de variação sobre 100% dos processos mapeados"
         >
-          <div className="bars">
-            {data.rankingCondenacoes.slice(0, 6).map((item, index) => {
-              const barWidth = Math.max(8, item.taxa_no_motivo || item.taxa_condenacao_no_motivo || item.percentual || 0);
-              const labelDireita = item.label_direita || `${item.condenacoes || item.quantidade_condenacoes || item.quantidade || 0} condenações (${item.taxa_no_motivo || item.taxa_condenacao_no_motivo || item.taxa_perda_no_motivo || 0}% de perda no motivo)`;
-              return (
-                <div className="bar-item" key={`${item.motivo}-${index}`}>
-                  <div className="bar-top">
-                    <span title={item.motivo} style={{ fontWeight: 600 }}>{item.motivo}</span>
-                    <b style={{ color: '#c34a4a' }}>{labelDireita}</b>
-                  </div>
-                  <div className="track">
-                    <div style={{ width: `${Math.min(100, barWidth)}%`, background: '#c34a4a' }} />
-                  </div>
-                </div>
-              );
-            })}
+          <div className="table-scroll">
+            <table className="responsive-table">
+              <thead>
+                <tr>
+                  <th>Motivo / Assunto do Processo</th>
+                  <th style={{ textAlign: 'right' }}>Processos Mapeados</th>
+                  <th style={{ textAlign: 'right' }}>Condenações</th>
+                  <th style={{ textAlign: 'right' }}>Taxa de Condenação</th>
+                  <th style={{ textAlign: 'right' }}>Faixa de Variação</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(data.condenacaoPorMotivo?.length ? data.condenacaoPorMotivo : data.rankingCondenacoes).map((item, index) => {
+                  const totalProc = item.total_processos ?? item.total ?? item.count ?? 0;
+                  const condenacoes = item.condenacoes ?? item.quantidade_condenacoes ?? item.quantidade ?? 0;
+                  const taxa = item.taxa_condenacao ?? item.taxa_no_motivo ?? item.percentual ?? 0.0;
+                  const faixa = item.faixa_variacao || (condenacoes === 0 ? "0,0% a 0,0%" : "—");
+                  const isBlockedZero = condenacoes === 0;
+
+                  return (
+                    <tr key={`${item.motivo}-${index}`}>
+                      <td data-label="Motivo / Assunto" className="full-width">
+                        <b>{item.motivo}</b>
+                      </td>
+                      <td data-label="Processos Mapeados" style={{ textAlign: 'right' }}>
+                        <span>{formatNumber(totalProc)}</span>
+                      </td>
+                      <td data-label="Condenações" style={{ textAlign: 'right' }}>
+                        <span style={{ fontWeight: 600, color: condenacoes > 0 ? '#c34a4a' : '#25865a' }}>
+                          {formatNumber(condenacoes)}
+                        </span>
+                      </td>
+                      <td data-label="Taxa de Condenação" style={{ textAlign: 'right' }}>
+                        <Tag type={isBlockedZero ? 'green' : taxa >= 60 ? 'red' : taxa >= 35 ? 'amber' : 'green'}>
+                          {formatPercent(taxa)}
+                        </Tag>
+                      </td>
+                      <td data-label="Faixa de Variação" style={{ textAlign: 'right' }}>
+                        <span style={{ fontSize: '12px', color: '#556677', fontWeight: 500 }}>
+                          {faixa}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           </div>
           <div className="muted-note" style={{ marginTop: '14px' }}>
-            <BarChart3 size={15} /> Calibragem bayesiana contínua: os temas acima possuem desfechos confirmados que elevam o prior beta do modelo preditivo.
+            <BarChart3 size={15} /> Avaliação de 100% dos processos identificados sem cortes arbitrários. Motivos sem condenações possuem taxa fixada estritamente em 0,0%.
           </div>
         </Panel>
       )}
@@ -986,6 +1011,7 @@ function CompanyShareActions({ data }) {
         desfechos_sentencas: data.outcomes || {},
         ranking_motivos: data.reasons || [],
         ranking_motivos_condenacao: data.rankingCondenacoes || [],
+        condenacao_por_motivo: data.condenacaoPorMotivo || [],
         plus_previsao_condenacao: data.predictions || [],
         idoneidade_economica: data.idoneidadeEconomica || {},
         ai_analysis: data.aiAnalysis || {},
@@ -1136,6 +1162,9 @@ export default function App() {
               rankingCondenacoes: (updated.rankingCondenacoes && updated.rankingCondenacoes.length > 0)
                 ? updated.rankingCondenacoes
                 : prev?.rankingCondenacoes || [],
+              condenacaoPorMotivo: (updated.condenacaoPorMotivo && updated.condenacaoPorMotivo.length > 0)
+                ? updated.condenacaoPorMotivo
+                : prev?.condenacaoPorMotivo || [],
             }));
           }
           clearInterval(intervalId);
