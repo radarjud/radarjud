@@ -15,21 +15,13 @@ def _database_url() -> str:
     """
     Resolve a URI do banco de dados:
     - Normaliza postgres:// para postgresql://.
-    - Se a URL for postgresql:// genérica (sem driver explícito) e psycopg (v3) não estiver instalado,
-      faz fallback automático para postgresql+psycopg2:// (compatibilidade com psycopg2-binary no SQLAlchemy 2.0+).
+    - Preserva drivers explícitos como postgresql+psycopg2://.
     - Faz fallback para SQLite local se DATABASE_URL não estiver definida ou apontar para 'db' fora do Docker.
     """
     configured_url = os.getenv("DATABASE_URL", "").strip()
     if configured_url:
         if configured_url.startswith("postgres://"):
             configured_url = "postgresql://" + configured_url[len("postgres://"):]
-
-        # Se for postgresql:// genérico sem driver explícito (+psycopg ou +psycopg2)
-        if configured_url.startswith("postgresql://"):
-            try:
-                import psycopg  # noqa: F401
-            except ImportError:
-                configured_url = "postgresql+psycopg2://" + configured_url[len("postgresql://"):]
 
         # Se a URL aponta para o host 'db' (Docker) e estamos rodando fora do Docker (sem resolver 'db')
         if "@db:" in configured_url or "@db/" in configured_url:
