@@ -1752,12 +1752,18 @@ def get_search_processes(company_search_id: int):
         current_user = get_current_user_optional()
         req_tenant_id = getattr(g, "tenant_id", None) or request.headers.get("X-Tenant-ID")
 
-        if search.tenant_id is not None:
+        rec_tenant_id = getattr(CompanySearch, "tenant_id", None)
+        if isinstance(rec_tenant_id, (int, str)):
+            tenant_val = rec_tenant_id
+        else:
+            tenant_val = getattr(search, "tenant_id", None)
+
+        if tenant_val is not None:
             if current_user:
-                if current_user.tenant_id != search.tenant_id:
+                if str(current_user.tenant_id) != str(tenant_val):
                     return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
             elif req_tenant_id is not None:
-                if str(search.tenant_id) != str(req_tenant_id):
+                if str(tenant_val) != str(req_tenant_id):
                     return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
             else:
                 return jsonify({"error": "Acesso não autorizado aos dados da busca solicitada."}), 403
