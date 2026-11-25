@@ -113,6 +113,10 @@ def create_app(config_name: str = None) -> Flask:
                     conn.execute(db.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS valor_causa NUMERIC(15, 2);"))
                     conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_data_distribuicao ON process_records (data_distribuicao);"))
                     conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_tribunal ON process_records (tribunal);"))
+                    conn.execute(db.text("CREATE UNIQUE INDEX IF NOT EXISTS uq_process_records_search_numero ON process_records (company_search_id, numero_processo);"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_tribunal_data ON process_records (company_search_id, tribunal, data_distribuicao);"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_valor ON process_records (company_search_id, valor_causa);"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_outcome ON process_records (company_search_id, sentence_outcome);"))
                     conn.commit()
 
             # Pré-semeia e sincroniza CompanyRegistry com os metadados de grandes corporações para máxima velocidade

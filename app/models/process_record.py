@@ -12,6 +12,12 @@ class ProcessRecord(db.Model):
     Focado estritamente na Pessoa Jurídica (Compliance LGPD).
     """
     __tablename__ = "process_records"
+    __table_args__ = (
+        db.UniqueConstraint("company_search_id", "numero_processo", name="uq_process_records_search_numero"),
+        db.Index("ix_process_records_search_tribunal_data", "company_search_id", "tribunal", "data_distribuicao"),
+        db.Index("ix_process_records_search_valor", "company_search_id", "valor_causa"),
+        db.Index("ix_process_records_search_outcome", "company_search_id", "sentence_outcome"),
+    )
 
     id = db.Column(db.Integer, primary_key=True)
     company_search_id = db.Column(db.Integer, db.ForeignKey("company_searches.id", ondelete="CASCADE"), nullable=False, index=True)
