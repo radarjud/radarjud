@@ -9,6 +9,13 @@ from app.services.monitoring_job import (
     evaluate_monitored_supplier,
     dispatch_alert,
 )
+from app.services.notifier import NotificationService
+from app.services.task_dispatcher import (
+    TaskDispatcher,
+    UpstashRedisDispatcher,
+    InProcessFallbackDispatcher,
+    get_task_dispatcher,
+)
 
 __all__ = [
     "CNJClient",
@@ -21,5 +28,10 @@ __all__ = [
     "run_monitoring_job",
     "evaluate_monitored_supplier",
     "dispatch_alert",
+    "NotificationService",
+    "TaskDispatcher",
+    "UpstashRedisDispatcher",
+    "InProcessFallbackDispatcher",
+    "get_task_dispatcher",
 ]
 

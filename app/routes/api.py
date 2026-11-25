@@ -3033,3 +3033,65 @@ def trigger_monitoring_job() -> Response:
 
     summary = run_monitoring_job(batch_size=batch_size, tenant_id=tenant_filter)
     return jsonify(summary), 200
+
+
+@api_bp.route("/internal/run-monitoring", methods=["POST"])
+def internal_run_monitoring() -> Response:
+    """
+    Endpoint interno agendado (US-11) protegido por X-Cron-Secret (comparação em tempo constante).
+    Executa a varredura de fornecedores monitorados, enfileira alertas no TaskDispatcher
+    (Upstash Redis ou fallback in-process) e processa o lote de notificações.
+    """
+    expected_secret = (
+        os.getenv("CRON_SECRET")
+        or current_app.config.get("CRON_SECRET")
+        or ""
+    ).strip()
+    provided_secret = (request.headers.get("X-Cron-Secret") or "").strip()
+
+    if (
+        not expected_secret
+        or not provided_secret
+        or not hmac.compare_digest(provided_secret, expected_secret)
+    ):
+        return jsonify({"error": "Forbidden"}), 403
+
+    from app.services.monitoring_job import run_monitoring_job
+    from app.services.task_dispatcher import get_task_dispatcher
+
+    t0 = time.perf_counter()
+    data = request.get_json(silent=True) or {}
+    try:
+        batch_size = min(50, max(1, int(data.get("batch_size", 10))))
+    except (TypeError, ValueError):
+        batch_size = 10
+    try:
+        max_items = min(100, max(1, int(data.get("max_items", 25))))
+    except (TypeError, ValueError):
+        max_items = 25
+
+    tenant_filter = data.get("tenant_id")
+    dispatcher = get_task_dispatcher()
+    try:
+        scan_summary = run_monitoring_job(
+            batch_size=batch_size,
+            tenant_id=tenant_filter,
+            dispatcher=dispatcher,
+        )
+        queue_summary = dispatcher.process_batch(max_items=max_items)
+    finally:
+        dispatcher.close()
+
+    duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    return jsonify({
+        "status": "success",
+        "dispatcher_backend": dispatcher.backend_name,
+        "suppliers_checked": scan_summary["processed"],
+        "enqueued": scan_summary.get("enqueued", 0),
+        "processed": queue_summary["processed"],
+        "succeeded": queue_summary["succeeded"],
+        "failed": queue_summary["failed"],
+        "remaining": queue_summary["remaining"],
+        "errors": scan_summary["errors"] + queue_summary["failed"],
+        "duration_ms": duration_ms,
+    }), 200

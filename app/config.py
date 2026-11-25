@@ -89,6 +89,19 @@ class Config:
     # Portal da Transparência / CGU
     PORTAL_TRANSPARENCIA_API_KEY = os.getenv("PORTAL_TRANSPARENCIA_API_KEY", "").strip()
 
+    # Fila Assíncrona (Upstash Redis Serverless + Cron US-11)
+    REDIS_URL = os.getenv("REDIS_URL", "").strip()
+    CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
+
+    # Notificações Transacionais (Resend API + Fallback SMTP)
+    RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+    ALERT_FROM_EMAIL = os.getenv("ALERT_FROM_EMAIL", "alertas@radarjus.com.br").strip()
+    SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+    SMTP_PORT = int(os.getenv("SMTP_PORT", "587") or "587")
+    SMTP_USER = os.getenv("SMTP_USER", "").strip()
+    SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
+    SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").strip().lower() in ("1", "true", "yes")
+
     # Configurações de Conectividade e Resiliência
     REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
     MAX_PROCESSES_PER_QUERY = int(os.getenv("MAX_PROCESSES_PER_QUERY", "100"))
