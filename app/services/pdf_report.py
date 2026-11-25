@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from app.services.business_labels import business_text
 from app.services.pdf_svg_charts import (
     generate_bayes_vs_sumula331_svg,
     generate_comparative_bars_svg,
@@ -290,13 +291,14 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 qtd = int(
                     it.get("quantidade_condenacoes")
+                    or it.get("condenacoes")
                     or it.get("quantidade")
                     or it.get("total")
                     or it.get("count")
                     or 0
                 )
                 pct = it.get("percentual") or it.get("pct") or it.get("taxa_condenacao_pct")
-                normalized.append({"motivo": nome, "quantidade": qtd, "percentual": pct})
+                normalized.append({"motivo": nome, "quantidade": qtd, "percentual": pct, "taxa_no_motivo": next((it[k] for k in ("taxa_no_motivo", "taxa_condenacao_no_motivo", "taxa_perda_no_motivo") if it.get(k) is not None), None)})
             elif isinstance(it, str):
                 normalized.append({"motivo": it, "quantidade": 0, "percentual": None})
         return normalized
@@ -463,16 +465,19 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
     ]))
     story.append(header_table)
     story.append(Spacer(1, 8))
+    story.append(Paragraph("Recomendação de contratação: " + _xml_escape(comp["recomendacao"]), style_h2))
+    for action in comp["recomendacoes"]:
+        story.append(Paragraph("<b>" + _xml_escape(action) + "</b>", style_h2))
 
     # 2. KPIs Principais (Exposição Financeira, Eventos, Confiança Bayesiana, Desfechos)
-    exp_num = float(report["exposure_score"] or 0.0)
+    exp_num = float(econ["risco_sub"] or 0.0)
     exp_color = "#c34a4a" if exp_num >= 60 else ("#b67b23" if exp_num >= 35 else "#25865a")
     kpi_table = Table(
         [[
             Paragraph(
-                f"ÍNDICE DE EXPOSIÇÃO FINANCEIRA<br/>"
-                f"<font size='14' color='{exp_color}'><b>{_format_pct(report['exposure_score'])}</b></font><br/>"
-                f"<font size='7.5' color='#526477'>Score geral de impacto subsidiário</font>",
+                f"RISCO SUBSIDIÁRIO<br/>"
+                f"<font size='14' color='{exp_color}'><b>{_format_pct(econ['risco_sub'], '—')}</b></font><br/>"
+                f"<font size='7.5' color='#526477'>Estimativa de risco ao contratante</font>",
                 style_kpi_label,
             ),
             Paragraph(
@@ -482,7 +487,7 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
                 style_kpi_label,
             ),
             Paragraph(
-                f"CONFIANÇA BAYESIANA<br/>"
+                f"CONFIANÇA DA ESTIMATIVA<br/>"
                 f"<font size='11' color='#245a81'><b>{_xml_escape(report['conf_label'])}</b></font><br/>"
                 f"<font size='7.5' color='#526477'>{_xml_escape(report['conf_detail'])}</font>",
                 style_kpi_label,
@@ -665,7 +670,7 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
     story.append(Spacer(1, 10))
     story.append(Paragraph(
         "Fontes Oficiais Consultadas: Comunica PJe (CNJ), DataJud (CNJ), Receita Federal do Brasil, CGU (CEIS/CNEP) e PGFN. "
-        "Relatório gerado automaticamente pelo RadarJus v2.0 (Motor Bayesiano Empírico + Auditoria de Solvência).",
+        "Relatório gerado automaticamente pelo RadarJus v2.0 (Estimativa baseada no histórico + Auditoria de Solvência).",
         style_small,
     ))
 
@@ -693,9 +698,9 @@ def _generate_pdf_pure_python(report: Dict[str, Any]) -> bytes:
         f"CNPJ Matriz: {report['cnpj_formatted']} | Emissao: {report['generated_at']}",
         "-" * 78,
         "1. INDICADORES PREDITIVOS & EXPOSICAO",
-        f"   Indice de Exposicao Financeira: {_format_pct(report['exposure_score'])}",
+        f"   Risco Subsidiario: {_format_pct(econ['risco_sub'], '—')}",
         f"   Eventos Identificados: {report['total_processes']}",
-        f"   Grau de Confianca Bayesiano: {report['conf_detail']}",
+        f"   Confianca da estimativa: {report['conf_detail']}",
         f"   Desfechos: Condenacoes={out['condenacoes']} | Acordos={out['acordos']} | Improcedentes={out['improcedentes']} | Em Aberto={out['em_aberto']}",
         "-" * 78,
         "2. IDONEIDADE ECONOMICA & EXPOSICAO SUBSIDIARIA",
@@ -838,7 +843,7 @@ def _generate_comparative_pdf_reportlab(companies: List[Dict[str, Any]]) -> byte
         Paragraph("<b>EMPRESA</b>", cell_head),
         Paragraph("<b>CNPJ</b>", cell_head),
         Paragraph("<b>PROCESSOS</b>", cell_head),
-        Paragraph("<b>SCORE RISCO</b>", cell_head),
+        Paragraph("<b>RISCO SUBSIDIÁRIO</b>", cell_head),
         Paragraph("<b>CENÁRIO</b>", cell_head),
         Paragraph("<b>RECOMENDAÇÃO</b>", cell_head),
     ]]
@@ -850,7 +855,7 @@ def _generate_comparative_pdf_reportlab(companies: List[Dict[str, Any]]) -> byte
             Paragraph(comp["company_name"][:28], cell_body),
             Paragraph(comp["cnpj_formatted"], cell_body),
             Paragraph(str(comp["total_processes"]), cell_body),
-            Paragraph(f"{comp['exposure_score']:.1f}%", cell_body),
+            Paragraph(_format_pct(comp["economic"]["risco_sub"], "—"), cell_body),
             Paragraph(c_badge, cell_body),
             Paragraph(recom[:26], cell_body),
         ])
@@ -893,7 +898,7 @@ def _generate_comparative_pdf_pure_python(companies: List[Dict[str, Any]]) -> by
     ]
     for comp in companies:
         lines.append(f"Empresa: {_ascii_latin1(comp['company_name'])}")
-        lines.append(f"CNPJ: {comp['cnpj_formatted']} | Processos: {comp['total_processes']} | Score: {comp['exposure_score']:.1f}%")
+        lines.append(f"CNPJ: {comp['cnpj_formatted']} | Processos: {comp['total_processes']} | Risco Subsidiario: {_format_pct(comp['economic']['risco_sub'], 'Nao informado')}")
         lines.append(f"Cenario: {_ascii_latin1(comp['economic']['cenario_badge'])}")
         lines.append(f"Recomendacao: {_ascii_latin1(comp['compliance']['recomendacao'])}")
         lines.append("----------------------------------------------------------------------")
@@ -945,7 +950,7 @@ def generate_company_report_pdf(raw_data: Dict[str, Any]) -> bytes:
     Gera o PDF executivo v3.0 (HTML/CSS-to-PDF com WeasyPrint, Jinja2 e gráficos SVG).
     Cai com resiliência total para ReportLab e gerador PDF puro caso WeasyPrint falhe.
     """
-    report = normalize_report_payload(raw_data)
+    report = business_text(normalize_report_payload(raw_data))
     outcomes_svg = generate_outcomes_simplex_svg(report.get("outcomes"))
 
     is_cenario_b = not report.get("economic", {}).get("is_cenario_a", True)
@@ -1006,14 +1011,14 @@ def generate_comparative_report_pdf(raw_data: Any) -> bytes:
         if not companies_raw:
             companies_raw = [raw_data]
 
-    normalized_companies = [normalize_report_payload(c) for c in companies_raw[:5]]
+    normalized_companies = [business_text(normalize_report_payload(c)) for c in companies_raw[:5]]
     comp_chart_data = [
         {
             "nome": c["company_name"],
-            "score": c["exposure_score"],
+            "score": c["economic"]["risco_sub"],
             "processos": c["total_processes"],
         }
-        for c in normalized_companies
+        for c in normalized_companies if c["economic"]["risco_sub"] is not None
     ]
     comparative_svg = generate_comparative_bars_svg(comp_chart_data)
 
