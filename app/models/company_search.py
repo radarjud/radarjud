@@ -44,6 +44,10 @@ class CompanySearch(db.Model):
     cnae_codigo = db.Column(db.String(20), nullable=True, index=True)
     cnae_descricao = db.Column(db.String(255), nullable=True)
 
+    # Responsabilidade Subsidiária de Tomadoras PJ (Súmula 331 TST - US-19)
+    condenacoes_subsidiarias_tomadoras_count = db.Column(db.Integer, default=0, nullable=True)
+    tomadoras_subsidiarias_pj = db.Column(db.JSON, nullable=True)
+
     created_at = db.Column(db.DateTime, default=get_utc_now, nullable=False)
     updated_at = db.Column(db.DateTime, default=get_utc_now, onupdate=get_utc_now, nullable=False)
 
@@ -139,6 +143,13 @@ class CompanySearch(db.Model):
             "idoneidade_economica": econ_data,
             "logo": self._sanitize_logo_for_export(econ_data.get("logo", {}) if isinstance(econ_data, dict) else {}),
             "ai_analysis": self.ai_analysis or {},
+            "condenacoes_subsidiarias_tomadoras_count": int(self.condenacoes_subsidiarias_tomadoras_count or 0),
+            "tomadoras_subsidiarias_pj": self.tomadoras_subsidiarias_pj or [],
+            "mensagem_responsabilidade_subsidiaria": (
+                f"Histórico de Responsabilidade Subsidiária: {int(self.condenacoes_subsidiarias_tomadoras_count or 0)} processos com condenação subsidiária atribuída a contratantes anteriores"
+                if int(self.condenacoes_subsidiarias_tomadoras_count or 0) > 0
+                else "Nenhuma condenação subsidiária de contratante identificada na amostra"
+            ),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
