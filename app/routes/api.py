@@ -2112,20 +2112,51 @@ def get_search_history():
 
     limit = int(request.args.get("limit", 20))
     try:
-        query = CompanySearch.query
-        if current_user:
-            query = query.filter_by(tenant_id=current_user.tenant_id)
-        else:
-            query = query.filter(CompanySearch.tenant_id.is_(None))
-            
-        searches = (
-            query.order_by(CompanySearch.updated_at.desc())
-            .limit(limit)
-            .all()
-        )
+        try:
+            query = CompanySearch.query
+            if current_user:
+                query = query.filter_by(tenant_id=current_user.tenant_id)
+            else:
+                query = query.filter(CompanySearch.tenant_id.is_(None))
+                
+            searches = (
+                query.order_by(CompanySearch.updated_at.desc())
+                .limit(limit)
+                .all()
+            )
+        except Exception as query_exc:
+            # Se falhou por coluna ausente no SQLite local, aplica migrações e reexecuta
+            from app import ensure_database_schema
+            logger.warning("Query de histórico falhou, aplicando migrações defensivas: %s", query_exc)
+            ensure_database_schema(db)
+            query = CompanySearch.query
+            if current_user:
+                query = query.filter_by(tenant_id=current_user.tenant_id)
+            else:
+                query = query.filter(CompanySearch.tenant_id.is_(None))
+            searches = (
+                query.order_by(CompanySearch.updated_at.desc())
+                .limit(limit)
+                .all()
+            )
+
+        items = []
+        for s in searches:
+            try:
+                items.append(s.to_dict())
+            except Exception as ser_err:
+                logger.warning("Falha ao serializar search id=%s: %s", getattr(s, "id", None), ser_err)
+                items.append({
+                    "id": getattr(s, "id", None),
+                    "company_name": getattr(s, "company_name", "Desconhecido"),
+                    "total_processes": getattr(s, "total_processes", 0),
+                    "scan_status": getattr(s, "scan_status", "COMPLETED"),
+                    "updated_at": s.updated_at.isoformat() if getattr(s, "updated_at", None) else None,
+                })
+
         return jsonify({
-            "total": len(searches),
-            "items": [s.to_dict() for s in searches]
+            "total": len(items),
+            "items": items,
         }), 200
     except Exception as exc:
         logger.error("Erro ao listar histórico de pesquisas: %s", exc)

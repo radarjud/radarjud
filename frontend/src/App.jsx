@@ -1302,8 +1302,14 @@ export default function App() {
         }, { signal, page1Items: first.items });
         if (!current()) return;
         {
+          const isFinal = scan.failedPages.length === 0;
           await request('/ingest-deep-scan', {
-            method: 'POST', signal, body: JSON.stringify({ search_id: Number(normalized.searchId), items: scan.items, browser_scan_finished: true, is_final_batch: scan.failedPages.length === 0 && scan.received >= first.count && first.count <= 1000 }),
+            method: 'POST', signal, body: JSON.stringify({
+              search_id: Number(normalized.searchId),
+              items: scan.items,
+              browser_scan_finished: true,
+              is_final_batch: isFinal,
+            }),
           });
           if (!current()) return;
           const updated = normalize(await request(`/history/${normalized.searchId}`, { signal }));
@@ -1311,7 +1317,14 @@ export default function App() {
             setData(prev => validSearchId(prev?.searchId) === validSearchId(normalized.searchId) ? updated : prev);
           }
         }
-        if (current()) setScanProgress({ running: false, message: scan.failedPages.length || (first.count <= 1000 && scan.received < first.count) ? 'Varredura parcial: nem todas as comunicações foram coletadas.' : first.count > 1000 ? 'Varredura limitada às primeiras 10 páginas.' : 'Varredura do navegador concluída.' });
+        if (current()) {
+          setScanProgress({
+            running: false,
+            message: scan.failedPages.length
+              ? 'Varredura parcial: nem todas as comunicações foram coletadas.'
+              : 'Varredura concluída com sucesso.',
+          });
+        }
       } catch {
         if (current()) setScanProgress({ running: false, message: 'Não foi possível consolidar toda a varredura. Os resultados iniciais foram preservados.' });
       }

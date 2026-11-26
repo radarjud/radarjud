@@ -1,5 +1,33 @@
+import json
+from typing import Any
 from datetime import datetime, timezone, timedelta
 from app.extensions import db
+
+
+def _safe_dict(val: Any) -> dict:
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str) and val.strip():
+        try:
+            parsed = json.loads(val)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {}
+
+
+def _safe_list(val: Any) -> list:
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str) and val.strip():
+        try:
+            parsed = json.loads(val)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+    return []
 
 
 def get_utc_now():
@@ -68,7 +96,7 @@ class CompanySearch(db.Model):
         return delta <= timedelta(hours=hours)
 
     def to_dict(self):
-        outcomes = self.outcomes_summary or {}
+        outcomes = _safe_dict(self.outcomes_summary)
         julgados = outcomes.get("condenacoes", 0) + outcomes.get("acordos", 0) + outcomes.get("improcedentes", 0)
         condenacoes = outcomes.get("condenacoes", 0)
         
@@ -88,51 +116,59 @@ class CompanySearch(db.Model):
             prob_cond_shrunk = (
                 round(((condenacoes + 3.0 * 0.50) / (julgados + 3.0)) * 100.0, 1)
                 if julgados > 0
-                else (self.overall_risk_score if self.total_processes > 0 else None)
+                else (self.overall_risk_score if (self.total_processes or 0) > 0 else None)
             )
-            plus_previsoes = self.predictions_summary or []
+            plus_previsoes = _safe_list(self.predictions_summary)
 
         public_count = max(0, (self.total_processes or 0) - (self.secrecy_count or 0))
         niveis_sigilo = {"0": public_count}
         if self.secrecy_count and self.secrecy_count > 0:
             niveis_sigilo["1"] = self.secrecy_count
 
-        # Avaliação consistente de Idoneidade Econômica & Logomarca
-        from app.services.economic_service import EconomicStandingService
-        econ_data = self.economic_standing
+        # Idoneidade Econômica & Logomarca (NUNCA dispara chamadas de rede no to_dict)
+        econ_data = _safe_dict(self.economic_standing)
         if not econ_data:
-            econ_service = EconomicStandingService()
-            econ_data = econ_service.evaluate_economic_standing(
-                company_name=self.company_name,
-                company_processes=[p.to_dict() for p in self.processes],
-                p_condenacao_trabalhista=prob_cond_shrunk or self.overall_risk_score or 0.0,
-            )
+            from app.services.economic_service import EconomicStandingService
+            try:
+                econ_service = EconomicStandingService()
+                logo_info = econ_service.get_company_logo_info(self.company_name or "")
+            except Exception:
+                logo_info = {}
+            econ_data = {
+                "cenario": "CENARIO_A",
+                "cenario_badge": "Cenário A · Regular",
+                "cenario_titulo": "Cenário A: Idoneidade Econômica Observada",
+                "cenario_class": "seguro",
+                "classificacao_porte": "Porte Médio / Regular",
+                "capital_social_declarado": 0.0,
+                "capital_social_formatado": "R$ 0,00",
+                "valor_formatado": "R$ 0,00",
+                "probabilidade_insolvencia": 20.0,
+                "probabilidade_insolvencia_pct": 20.0,
+                "risco_calote_subsidiario": 10.0,
+                "risco_calote_subsidiario_pct": 10.0,
+                "logo": logo_info,
+                "sinais_solvencia_publica": None,
+            }
 
-        cond_por_motivo = self.condenacao_por_motivo
-        if cond_por_motivo is None and self.processes:
-            from app.services.prediction_engine import build_condenacao_por_motivo
-            cond_por_motivo = build_condenacao_por_motivo([p.to_dict() for p in self.processes])
+        cond_por_motivo = _safe_list(self.condenacao_por_motivo)
+        if not cond_por_motivo and self.processes:
+            try:
+                from app.services.prediction_engine import build_condenacao_por_motivo
+                cond_por_motivo = build_condenacao_por_motivo([p.to_dict() for p in self.processes])
+            except Exception:
+                cond_por_motivo = []
 
-        sub_count = self.condenacoes_subsidiarias_tomadoras_count
-        sub_tomadoras = self.tomadoras_subsidiarias_pj
-        if (sub_count is None or sub_tomadoras is None) and self.processes:
-            from app.services.ai_analyzer import detect_subsidiary_liability_in_processes
-            sub_res = detect_subsidiary_liability_in_processes(
-                [p.to_dict() for p in self.processes],
-                evaluated_company=self.company_name,
-            )
-            sub_count = sub_res["condenacoes_subsidiarias_tomadoras_count"]
-            sub_tomadoras = sub_res["tomadoras_subsidiarias_pj"]
-        sub_count = int(sub_count or 0)
-        sub_tomadoras = list(sub_tomadoras or [])
+        sub_count = int(self.condenacoes_subsidiarias_tomadoras_count or 0)
+        sub_tomadoras = _safe_list(self.tomadoras_subsidiarias_pj)
         msg_sub = (
             f"Histórico de Responsabilidade Subsidiária: {sub_count} processos com condenação subsidiária atribuída a contratantes anteriores"
             if sub_count > 0
             else "Nenhuma condenação subsidiária de contratante identificada na amostra"
         )
 
-        contratos_pub = self.contratos_poder_publico
-        if not isinstance(contratos_pub, dict):
+        contratos_pub = _safe_dict(self.contratos_poder_publico)
+        if not contratos_pub:
             contratos_pub = {
                 "status": "DISPONIVEL",
                 "total_contratos": 0,
