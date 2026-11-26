@@ -719,7 +719,8 @@ def search_company():
                     res["score_risco_terceirizacao"] = econ_data["indice_exposicao_financeira"]
                     res["overall_risk_score"] = econ_data["indice_exposicao_financeira"]
 
-if isinstance(cached_search.ai_analysis, dict) and cached_search.ai_analysis:
+                # Reutiliza parecer de IA persistido quando disponível (evita chamada Gemini em L1 hit)
+                if isinstance(cached_search.ai_analysis, dict) and cached_search.ai_analysis:
                     res["ai_analysis"] = cached_search.ai_analysis
                 else:
                     fresh_ai = orchestrator.ai_analyzer.analyze_company(res)
