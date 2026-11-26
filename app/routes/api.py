@@ -307,6 +307,11 @@ def _deep_scan_background_worker(
             if "condenacoes_subsidiarias_tomadoras_count" in deep_results:
                 search.condenacoes_subsidiarias_tomadoras_count = deep_results.get("condenacoes_subsidiarias_tomadoras_count", 0)
                 search.tomadoras_subsidiarias_pj = deep_results.get("tomadoras_subsidiarias_pj", [])
+            if search.contratos_poder_publico is None:
+                from app.services.public_contracts_service import public_contracts_service
+                deep_cnpj = next(iter(cnpjs_found), None) or (econ.get("cnpj") if isinstance(econ, dict) else None)
+                if deep_cnpj:
+                    search.contratos_poder_publico = public_contracts_service.get_public_contracts(deep_cnpj)
             search.movements_hash = deep_results.get("movements_hash")
             search.economic_standing = deep_results["idoneidade_economica"]
             if search.economic_standing and isinstance(search.economic_standing, dict):
@@ -767,6 +772,20 @@ def search_company():
             fast_results["ai_analysis"] = fresh_ai
             fast_results["parecer_agente_adk"] = fresh_ai
 
+        # Consulta de Contratos com o Poder Público (PNCP / Portal da Transparência - US-20)
+        from app.services.public_contracts_service import public_contracts_service
+        clean_search_cnpj = cnpj_used or (econ_data.get("cnpj") if isinstance(econ_data, dict) else None)
+        contratos_pub = public_contracts_service.get_public_contracts(clean_search_cnpj) if clean_search_cnpj else {
+            "status": "DISPONIVEL",
+            "total_contratos": 0,
+            "esferas": [],
+            "orgaos_contratantes": [],
+            "valor_global_total": None,
+            "valor_global_formatado": None,
+            "mensagem": "Nenhum contrato público localizado nas bases consultadas",
+        }
+        fast_results["contratos_poder_publico"] = contratos_pub
+
         # Persistência do resultado no PostgreSQL
         search_id = None
         try:
@@ -789,6 +808,7 @@ def search_company():
                 cnae_descricao=econ_data.get("cnae_descricao") if isinstance(econ_data, dict) else None,
                 condenacoes_subsidiarias_tomadoras_count=fast_results.get("condenacoes_subsidiarias_tomadoras_count", 0),
                 tomadoras_subsidiarias_pj=fast_results.get("tomadoras_subsidiarias_pj", []),
+                contratos_poder_publico=contratos_pub,
                 overall_risk_score=fast_results.get("score_risco_terceirizacao", 0.0),
                 ai_analysis=fast_results.get("ai_analysis", {}),
                 movements_hash=new_hash,
@@ -2040,6 +2060,19 @@ def get_search_detail(search_id: int):
             result["previsao_bloqueada"] = fresh_metrics.get("previsao_bloqueada", False)
             result["motivo_bloqueio_previsao"] = fresh_metrics.get("motivo_bloqueio_previsao")
         result["parecer_agente_adk"] = result.get("ai_analysis", {})
+        if not result.get("contratos_poder_publico"):
+            from app.services.public_contracts_service import public_contracts_service
+            econ_s = search.economic_standing if isinstance(search.economic_standing, dict) else {}
+            c_cnpj = econ_s.get("cnpj")
+            result["contratos_poder_publico"] = public_contracts_service.get_public_contracts(c_cnpj) if c_cnpj else {
+                "status": "DISPONIVEL",
+                "total_contratos": 0,
+                "esferas": [],
+                "orgaos_contratantes": [],
+                "valor_global_total": None,
+                "valor_global_formatado": None,
+                "mensagem": "Nenhum contrato público localizado nas bases consultadas",
+            }
         return jsonify(result), 200
     except Exception as exc:
         logger.error("Erro ao obter detalhes da pesquisa ID %d: %s", search_id, exc)
