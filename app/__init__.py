@@ -96,6 +96,7 @@ def create_app(config_name: str = None) -> Flask:
             from app.models.process_record import ProcessRecord  # noqa: F401
             from app.models.CompanyRegistry import CompanyRegistry  # noqa: F401
             from app.models.monitored_supplier import MonitoredSupplier  # noqa: F401
+            from app.models.pep_registry import PEPComplianceCache, PEPRegistry  # noqa: F401
             from app.models.public_contract_cache import PublicContractCache  # noqa: F401
             db.create_all()
             if db.engine.dialect.name == "postgresql":
@@ -112,11 +113,14 @@ def create_app(config_name: str = None) -> Flask:
                     conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS condenacoes_subsidiarias_tomadoras_count INTEGER DEFAULT 0;"))
                     conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS tomadoras_subsidiarias_pj JSON;"))
                     conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS contratos_poder_publico JSON;"))
+                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS compliance_pep JSON;"))
                     conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_company_searches_cnae_codigo ON company_searches (cnae_codigo);"))
                     conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS cnae_codigo VARCHAR(20);"))
                     conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS cnae_descricao VARCHAR(255);"))
                     conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS public_contracts JSON;"))
                     conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS public_contracts_cached_at TIMESTAMP;"))
+                    conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS compliance_pep JSON;"))
+                    conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS compliance_pep_cached_at TIMESTAMP;"))
                     conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_company_registry_cnae_codigo ON company_registry (cnae_codigo);"))
                     conn.execute(db.text("CREATE TABLE IF NOT EXISTS public_contracts_cache ("
                                          "id SERIAL PRIMARY KEY, "

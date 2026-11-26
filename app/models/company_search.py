@@ -51,6 +51,9 @@ class CompanySearch(db.Model):
     # Contratos com o Poder Público (PNCP / Portal da Transparência - US-20)
     contratos_poder_publico = db.Column(db.JSON, nullable=True)
 
+    # Compliance de Pessoas Politicamente Expostas no QSA (CGU - US-21)
+    compliance_pep = db.Column(db.JSON, nullable=True)
+
     created_at = db.Column(db.DateTime, default=get_utc_now, nullable=False)
     updated_at = db.Column(db.DateTime, default=get_utc_now, onupdate=get_utc_now, nullable=False)
 
@@ -143,6 +146,15 @@ class CompanySearch(db.Model):
                 "mensagem": "Nenhum contrato público localizado nas bases consultadas",
             }
 
+        pep_data = self.compliance_pep
+        if not isinstance(pep_data, dict):
+            pep_data = {
+                "status": "NAO_IDENTIFICADO",
+                "total_vinculos_identificados": 0,
+                "ocorrencias": [],
+                "recomendacao": "Nenhum vínculo com Pessoa Politicamente Exposta (PEP) identificado no QSA consultado.",
+            }
+
         return {
             "id": self.id,
             "tenant_id": self.tenant_id,
@@ -180,6 +192,7 @@ class CompanySearch(db.Model):
             "tomadoras_subsidiarias_pj": sub_tomadoras,
             "mensagem_responsabilidade_subsidiaria": msg_sub,
             "contratos_poder_publico": contratos_pub,
+            "compliance_pep": pep_data,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

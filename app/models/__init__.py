@@ -5,6 +5,7 @@ from app.models.process_record import ProcessRecord
 from app.models.audit_log import AuditLog
 from app.models.monitored_supplier import MonitoredSupplier
 from app.models.CompanyRegistry import CompanyRegistry
+from app.models.pep_registry import PEPComplianceCache, PEPRegistry
 from app.models.public_contract_cache import PublicContractCache
 
 __all__ = [
@@ -16,5 +17,7 @@ __all__ = [
     "MonitoredSupplier",
     "CompanyRegistry",
     "PublicContractCache",
+    "PEPRegistry",
+    "PEPComplianceCache",
 ]
 

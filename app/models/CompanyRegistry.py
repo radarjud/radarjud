@@ -26,6 +26,10 @@ class CompanyRegistry(db.Model):
     public_contracts = db.Column(db.JSON, nullable=True)
     public_contracts_cached_at = db.Column(db.DateTime, nullable=True)
 
+    # Compliance de Pessoas Politicamente Expostas no QSA (CGU - US-21)
+    compliance_pep = db.Column(db.JSON, nullable=True)
+    compliance_pep_cached_at = db.Column(db.DateTime, nullable=True)
+
     created_at = db.Column(db.DateTime, default=get_utc_now, nullable=False)
     updated_at = db.Column(
         db.DateTime,
@@ -49,6 +53,8 @@ class CompanyRegistry(db.Model):
             "cnae_descricao": self.cnae_descricao,
             "public_contracts": self.public_contracts,
             "public_contracts_cached_at": self.public_contracts_cached_at.isoformat() if self.public_contracts_cached_at else None,
+            "compliance_pep": self.compliance_pep,
+            "compliance_pep_cached_at": self.compliance_pep_cached_at.isoformat() if self.compliance_pep_cached_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
