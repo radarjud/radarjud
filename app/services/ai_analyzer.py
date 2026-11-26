@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import logging
 import threading
+import unicodedata
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 import requests
@@ -66,10 +67,11 @@ SUBSIDIARY_PATTERNS = [
     re.compile(p, re.IGNORECASE) for p in [
         r"responsabilidade\s+subsidi[aá]ria",
         r"condena[cç][aã]o\s+subsidi[aá]ria",
-        r"condenad[ao]s?\s+subsidiariamente",
+        r"conden(?:o|a|am|ou|ad[ao]s?)\s+subsidiariamente",
         r"responde(m)?\s+subsidiariamente",
+        r"subsidiariamente",
         r"s[uú]mula\s*(?:n[ºo]?\s*)?331",
-        r"tomador(?:a)?\s+(?:de|dos|do)\s+servi[cç]os?",
+        r"tomador(?:a)?(?:\s+(?:de|dos|do|da))?\s*(?:servi[cç]os?)?",
         r"responsabiliza[cç][aã]o\s+subsidi[aá]ria",
         r"devedor(?:a)?\s+subsidi[aá]ri[ao]",
         r"execu[cç][aã]o\s+subsidi[aá]ria",
@@ -133,14 +135,31 @@ def sanitize_contractor_pj_name(
     if not has_pj_indicator and not has_cnpj:
         return None
 
-    name_upper = name.upper().strip(" .,;:-_")
+    # Normaliza diacríticos para ASCII para comparações consistentes e sem ruído
+    name_normalized = (
+        unicodedata.normalize("NFKD", name)
+        .encode("ASCII", "ignore")
+        .decode("utf-8")
+    )
+    name_upper = name_normalized.upper().strip(" .,;:-_")
 
     for exc in EXCLUDED_ENTITIES:
-        if exc in name_upper:
+        exc_norm = (
+            unicodedata.normalize("NFKD", exc)
+            .encode("ASCII", "ignore")
+            .decode("utf-8")
+            .upper()
+        )
+        if exc_norm in name_upper:
             return None
 
     if evaluated_company:
-        clean_eval = re.sub(r"[^\w\s]", "", evaluated_company.upper()).strip()
+        eval_norm = (
+            unicodedata.normalize("NFKD", evaluated_company)
+            .encode("ASCII", "ignore")
+            .decode("utf-8")
+        )
+        clean_eval = re.sub(r"[^\w\s]", "", eval_norm.upper()).strip()
         clean_name = re.sub(r"[^\w\s]", "", name_upper).strip()
 
         if clean_eval and (clean_name == clean_eval or clean_eval in clean_name or clean_name in clean_eval):
