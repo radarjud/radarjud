@@ -11,10 +11,15 @@ from app.services.monitoring_job import (
 )
 from app.services.ai_analyzer import detect_subsidiary_liability_in_processes
 from app.services.notifier import NotificationService
+from app.services.pep_compliance_service import (
+    PEPComplianceService,
+    check_qsa_pep_compliance,
+    pep_compliance_service,
+)
 from app.services.public_contracts_service import (
     PublicContractsService,
-    public_contracts_service,
     get_public_contracts,
+    public_contracts_service,
 )
 from app.services.task_dispatcher import (
     TaskDispatcher,
@@ -39,6 +44,9 @@ __all__ = [
     "PublicContractsService",
     "public_contracts_service",
     "get_public_contracts",
+    "PEPComplianceService",
+    "pep_compliance_service",
+    "check_qsa_pep_compliance",
     "TaskDispatcher",
     "UpstashRedisDispatcher",
     "InProcessFallbackDispatcher",

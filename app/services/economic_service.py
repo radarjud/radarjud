@@ -19,6 +19,7 @@ from app.utils.sanitizer import (
     classify_search_mode,
 )
 from app.utils.http_client import request_gov_br_with_fallback
+from app.models.pep_registry import mask_cpf_lgpd
 
 logger = logging.getLogger(__name__)
 
@@ -2186,6 +2187,15 @@ class EconomicStandingService:
                     "email": email,
                     "qsa_total": len(qsa),
                     "qsa_nomes": [s.get("nome_socio") for s in qsa if s.get("nome_socio")][:5],
+                    "qsa": [
+                        {
+                            "nome_socio": s.get("nome_socio"),
+                            "cnpj_cpf_do_socio": mask_cpf_lgpd(s.get("cnpj_cpf_do_socio") or s.get("cpf_cnpj_socio")),
+                            "qualificacao_socio": s.get("qualificacao_socio"),
+                        }
+                        for s in qsa
+                        if isinstance(s, dict)
+                    ],
                 }
         except Exception as exc:
             logger.debug("BrasilAPI falhou para CNPJ %s: %s", clean_cnpj, exc)
@@ -2359,6 +2369,7 @@ class EconomicStandingService:
         econ_result["data_situacao_cadastral"] = cadastral_data.get("data_situacao_cadastral")
         econ_result["qsa_total"] = cadastral_data.get("qsa_total", 0)
         econ_result["qsa_nomes"] = cadastral_data.get("qsa_nomes", [])
+        econ_result["qsa"] = cadastral_data.get("qsa", [])
         econ_result["porte"] = cadastral_data.get("porte", econ_result.get("badge_compatibilidade_porte", "DEMAIS"))
         cnae_cod = cadastral_data.get("cnae_codigo") or econ_result.get("cnae_codigo")
         cnae_desc = cadastral_data.get("cnae_descricao") or cadastral_data.get("cnae_fiscal_descricao") or econ_result.get("cnae_descricao", "")
