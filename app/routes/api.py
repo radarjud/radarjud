@@ -52,7 +52,12 @@ from app.utils.auth import get_current_user_optional, require_auth, require_role
 from app.models.tenant import Tenant
 from app.models.audit_log import AuditLog
 from app.services.quota_service import QuotaService
-from app.services.cnj_searcher import normalize_court_code
+from app.services.cnj_searcher import (
+    normalize_court_code,
+    get_scan_config,
+    parse_iso_date,
+    extract_real_cause_fast,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +181,77 @@ def _deep_scan_background_worker(
                             "is_tst_recurso": p.get("is_tst_recurso", False),
                         }
 
+            # Identifica os CNJs já conhecidos/persistidos para a busca atual (RAM constante)
+            known_numbers = {
+                r[0]
+                for r in db.session.query(ProcessRecord.numero_processo)
+                .filter(ProcessRecord.company_search_id == search_id)
+                .all()
+                if r[0]
+            }
+            if page1_processes:
+                for p in page1_processes:
+                    num = p.get("numero_processo") or p.get("numeroProcesso")
+                    if num:
+                        known_numbers.add(num)
+
+            scan_cfg = get_scan_config()
+            is_render_env = scan_cfg.get("is_render", False)
+
+            # Persistência streaming por lote: salva página a página sem acúmulo na RAM (US-23)
+            def _on_batch_persist(page_num: int, batch_processes: dict, new_count: int):
+                if job_id:
+                    with ACTIVE_SEARCH_LOCK:
+                        if job_id in CANCELLED_JOB_IDS:
+                            return
+                try:
+                    batch_records = []
+                    for cnj, pdata in (batch_processes or {}).items():
+                        if not cnj or cnj in known_numbers:
+                            continue
+                        known_numbers.add(cnj)
+                        raw_texts = pdata.get("publicacoes_texto", [])
+                        classes_list = pdata.get("classes_pje", [])
+                        assuntos = extract_real_cause_fast([], raw_texts, classes_pje=classes_list)
+                        primary_name = assuntos[0].get("nome") if assuntos else "Obrigação / Reclamação em Apuração Inicial"
+                        primary_code = assuntos[0].get("codigo") if assuntos else None
+                        dist_date = parse_iso_date(pdata.get("dataUltimaPublicacao"))
+
+                        rec = ProcessRecord(
+                            company_search_id=search_id,
+                            numero_processo=cnj,
+                            tribunal=str(pdata.get("siglaTribunal") or pdata.get("tribunal") or "")[:50],
+                            grau="TST (Recursal)" if pdata.get("is_tst_recurso") else "G1",
+                            nivel_sigilo=0,
+                            primary_subject=primary_name,
+                            primary_subject_code=primary_code,
+                            subjects_json=[a["nome"] for a in assuntos if a.get("nome")],
+                            observation=f"Assunto identificado via publicação PJe: '{primary_name}'." if primary_name else None,
+                            sentence_outcome="em_aberto",
+                            has_expert_report=False,
+                            data_distribuicao=dist_date,
+                            raw_metadata=None,
+                        )
+                        batch_records.append(rec)
+
+                    if batch_records:
+                        for i in range(0, len(batch_records), 50):
+                            db.session.bulk_save_objects(batch_records[i:i + 50])
+                            db.session.commit()
+                        del batch_records
+
+                    s = db.session.get(CompanySearch, search_id)
+                    if s:
+                        s.total_processes = len(known_numbers)
+                        s.last_checked_at = get_utc_now()
+                        db.session.commit()
+
+                    if is_render_env:
+                        gc.collect()
+                except Exception as persist_err:
+                    db.session.rollback()
+                    logger.debug("Erro na persistência do lote página %d: %s", page_num, persist_err)
+
             # Callback progressivo para polling no frontend (42 -> 90 -> 180 -> 350 -> 500+)
             def _on_page_update(page_num: int, accumulated_count: int, current_procs: dict):
                 if job_id:
@@ -188,29 +264,38 @@ def _deep_scan_background_worker(
                             all_processes_map[cnj] = data
                         else:
                             for t in data.get("publicacoes_texto", []):
-                                if t not in all_processes_map[cnj]["publicacoes_texto"]:
+                                if t not in all_processes_map[cnj].setdefault("publicacoes_texto", []):
                                     all_processes_map[cnj]["publicacoes_texto"].append(t)
                             for c in data.get("classes_pje", []):
-                                if c not in all_processes_map[cnj].get("classes_pje", []):
-                                    all_processes_map[cnj].setdefault("classes_pje", []).append(c)
+                                if c not in all_processes_map[cnj].setdefault("classes_pje", []):
+                                    all_processes_map[cnj]["classes_pje"].append(c)
 
                     s = db.session.get(CompanySearch, search_id)
                     if s:
-                        s.total_processes = len(all_processes_map)
+                        s.total_processes = max(len(all_processes_map), len(known_numbers))
                         s.last_checked_at = get_utc_now()
                         db.session.commit()
                 except Exception as db_e:
                     db.session.rollback()
                     logger.debug("Erro ao atualizar progresso da página %d: %s", page_num, db_e)
 
-            # 1. Paginação padrão até 20 páginas no Comunica PJe (começando da página 2)
+            # 1. Paginação diluída com persistência por lote e freio anti-loop (US-23)
             scan_res = orchestrator.searcher.paginate_comunica_pje_standard(
                 search_strategy=strat,
                 start_page=2,
-                max_pages=20,
+                max_pages=scan_cfg["max_pages"],
                 on_page_callback=_on_page_update,
+                on_batch_persist=_on_batch_persist,
                 timeout=6.0,
+                known_cnjs=known_numbers,
+                batch_delay=scan_cfg["batch_delay"],
             )
+
+            # Correção do status final (US-23):
+            # Se todas as páginas válidas foram concluídas ou a trava de 0 CNJs novos encerrou a varredura,
+            # o status canônico é COMPLETED — eliminando falsos selos parciais.
+            # Status parcial apenas se atingiu teto configurado com mais registros pendentes.
+            final_scan_status = "PARTIAL_FAST_PATH" if scan_res.get("hit_max_pages") else "COMPLETED"
 
             # Mescla todos os processos retornados em all_processes_map
             for cnj, data in scan_res.get("processes", {}).items():
@@ -218,11 +303,11 @@ def _deep_scan_background_worker(
                     all_processes_map[cnj] = data
                 else:
                     for t in data.get("publicacoes_texto", []):
-                        if t not in all_processes_map[cnj]["publicacoes_texto"]:
+                        if t not in all_processes_map[cnj].setdefault("publicacoes_texto", []):
                             all_processes_map[cnj]["publicacoes_texto"].append(t)
                     for c in data.get("classes_pje", []):
-                        if c not in all_processes_map[cnj].get("classes_pje", []):
-                            all_processes_map[cnj].setdefault("classes_pje", []).append(c)
+                        if c not in all_processes_map[cnj].setdefault("classes_pje", []):
+                            all_processes_map[cnj]["classes_pje"].append(c)
 
             if job_id:
                 with ACTIVE_SEARCH_LOCK:
@@ -259,7 +344,7 @@ def _deep_scan_background_worker(
                 company_name=company_name,
                 processes=enriched_list,
                 capital_info=capital_info,
-                scan_status="COMPLETED",
+                scan_status=final_scan_status,
             )
             deep_results["empresa"] = company_name
             deep_results["is_broad_brand"] = strat.get("is_broad_brand", False)
@@ -327,7 +412,7 @@ def _deep_scan_background_worker(
             if search.economic_standing and isinstance(search.economic_standing, dict):
                 search.cnae_codigo = search.economic_standing.get("cnae_codigo") or search.cnae_codigo
                 search.cnae_descricao = search.economic_standing.get("cnae_descricao") or search.cnae_descricao
-            search.scan_status = "COMPLETED"
+            search.scan_status = final_scan_status
             search.last_checked_at = get_utc_now()
             db.session.commit()
 
@@ -372,8 +457,13 @@ def _deep_scan_background_worker(
                         except Exception as batch_err:
                             db.session.rollback()
                             logger.debug("Lote de processos %d tratado defensivamente: %s", i, batch_err)
+                    del new_records
             except Exception as rec_err:
                 logger.debug("Persistência detalhada de processos ignorada: %s", rec_err)
+
+            del enriched_list
+            if is_render_env:
+                gc.collect()
 
             # REGRA 4: Salva no Cache em Memória com TTL de 15 minutos
             deep_results["search_id"] = search.id
@@ -387,7 +477,7 @@ def _deep_scan_background_worker(
             try:
                 search = db.session.get(CompanySearch, search_id)
                 if search:
-                    search.scan_status = "COMPLETED"
+                    search.scan_status = "PARTIAL_FAST_PATH"
                     db.session.commit()
             except Exception:
                 pass
