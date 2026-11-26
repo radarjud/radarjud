@@ -23,7 +23,7 @@ weasyprint>=60.0
 Jinja2>=3.1.2
 
 # Servidor WSGI de Produção
-gunicorn>=21.2.0
+gunicorn>=27.0.1
 
 # Testes & Qualidade
 pytest>=8.0.2
