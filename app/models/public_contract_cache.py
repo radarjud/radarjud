@@ -1,11 +1,12 @@
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, Optional
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
 from app.extensions import db
 
 
 def get_utc_now():
     """Retorna timestamp UTC naive compatível com colunas DateTime do SQLAlchemy."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class PublicContractCache(db.Model):
@@ -22,14 +23,14 @@ class PublicContractCache(db.Model):
     cached_at = db.Column(db.DateTime, default=get_utc_now, nullable=False)
     ttl_seconds = db.Column(db.Integer, default=86400, nullable=False)  # Padrão 24 horas
 
-    def is_valid(self, ttl_hours: Optional[int] = None) -> bool:
+    def is_valid(self, ttl_hours: int | None = None) -> bool:
         """Verifica se o registro de cache ainda está dentro da janela de TTL."""
         if not self.cached_at:
             return False
         max_age = timedelta(hours=ttl_hours) if ttl_hours is not None else timedelta(seconds=self.ttl_seconds)
         return (get_utc_now() - self.cached_at) <= max_age
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "cnpj": self.cnpj,

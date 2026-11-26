@@ -1,5 +1,6 @@
 import json
 from unittest.mock import MagicMock, patch
+
 import pytest
 import requests
 
@@ -9,17 +10,16 @@ from app.models.company_search import CompanySearch
 from app.models.public_contract_cache import PublicContractCache
 from app.models.tenant import Tenant
 from app.models.user import User
-from app.services.public_contracts_service import (
-    PublicContractsService,
-    get_public_contracts,
-    sanitize_cnpj,
-    normalize_sphere,
-    sanitize_public_organ_name,
-)
 from app.services.pdf_report import (
+    _generate_pdf_pure_python,
     generate_company_report_pdf,
     normalize_report_payload,
-    _generate_pdf_pure_python,
+)
+from app.services.public_contracts_service import (
+    PublicContractsService,
+    normalize_sphere,
+    sanitize_cnpj,
+    sanitize_public_organ_name,
 )
 from app.utils.jwt import create_access_token
 

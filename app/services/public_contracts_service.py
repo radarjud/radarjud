@@ -1,13 +1,14 @@
+import logging
 import os
 import re
 import time
-import logging
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Any
+
 import requests
 
 from app.extensions import db
-from app.models.public_contract_cache import PublicContractCache, get_utc_now
 from app.models.CompanyRegistry import CompanyRegistry
+from app.models.public_contract_cache import PublicContractCache, get_utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ DEFAULT_HEADERS = {
 HTTP_TIMEOUT = (2.0, 5.0)
 
 # Cache L0 em memória (máx 100 itens, TTL 15 min) para respostas ultrarrápidas
-_L0_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_L0_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _L0_CACHE_TTL = 900  # 15 minutos
 
 CPF_REGEX = re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b")
@@ -33,7 +34,7 @@ def sanitize_cnpj(raw_cnpj: Any) -> str:
     return re.sub(r"\D", "", str(raw_cnpj or "")).strip()
 
 
-def format_currency_brl(val: Optional[float]) -> Optional[str]:
+def format_currency_brl(val: float | None) -> str | None:
     """Formata valor float para moeda brasileira BRL (ex.: R$ 1.500.000,00)."""
     if val is None:
         return None
@@ -44,7 +45,7 @@ def format_currency_brl(val: Optional[float]) -> Optional[str]:
         return None
 
 
-def normalize_sphere(raw_esfera: Any, organ_name: str = "") -> Optional[str]:
+def normalize_sphere(raw_esfera: Any, organ_name: str = "") -> str | None:
     """
     Normaliza a esfera federativa para: 'Municipal', 'Estadual' ou 'Federal'.
     Usa identificador explícito de esfera ou heurística pelo nome do órgão.
@@ -70,7 +71,7 @@ def normalize_sphere(raw_esfera: Any, organ_name: str = "") -> Optional[str]:
     return "Municipal" if "M" in raw_str else ("Estadual" if "E" in raw_str else ("Federal" if "F" in raw_str else None))
 
 
-def sanitize_public_organ_name(raw_name: Any) -> Optional[str]:
+def sanitize_public_organ_name(raw_name: Any) -> str | None:
     """
     Higieniza o nome do órgão público contratante, garantindo estrita aderência à LGPD:
     - Remove CPFs acidentais
@@ -102,11 +103,11 @@ class PublicContractsService:
     - Sanitização LGPD by design (exclusivamente órgãos públicos e pessoas jurídicas)
     """
 
-    def __init__(self, session: Optional[requests.Session] = None):
+    def __init__(self, session: requests.Session | None = None):
         self.session = session or requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
 
-    def get_public_contracts(self, cnpj: str, force_refresh: bool = False) -> Dict[str, Any]:
+    def get_public_contracts(self, cnpj: str, force_refresh: bool = False) -> dict[str, Any]:
         """
         Consulta contratos públicos por CNPJ, consultando primeiramente os caches L0/L1
         e, em caso de cache miss, disparando requisições externas para o PNCP / Portal da Transparência.
@@ -133,7 +134,7 @@ class PublicContractsService:
                     res_data = dict(cached_l1.data)
                     _L0_CACHE[clean_cnpj] = (time.time(), res_data)
                     return res_data
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning("Falha ao consultar cache L1 de contratos públicos: %s", e)
 
         # 3. Consulta Externa às APIs Governamentais
@@ -146,7 +147,7 @@ class PublicContractsService:
 
         return data
 
-    def _fetch_contracts_external(self, clean_cnpj: str) -> Dict[str, Any]:
+    def _fetch_contracts_external(self, clean_cnpj: str) -> dict[str, Any]:
         """
         Executa chamadas HTTP para as APIs abertas do PNCP e, opcionalmente,
         Portal da Transparência (se chave presente no ambiente).
@@ -178,7 +179,7 @@ class PublicContractsService:
         # Fallback genérico caso a chamada retorne outros status
         return self._build_empty_response("Nenhum contrato público localizado nas bases consultadas")
 
-    def _try_portal_transparencia_fallback(self, clean_cnpj: str) -> Optional[Dict[str, Any]]:
+    def _try_portal_transparencia_fallback(self, clean_cnpj: str) -> dict[str, Any] | None:
         """
         Consulta opcional à API do Portal da Transparência (usada se PORTAL_TRANSPARENCIA_API_KEY configurada).
         Nunca falha de forma fatal se a chave não estiver presente.
@@ -194,14 +195,14 @@ class PublicContractsService:
             if resp.status_code == 200:
                 payload = resp.json()
                 return self._parse_portal_transparencia_payload(payload)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("Fallback do Portal da Transparência falhou: %s", e)
 
         return None
 
-    def _parse_pncp_payload(self, payload: Any) -> Dict[str, Any]:
+    def _parse_pncp_payload(self, payload: Any) -> dict[str, Any]:
         """Processa a resposta JSON do PNCP de forma enxuta e defensiva."""
-        items: List[Dict[str, Any]] = []
+        items: list[dict[str, Any]] = []
         total_registros = 0
 
         if isinstance(payload, dict):
@@ -217,7 +218,7 @@ class PublicContractsService:
             return self._build_empty_response("Nenhum contrato público localizado nas bases consultadas")
 
         esferas_set = set()
-        orgaos_list: List[str] = []
+        orgaos_list: list[str] = []
         valor_global_acumulado: float = 0.0
         teve_valor = False
 
@@ -258,7 +259,7 @@ class PublicContractsService:
                 except (ValueError, TypeError):
                     pass
 
-        final_esferas = sorted(list(esferas_set))
+        final_esferas = sorted(esferas_set)
         if not final_esferas:
             final_esferas = ["Municipal"]  # Fallback padrão seguro
 
@@ -274,9 +275,9 @@ class PublicContractsService:
             "mensagem": f"{total_registros} contrato(s) público(s) identificado(s) nas bases governamentais",
         }
 
-    def _parse_portal_transparencia_payload(self, payload: Any) -> Dict[str, Any]:
+    def _parse_portal_transparencia_payload(self, payload: Any) -> dict[str, Any]:
         """Processa a resposta do Portal da Transparência."""
-        items: List[Dict[str, Any]] = []
+        items: list[dict[str, Any]] = []
         if isinstance(payload, list):
             items = payload
         elif isinstance(payload, dict):
@@ -286,7 +287,7 @@ class PublicContractsService:
             return self._build_empty_response("Nenhum contrato público localizado nas bases consultadas")
 
         esferas_set = {"Federal"}  # Portal da Transparência do Governo Federal
-        orgaos_list: List[str] = []
+        orgaos_list: list[str] = []
         valor_global_acumulado: float = 0.0
         teve_valor = False
 
@@ -317,14 +318,14 @@ class PublicContractsService:
         return {
             "status": "DISPONIVEL",
             "total_contratos": total,
-            "esferas": sorted(list(esferas_set)),
+            "esferas": sorted(esferas_set),
             "orgaos_contratantes": orgaos_list[:10],
             "valor_global_total": val_total,
             "valor_global_formatado": format_currency_brl(val_total),
             "mensagem": f"{total} contrato(s) público(s) identificado(s) nas bases governamentais",
         }
 
-    def _build_empty_response(self, msg: str = "Nenhum contrato público localizado nas bases consultadas") -> Dict[str, Any]:
+    def _build_empty_response(self, msg: str = "Nenhum contrato público localizado nas bases consultadas") -> dict[str, Any]:
         return {
             "status": "DISPONIVEL",
             "total_contratos": 0,
@@ -335,7 +336,7 @@ class PublicContractsService:
             "mensagem": msg,
         }
 
-    def _build_unavailable_response(self) -> Dict[str, Any]:
+    def _build_unavailable_response(self) -> dict[str, Any]:
         return {
             "status": "INDISPONIVEL",
             "total_contratos": 0,
@@ -346,7 +347,7 @@ class PublicContractsService:
             "mensagem": "Base governamental temporariamente indisponível no momento da consulta.",
         }
 
-    def _save_l1_cache(self, clean_cnpj: str, data: Dict[str, Any]) -> None:
+    def _save_l1_cache(self, clean_cnpj: str, data: dict[str, Any]) -> None:
         """Salva o resultado no PostgreSQL (public_contracts_cache e company_registry)."""
         try:
             cached = PublicContractCache.query.filter_by(cnpj=clean_cnpj).first()
@@ -369,7 +370,7 @@ class PublicContractsService:
                 reg.public_contracts_cached_at = get_utc_now()
 
             db.session.commit()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             db.session.rollback()
             logger.warning("Falha ao salvar L1 cache de contratos públicos para CNPJ %s: %s", clean_cnpj, exc)
 
@@ -378,6 +379,6 @@ class PublicContractsService:
 public_contracts_service = PublicContractsService()
 
 
-def get_public_contracts(cnpj: str, force_refresh: bool = False) -> Dict[str, Any]:
+def get_public_contracts(cnpj: str, force_refresh: bool = False) -> dict[str, Any]:
     """Helper global para consulta de contratos públicos com o Poder Público."""
     return public_contracts_service.get_public_contracts(cnpj=cnpj, force_refresh=force_refresh)
