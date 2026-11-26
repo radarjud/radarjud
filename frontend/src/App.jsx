@@ -118,11 +118,22 @@ function normalize(raw) {
   const isPrevisaoBloqueada = Boolean(payload.previsao_bloqueada) || (numCondenacoes === 0 && total > 0);
   const effectiveRiskScore = (total === 0 || isPrevisaoBloqueada) ? 0.0 : riskScore;
 
+  const subCount = Number(payload.condenacoes_subsidiarias_tomadoras_count ?? payload.condenacoes_subsidiarias_count ?? 0);
+  const subTomadoras = Array.isArray(payload.tomadoras_subsidiarias_pj) ? payload.tomadoras_subsidiarias_pj : [];
+  const subMsg = payload.mensagem_responsabilidade_subsidiaria || (
+    subCount > 0
+      ? `Histórico de Responsabilidade Subsidiária: ${subCount} processos com condenação subsidiária atribuída a contratantes anteriores`
+      : 'Nenhuma condenação subsidiária de contratante identificada na amostra'
+  );
+
   return {
     name: companyName,
     total: total,
     riskScore: effectiveRiskScore,
     overallRiskScore: effectiveRiskScore,
+    subsidiaryLiabilityCount: subCount,
+    subsidiaryContractorsPJ: subTomadoras,
+    subsidiaryMessage: subMsg,
     reasons: Array.isArray(payload.ranking_motivos) ? payload.ranking_motivos : [],
     rankingCondenacoes: Array.isArray(payload.ranking_motivos_condenacao) ? payload.ranking_motivos_condenacao : [],
     condenacaoPorMotivo: Array.isArray(payload.condenacao_por_motivo) ? payload.condenacao_por_motivo : [],
@@ -439,10 +450,84 @@ function Overview({ data, navigate, catalogTerm }) {
       )}
 
 
-      {hasData && <Panel title="Diligência complementar" subtitle="Informações para verificar antes da contratação">
-        <p>Histórico de responsabilidade subsidiária, contratos públicos e alertas de PEP: dados específicos não disponibilizados nesta consulta.</p>
-        {data.hasEconomicData && <p>Restrições federais: {data.idoneidadeEconomica.possui_sancoes_cgu || data.idoneidadeEconomica.possui_divida_ativa ? 'Apontamentos informados' : 'Consulte as bases oficiais para confirmação'}.</p>}
-      </Panel>}
+      {hasData && (
+        <Panel title="Diligência complementar" subtitle="Informações para verificar antes da contratação">
+          {data.subsidiaryLiabilityCount > 0 ? (
+            <div
+              className="subsidiary-alert-card"
+              style={{
+                background: '#fef7ea',
+                borderLeft: '4px solid #b67b23',
+                padding: '14px 18px',
+                borderRadius: '8px',
+                marginBottom: '16px',
+                boxSizing: 'border-box',
+                maxWidth: '100%',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', flexWrap: 'wrap' }}>
+                <ShieldAlert size={18} color="#b67b23" />
+                <strong style={{ color: '#b67b23', fontSize: '14px' }}>
+                  Histórico de Responsabilidade Subsidiária: {data.subsidiaryLiabilityCount} processos com condenação subsidiária atribuída a contratantes anteriores
+                </strong>
+              </div>
+              {data.subsidiaryContractorsPJ && data.subsidiaryContractorsPJ.length > 0 && (
+                <div style={{ marginTop: '8px' }}>
+                  <small style={{ color: '#556677', display: 'block', marginBottom: '6px', fontWeight: 600 }}>
+                    Contratantes / Tomadoras PJ identificadas no polo passivo:
+                  </small>
+                  <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                    {data.subsidiaryContractorsPJ.map((tomadora, idx) => (
+                      <span
+                        key={idx}
+                        style={{
+                          background: '#fff',
+                          border: '1px solid #d8b888',
+                          color: '#7a5113',
+                          padding: '3px 8px',
+                          borderRadius: '4px',
+                          fontSize: '11px',
+                          fontWeight: 600,
+                          wordBreak: 'break-word',
+                        }}
+                      >
+                        {tomadora}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div
+              className="subsidiary-empty-card"
+              style={{
+                background: '#f0f9f4',
+                borderLeft: '4px solid #25865a',
+                padding: '12px 16px',
+                borderRadius: '8px',
+                marginBottom: '16px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                flexWrap: 'wrap',
+                boxSizing: 'border-box',
+                maxWidth: '100%',
+              }}
+            >
+              <ShieldCheck size={18} color="#25865a" />
+              <span style={{ color: '#25865a', fontSize: '13px', fontWeight: 600 }}>
+                Nenhuma condenação subsidiária de contratante identificada na amostra
+              </span>
+            </div>
+          )}
+          {data.hasEconomicData && (
+            <p style={{ margin: 0, fontSize: '13px', color: '#556677' }}>
+              Restrições federais: {data.idoneidadeEconomica.possui_sancoes_cgu || data.idoneidadeEconomica.possui_divida_ativa ? 'Apontamentos informados' : 'Consulte as bases oficiais para confirmação'}.
+            </p>
+          )}
+        </Panel>
+      )}
       {/* Parecer do Consultor de Inteligência Artificial (Agente ADK radarjusAgent) */}
       {ai && (
         <Panel

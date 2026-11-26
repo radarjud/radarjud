@@ -72,7 +72,23 @@ ul { margin: 4pt 0 8pt; padding-left: 15pt; }
 <tbody>{% for item in ranking %}<tr><td>{{ loop.index }}</td><td>{{ item.motivo }}</td><td class="num">{{ item.quantidade }}</td><td class="num">{{ pct(item.taxa_no_motivo) if report.ranking_condenacoes and item.taxa_no_motivo is defined and item.taxa_no_motivo is not none else '—' }}</td></tr>{% endfor %}</tbody></table>
 {% else %}<p>Nenhuma condenação ou vetor de risco recorrente mapeado para esta empresa.</p>{% endif %}
 {% endif %}
-<h2>Diligência complementar</h2>{% if comp.alertas_331 %}<ul>{% for item in comp.alertas_331 %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}<p>Histórico de responsabilidade subsidiária, contratos públicos e alertas de PEP: dados específicos não disponibilizados nesta consulta.</p><h2>Resumo executivo</h2><p>{{ comp.resumo_executivo }}</p><h2>Resumo dos processos analisados</h2><table class="kpis"><tr>{% for label,value in [('Processos',report.total_processes),('Condenações',out.condenacoes),('Acordos',out.acordos),('Improcedentes',out.improcedentes),('Em aberto',out.em_aberto)] %}<td><div class="kpi-label">{{ label }}</div><div class="kpi-value num">{{ value }}</div></td>{% endfor %}</tr></table>{% if outcomes_svg %}<section class="chart-block"><h2>Distribuição de desfechos</h2><div class="chart-frame">{{ outcomes_svg | safe }}</div></section>{% endif %}<h2>Mais informações</h2><table class="econ"><colgroup><col style="width:54%"><col style="width:46%"></colgroup><tr>
+<h2>Diligência complementar</h2>
+{% if comp.condenacoes_subsidiarias_tomadoras_count and comp.condenacoes_subsidiarias_tomadoras_count > 0 %}
+<div class="subsidiary-card" style="background:#fef7ea; border-left:4px solid #b67b23; padding:8px 12px; margin-bottom:10px; border-radius:4px;">
+  <strong style="color:#b67b23; font-size:12px;">Histórico de Responsabilidade Subsidiária: {{ comp.condenacoes_subsidiarias_tomadoras_count }} processos com condenação subsidiária atribuída a contratantes anteriores</strong>
+  {% if comp.tomadoras_subsidiarias_pj %}
+  <p style="margin:4px 0 0; font-size:11px; color:#445566;">
+    <strong>Contratantes / Tomadoras PJ identificadas:</strong> {{ comp.tomadoras_subsidiarias_pj | join(', ') }}
+  </p>
+  {% endif %}
+</div>
+{% else %}
+<div class="subsidiary-card" style="background:#f0f9f4; border-left:4px solid #25865a; padding:8px 12px; margin-bottom:10px; border-radius:4px;">
+  <span style="color:#25865a; font-size:11px; font-weight:600;">Nenhuma condenação subsidiária de contratante identificada na amostra</span>
+</div>
+{% endif %}
+{% if comp.alertas_331 %}<ul>{% for item in comp.alertas_331 %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+<p>Histórico de contratos públicos e alertas de PEP: dados específicos não disponibilizados nesta consulta.</p><h2>Resumo executivo</h2><p>{{ comp.resumo_executivo }}</p><h2>Resumo dos processos analisados</h2><table class="kpis"><tr>{% for label,value in [('Processos',report.total_processes),('Condenações',out.condenacoes),('Acordos',out.acordos),('Improcedentes',out.improcedentes),('Em aberto',out.em_aberto)] %}<td><div class="kpi-label">{{ label }}</div><div class="kpi-value num">{{ value }}</div></td>{% endfor %}</tr></table>{% if outcomes_svg %}<section class="chart-block"><h2>Distribuição de desfechos</h2><div class="chart-frame">{{ outcomes_svg | safe }}</div></section>{% endif %}<h2>Mais informações</h2><table class="econ"><colgroup><col style="width:54%"><col style="width:46%"></colgroup><tr>
 <td><div class="econ-label">CAPITAL SOCIAL DECLARATÓRIO</div><div class="econ-value num">{{ econ.capital_fmt }}</div><div class="detail">{{ econ.badge_porte }}<br>{{ econ.subtitulo_unidades }}</div></td>
 <td><div class="econ-label">SITUAÇÃO CADASTRAL RFB</div><div class="econ-value" style="color:{{ '#25865a' if econ.situacao_rfb == 'ATIVA' else '#c34a4a' }}">{{ econ.situacao_rfb }}</div><div class="detail">Sanções/Débitos: {{ econ.sancoes_texto }}</div></td>
 </tr><tr>
