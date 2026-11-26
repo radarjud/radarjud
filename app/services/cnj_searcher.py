@@ -3,6 +3,8 @@
 
 import os
 import re
+import gc
+import time
 import datetime
 from decimal import Decimal, InvalidOperation
 import unicodedata
@@ -450,6 +452,52 @@ def classify_process_outcome(
     return "EM_ABERTO"
 
 
+def get_scan_config() -> Dict[str, Any]:
+    """
+    Retorna a configuração dinâmica de varredura conforme o ambiente (Local vs. Render - US-23).
+
+    - Ambiente Local (RENDER ausente ou diferente de 'true'):
+        * SCAN_MAX_PAGES = 0 (ilimitado — sem cortes artificiais na varredura local)
+        * SCAN_BATCH_DELAY = 0.0 (sem atraso artificial entre páginas)
+        * gc_collect = False
+    - Ambiente Render (RENDER='true'):
+        * SCAN_MAX_PAGES = 50 (teto seguro contra OOM nos 512 MB e timeouts do worker)
+        * SCAN_BATCH_DELAY = 0.4 (pausa entre lotes para diluição de carga)
+        * gc_collect = True (coleta explícita a cada lote para estabilizar RAM ~150 MB)
+
+    Permite override explícito via variáveis de ambiente SCAN_MAX_PAGES e SCAN_BATCH_DELAY.
+    """
+    is_render = os.getenv("RENDER", "").strip().lower() == "true"
+
+    default_max_pages = 50 if is_render else 0
+    default_delay = 0.4 if is_render else 0.0
+
+    raw_max_pages = os.getenv("SCAN_MAX_PAGES")
+    if raw_max_pages is not None and raw_max_pages.strip():
+        try:
+            max_pages = int(raw_max_pages.strip())
+        except ValueError:
+            max_pages = default_max_pages
+    else:
+        max_pages = default_max_pages
+
+    raw_delay = os.getenv("SCAN_BATCH_DELAY")
+    if raw_delay is not None and raw_delay.strip():
+        try:
+            batch_delay = float(raw_delay.strip())
+        except ValueError:
+            batch_delay = default_delay
+    else:
+        batch_delay = default_delay
+
+    return {
+        "is_render": is_render,
+        "max_pages": max_pages,
+        "batch_delay": batch_delay,
+        "gc_collect": is_render,
+    }
+
+
 class CNJProcessSearcher:
     """
     Cliente robusto para integração oficial com as APIs públicas do Judiciário:
@@ -671,18 +719,30 @@ class CNJProcessSearcher:
         self,
         search_strategy: Dict[str, Any],
         start_page: int = 1,
-        max_pages: int = 20,
+        max_pages: Optional[int] = None,
         on_page_callback=None,
+        on_batch_persist=None,
         timeout: float = 6.0,
+        known_cnjs: Optional[Set[str]] = None,
+        batch_delay: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
-        Varre sequencialmente o Comunica PJe (páginas start_page..max_pages) com itensPorPagina=50.
-        CRITÉRIO DE PARADA ESTRITO:
-        - Interrompe APENAS se a lista bruta de itens retornados pela API for vazia (len(raw_items) == 0)
-          ou menor que 50 (len(raw_items) < 50).
-        - NUNCA interrompe baseado na contagem de processos únicos desduplicados!
-        - Executa callback progressivo a cada página para alimentar contadores em tempo real.
+        Varre sequencialmente o Comunica PJe em fluxo streaming por lote com RAM constante,
+        freio anti-loop em 3 camadas e limite dinâmico por ambiente (US-23).
+
+        Travas determinísticas anti-loop:
+        1. Trava de Novos Registros (principal contra repetição de páginas da API):
+           Se uma página trouxer 0 CNJs novos em relação aos já conhecidos, encerra imediatamente como COMPLETED.
+        2. Trava de Metadados:
+           Encerra naturalmente se a lista bruta de itens for vazia ou menor que 50 (fim oficial da lista no CNJ).
+        3. Teto configurável (SCAN_MAX_PAGES):
+           Se max_pages > 0 e page >= max_pages antes do fim natural, encerra sinalizando corte por teto de segurança.
         """
+        cfg = get_scan_config()
+        effective_max_pages = cfg["max_pages"] if max_pages is None else max_pages
+        effective_delay = cfg["batch_delay"] if batch_delay is None else batch_delay
+        do_gc = cfg.get("gc_collect", False)
+
         query_term = (
             search_strategy.get("comunica_query_term")
             or search_strategy.get("raw_input")
@@ -691,9 +751,18 @@ class CNJProcessSearcher:
 
         all_processes: Dict[str, Any] = {}
         discovered_entities: Set[str] = set()
+        known_cnjs_set: Set[str] = set(known_cnjs) if known_cnjs is not None else set()
         pages_read = 0
+        hit_max_pages = False
+        anti_loop_triggered = False
 
-        for page in range(start_page, max_pages + 1):
+        page = start_page
+        while True:
+            # Trava 3: Se a próxima página ultrapassar o teto configurado (quando teto > 0)
+            if effective_max_pages > 0 and page > effective_max_pages:
+                hit_max_pages = True
+                break
+
             params = {
                 "nomeParte": query_term,
                 "pagina": page,
@@ -713,21 +782,84 @@ class CNJProcessSearcher:
                 else:
                     raw_items = []
 
+                # Trava 2: Lista vazia indica fim natural da paginação pública
                 if not raw_items:
                     break
 
                 pages_read += 1
-                self._parse_comunica_items(raw_items, all_processes, discovered_entities)
+                page_processes: Dict[str, Any] = {}
+                self._parse_comunica_items(raw_items, page_processes, discovered_entities)
 
+                # Trava 1: Freio anti-loop determinístico por verificação de CNJs inéditos
+                page_cnjs = set(page_processes.keys())
+                new_cnjs = page_cnjs - known_cnjs_set
+
+                if len(new_cnjs) == 0:
+                    logger.info(
+                        "Freio anti-loop acionado na página %d: 0 novos CNJs identificados entre os %d processos retornados. Finalizando varredura como COMPLETED.",
+                        page,
+                        len(page_processes),
+                    )
+                    anti_loop_triggered = True
+                    # Mescla publicações/classes adicionais em processos já existentes no mapa
+                    for cnj, data in page_processes.items():
+                        if cnj in all_processes:
+                            for t in data.get("publicacoes_texto", []):
+                                if t not in all_processes[cnj].setdefault("publicacoes_texto", []):
+                                    all_processes[cnj]["publicacoes_texto"].append(t)
+                    break
+
+                # Atualiza conjunto de CNJs conhecidos e mapa em memória
+                known_cnjs_set.update(new_cnjs)
+                for cnj, data in page_processes.items():
+                    if cnj not in all_processes:
+                        all_processes[cnj] = data
+                    else:
+                        for t in data.get("publicacoes_texto", []):
+                            if t not in all_processes[cnj].setdefault("publicacoes_texto", []):
+                                all_processes[cnj]["publicacoes_texto"].append(t)
+                        for c in data.get("classes_pje", []):
+                            if c not in all_processes[cnj].setdefault("classes_pje", []):
+                                all_processes[cnj]["classes_pje"].append(c)
+
+                # Persistência streaming por lote (upsert imediato sem acúmulo de memória)
+                if on_batch_persist:
+                    try:
+                        on_batch_persist(page, page_processes, len(new_cnjs))
+                    except Exception as persist_err:
+                        logger.error("Erro no callback on_batch_persist na página %d: %s", page, persist_err)
+
+                # Callback progressivo para contadores da UI/polling
                 if on_page_callback:
                     try:
                         on_page_callback(page, len(all_processes), all_processes)
                     except Exception as cb_err:
                         logger.debug("Erro em on_page_callback página %d: %s", page, cb_err)
 
-                # Critério de parada oficial: última página da API do CNJ tem menos de 50 itens brutos
+                # Liberação explícita de memória da página processada (RAM constante)
+                del page_processes
+                if do_gc:
+                    gc.collect()
+
+                # Trava 2: Critério oficial de encerramento da API do CNJ (< 50 itens brutos)
                 if len(raw_items) < 50:
                     break
+
+                # Trava 2 adicional: se payload contiver metadados de total de páginas
+                total_pages = payload.get("totalPages") or payload.get("total_pages")
+                if total_pages and isinstance(total_pages, int) and page >= total_pages:
+                    break
+
+                # Trava 3: Se a página atual atingiu o teto configurado
+                if effective_max_pages > 0 and page >= effective_max_pages:
+                    hit_max_pages = True
+                    break
+
+                # Diluição no tempo configurável por ambiente (SCAN_BATCH_DELAY)
+                if effective_delay > 0:
+                    time.sleep(effective_delay)
+
+                page += 1
 
             except Exception as exc:
                 logger.error("Erro na paginação do Comunica PJe página %d: %s", page, exc)
@@ -749,13 +881,34 @@ class CNJProcessSearcher:
                         py_tst.get("items") or py_tst.get("itens") or []
                     )
                     if tst_items:
-                        self._parse_comunica_items(tst_items, all_processes, discovered_entities, is_tst_override=True)
+                        tst_processes: Dict[str, Any] = {}
+                        self._parse_comunica_items(tst_items, tst_processes, discovered_entities, is_tst_override=True)
+                        tst_new = set(tst_processes.keys()) - known_cnjs_set
+                        if tst_new:
+                            known_cnjs_set.update(tst_new)
+                            for cnj, data in tst_processes.items():
+                                if cnj not in all_processes:
+                                    all_processes[cnj] = data
+                                else:
+                                    for t in data.get("publicacoes_texto", []):
+                                        if t not in all_processes[cnj].setdefault("publicacoes_texto", []):
+                                            all_processes[cnj]["publicacoes_texto"].append(t)
+                            if on_batch_persist:
+                                try:
+                                    on_batch_persist(0, tst_processes, len(tst_new))
+                                except Exception as tst_cb_err:
+                                    logger.debug("Erro em on_batch_persist do TST: %s", tst_cb_err)
+                        del tst_processes
+                        if do_gc:
+                            gc.collect()
             except Exception as tst_exc:
                 logger.debug("Consulta complementar TST tratada silenciosamente: %s", tst_exc)
 
+        is_completed = not hit_max_pages
+
         logger.info(
-            "paginate_comunica_pje_standard('%s') finalizada: %d páginas lidas, %d processos únicos, %d entidades.",
-            query_term, pages_read, len(all_processes), len(discovered_entities)
+            "paginate_comunica_pje_standard('%s') finalizada: %d páginas lidas, %d processos únicos, %d entidades (hit_max_pages=%s, anti_loop=%s, is_completed=%s).",
+            query_term, pages_read, len(all_processes), len(discovered_entities), hit_max_pages, anti_loop_triggered, is_completed
         )
 
         return {
@@ -763,6 +916,9 @@ class CNJProcessSearcher:
             "discovered_entities": discovered_entities,
             "pages_read": pages_read,
             "total_processes": len(all_processes),
+            "hit_max_pages": hit_max_pages,
+            "anti_loop_triggered": anti_loop_triggered,
+            "is_completed": is_completed,
         }
 
     def fetch_brasil_api_fast(self, cnpj: str, timeout: float = 3.5) -> Dict[str, Any]:
