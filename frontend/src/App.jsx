@@ -142,6 +142,18 @@ function normalize(raw) {
         : `${cpTotal} contrato(s) público(s) identificado(s) nas bases governamentais`)
   );
 
+  const pepObj = isRecord(payload.compliance_pep) ? payload.compliance_pep : {};
+  const pepStatus = String(pepObj.status || 'NAO_IDENTIFICADO').toUpperCase();
+  const pepTotal = typeof pepObj.total_vinculos_identificados === 'number' ? pepObj.total_vinculos_identificados : 0;
+  const pepOcorrencias = Array.isArray(pepObj.ocorrencias) ? pepObj.ocorrencias : [];
+  const pepRecomendacao = pepObj.recomendacao || (
+    pepStatus === 'ALERTA_PEP'
+      ? 'Identificado possível vínculo com Pessoa Politicamente Exposta (PEP) no QSA. Recomenda-se diligência reforçada de integridade e verificação documental antes da homologação.'
+      : (pepStatus === 'INDISPONIVEL'
+        ? 'Base oficial de PEP (CGU) temporariamente indisponível no momento da consulta.'
+        : 'Nenhum vínculo com Pessoa Politicamente Exposta (PEP) identificado no QSA consultado.')
+  );
+
   return {
     name: companyName,
     total: total,
@@ -157,6 +169,10 @@ function normalize(raw) {
     publicContractsValorTotal: cpValorTotal,
     publicContractsValorFormatado: cpValorFormatado,
     publicContractsMensagem: cpMsg,
+    compliancePepStatus: pepStatus,
+    compliancePepTotal: pepTotal,
+    compliancePepOcorrencias: pepOcorrencias,
+    compliancePepRecomendacao: pepRecomendacao,
     reasons: Array.isArray(payload.ranking_motivos) ? payload.ranking_motivos : [],
     rankingCondenacoes: Array.isArray(payload.ranking_motivos_condenacao) ? payload.ranking_motivos_condenacao : [],
     condenacaoPorMotivo: Array.isArray(payload.condenacao_por_motivo) ? payload.condenacao_por_motivo : [],
@@ -673,6 +689,138 @@ function Overview({ data, navigate, catalogTerm }) {
                 <CheckCircle2 size={18} color="#25865a" />
                 <span style={{ color: '#25865a', fontSize: '13px', fontWeight: 600 }}>
                   Nenhum contrato público localizado nas bases consultadas
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* US-21: Compliance de Pessoas Politicamente Expostas no QSA (PEP / CGU) */}
+          <div
+            className="pep-compliance-section"
+            style={{
+              marginTop: '16px',
+              marginBottom: '16px',
+              boxSizing: 'border-box',
+              maxWidth: '100%',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', flexWrap: 'wrap' }}>
+              <ShieldAlert size={16} color="#c2410c" />
+              <strong style={{ fontSize: '13px', color: '#17283a', textTransform: 'uppercase', letterSpacing: '0.02em' }}>
+                Compliance Societário · Pessoas Politicamente Expostas (PEP / CGU)
+              </strong>
+            </div>
+
+            {data.compliancePepStatus === 'INDISPONIVEL' ? (
+              <div
+                className="pep-compliance-unavailable-card"
+                style={{
+                  background: '#f8fafc',
+                  borderLeft: '4px solid #64748b',
+                  padding: '12px 16px',
+                  borderRadius: '8px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  flexWrap: 'wrap',
+                  boxSizing: 'border-box',
+                  maxWidth: '100%',
+                }}
+              >
+                <AlertCircle size={18} color="#64748b" />
+                <span style={{ color: '#475569', fontSize: '13px' }}>
+                  Base oficial de PEP (CGU) temporariamente indisponível no momento da consulta.
+                </span>
+              </div>
+            ) : data.compliancePepStatus === 'ALERTA_PEP' && data.compliancePepTotal > 0 ? (
+              <div
+                className="pep-compliance-alert-card"
+                style={{
+                  background: '#fff7ed',
+                  borderLeft: '4px solid #ea580c',
+                  padding: '14px 18px',
+                  borderRadius: '8px',
+                  boxSizing: 'border-box',
+                  maxWidth: '100%',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap', marginBottom: '8px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    <strong style={{ color: '#c2410c', fontSize: '14px' }}>
+                      Alerta de Compliance: {data.compliancePepTotal} vínculo(s) PEP identificado(s) no QSA
+                    </strong>
+                  </div>
+                </div>
+
+                <p style={{ margin: '0 0 10px 0', fontSize: '12px', color: '#9a3412', lineHeight: '1.5' }}>
+                  {data.compliancePepRecomendacao}
+                </p>
+
+                {data.compliancePepOcorrencias && data.compliancePepOcorrencias.length > 0 && (
+                  <div style={{ marginTop: '8px' }}>
+                    <small style={{ color: '#7c2d12', display: 'block', marginBottom: '6px', fontWeight: 600 }}>
+                      Vínculos Públicos Identificados (Minimização LGPD):
+                    </small>
+                    <div style={{ display: 'grid', gap: '8px' }}>
+                      {data.compliancePepOcorrencias.map((oc, idx) => (
+                        <div
+                          key={idx}
+                          style={{
+                            background: '#fff',
+                            border: '1px solid #fed7aa',
+                            padding: '8px 12px',
+                            borderRadius: '6px',
+                            fontSize: '12px',
+                          }}
+                        >
+                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: '4px' }}>
+                            <strong style={{ color: '#431407' }}>{oc.cargo_funcao}</strong>
+                            <span
+                              style={{
+                                background: oc.nivel_correspondencia === 'CORRESPONDENCIA_ALTA' ? '#fee2e2' : '#fef3c7',
+                                color: oc.nivel_correspondencia === 'CORRESPONDENCIA_ALTA' ? '#991b1b' : '#92400e',
+                                padding: '2px 8px',
+                                borderRadius: '4px',
+                                fontSize: '11px',
+                                fontWeight: 600,
+                              }}
+                            >
+                              {oc.nivel_correspondencia === 'CORRESPONDENCIA_ALTA' ? 'Correspondência Exata' : 'Possível Vínculo (Homônimo)'}
+                            </span>
+                          </div>
+                          <div style={{ color: '#78350f', fontSize: '11px' }}>
+                            Órgão/Esfera: <strong>{oc.esfera_orgao}</strong>
+                            {oc.descricao_correspondencia && (
+                              <span style={{ marginLeft: '6px', color: '#b45309', fontStyle: 'italic' }}>
+                                · {oc.descricao_correspondencia}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div
+                className="pep-compliance-clean-card"
+                style={{
+                  background: '#f0f9f4',
+                  borderLeft: '4px solid #25865a',
+                  padding: '12px 16px',
+                  borderRadius: '8px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  flexWrap: 'wrap',
+                  boxSizing: 'border-box',
+                  maxWidth: '100%',
+                }}
+              >
+                <CheckCircle2 size={18} color="#25865a" />
+                <span style={{ color: '#25865a', fontSize: '13px', fontWeight: 600 }}>
+                  Nenhum vínculo com Pessoa Politicamente Exposta (PEP) identificado no QSA consultado
                 </span>
               </div>
             )}
