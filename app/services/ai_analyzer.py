@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import time
 import json
 import asyncio
@@ -55,6 +56,272 @@ def _prune_comparative_cache_if_needed() -> None:
         excess = len(COMPARATIVE_CACHE) - COMPARATIVE_CACHE_MAX_ENTRIES
         for k in sorted_keys[:excess]:
             COMPARATIVE_CACHE.pop(k, None)
+
+
+# =====================================================================
+# US-19: Detecção de Responsabilidade Subsidiária de Tomadoras PJ (Súmula 331 TST)
+# =====================================================================
+
+SUBSIDIARY_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"responsabilidade\s+subsidi[aá]ria",
+        r"condena[cç][aã]o\s+subsidi[aá]ria",
+        r"condenad[ao]s?\s+subsidiariamente",
+        r"responde(m)?\s+subsidiariamente",
+        r"s[uú]mula\s*(?:n[ºo]?\s*)?331",
+        r"tomador(?:a)?\s+(?:de|dos|do)\s+servi[cç]os?",
+        r"responsabiliza[cç][aã]o\s+subsidi[aá]ria",
+        r"devedor(?:a)?\s+subsidi[aá]ri[ao]",
+        r"execu[cç][aã]o\s+subsidi[aá]ria",
+    ]
+]
+
+PJ_INDICATORS_PATTERN = re.compile(
+    r"\b("
+    r"S\.?/?\s*A\.?|S/A|LTDA\.?|EIRELI\.?|MEI?|EPP|M\.?E\.?|E\.?P\.?P\.?|S/S|S\.?S\.?|"
+    r"MUNICIPIO|MUNICÍPIO|ESTADO|UNI[AÃ]O|AUTARQUIA|FUNDA[CÇ][AÃ]O|INSTITUTO|"
+    r"CONSORCIO|CONSÓRCIO|COOPERATIVA|BANCO|COMPANHIA|CIA\.?|SECRETARIA|MINIST[EÉ]RIO|"
+    r"EMPRESA|HOSPITAL|UNIVERSIDADE|FACULDADE|DEPARTAMENTO|TRIBUNAL|CONSELHO|"
+    r"AGENCIA|AGÊNCIA|SERVI[CÇ]O\s+SOCIAL|SESI|SENAI|SESC|SEBRAE|SOCIEDADE"
+    r")\b",
+    re.IGNORECASE
+)
+
+CPF_PATTERN = re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b")
+CNPJ_PATTERN = re.compile(r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b")
+
+EXCLUDED_ENTITIES = {
+    "MINISTERIO PUBLICO DO TRABALHO",
+    "MINISTÉRIO PÚBLICO DO TRABALHO",
+    "JUSTICA DO TRABALHO",
+    "JUSTIÇA DO TRABALHO",
+    "TRIBUNAL SUPERIOR DO TRABALHO",
+    "TST",
+    "VARA DO TRABALHO",
+    "PODER JUDICIARIO",
+    "PODER JUDICIÁRIO",
+}
+
+
+def sanitize_contractor_pj_name(
+    raw_name: str,
+    evaluated_company: str = "",
+    evaluated_cnpj: str = "",
+) -> Optional[str]:
+    """
+    Sanitiza e valida se o nome de entidade corresponde estritamente a uma Pessoa Jurídica
+    ou Órgão Público terceiro (tomadora), descartando 100% de pessoas físicas (LGPD by Design)
+    e excluindo a própria empresa avaliada.
+    """
+    if not raw_name or not isinstance(raw_name, str):
+        return None
+
+    name = " ".join(raw_name.strip().split())
+    if len(name) < 3:
+        return None
+
+    # LGPD: remove expressamente CPFs formatados ou numéricos isolados
+    name = CPF_PATTERN.sub("", name).strip()
+    name = re.sub(r"\s+", " ", name)
+    if len(name) < 3:
+        return None
+
+    has_pj_indicator = bool(PJ_INDICATORS_PATTERN.search(name))
+    has_cnpj = bool(CNPJ_PATTERN.search(name))
+
+    # LGPD By Design: se NÃO contiver indicador explícito de PJ nem CNPJ, descarta imediatamente
+    if not has_pj_indicator and not has_cnpj:
+        return None
+
+    name_upper = name.upper().strip(" .,;:-_")
+
+    for exc in EXCLUDED_ENTITIES:
+        if exc in name_upper:
+            return None
+
+    if evaluated_company:
+        clean_eval = re.sub(r"[^\w\s]", "", evaluated_company.upper()).strip()
+        clean_name = re.sub(r"[^\w\s]", "", name_upper).strip()
+
+        if clean_eval and (clean_name == clean_eval or clean_eval in clean_name or clean_name in clean_eval):
+            return None
+
+        eval_tokens = set(re.sub(r"\b(LTDA|SA|S/A|EIRELI|ME|EPP|CIA|COMPANHIA|DE|DO|DA|E)\b", "", clean_eval).split())
+        name_tokens = set(re.sub(r"\b(LTDA|SA|S/A|EIRELI|ME|EPP|CIA|COMPANHIA|DE|DO|DA|E)\b", "", clean_name).split())
+        eval_core = {t for t in eval_tokens if len(t) >= 4}
+        name_core = {t for t in name_tokens if len(t) >= 4}
+        if eval_core and name_core and eval_core == name_core:
+            return None
+
+    if evaluated_cnpj:
+        clean_eval_cnpj = re.sub(r"\D", "", evaluated_cnpj)
+        clean_name_cnpj = re.sub(r"\D", "", name)
+        if len(clean_eval_cnpj) >= 8 and len(clean_name_cnpj) >= 8:
+            if clean_eval_cnpj[:8] == clean_name_cnpj[:8]:
+                return None
+
+    if len(name_upper) > 120:
+        name_upper = name_upper[:120].strip()
+
+    return name_upper
+
+
+def extract_pj_contractors_from_process(
+    proc: Dict[str, Any],
+    evaluated_company: str = "",
+    evaluated_cnpj: str = "",
+) -> List[str]:
+    """
+    Extrai lista deduplicada de contratantes PJ (tomadoras) do processo a partir de:
+    - destinatarios_nomes / destinatarios (Comunica PJe)
+    - poloPassivo / partes / raw_metadata (DataJud)
+    - texto das publicações (se contiver co-réus / tomadoras identificáveis)
+    """
+    candidates: List[str] = []
+
+    dest_nomes = proc.get("destinatarios_nomes") or []
+    if isinstance(dest_nomes, list):
+        for n in dest_nomes:
+            if isinstance(n, str):
+                candidates.append(n)
+
+    raw_meta = proc.get("raw_metadata") or {}
+    if isinstance(raw_meta, dict):
+        for key in ("poloPassivo", "partes", "destinatarios"):
+            entities = raw_meta.get(key) or []
+            if isinstance(entities, list):
+                for ent in entities:
+                    if isinstance(ent, dict):
+                        nome = ent.get("nome") or ent.get("nomeParte")
+                        if not nome and isinstance(ent.get("pessoa"), dict):
+                            nome = ent["pessoa"].get("nome")
+                        if nome and isinstance(nome, str):
+                            candidates.append(nome)
+
+    texts = list(proc.get("publicacoes_texto") or [])
+    if proc.get("observation"):
+        texts.append(str(proc["observation"]))
+
+    for txt in texts:
+        if not isinstance(txt, str) or not txt:
+            continue
+        matches = re.finditer(
+            r"(?:2[ªaºo]?\s+reclamad[ao]|segund[ao]\s+reclamad[ao]|3[ªaºo]?\s+reclamad[ao]|"
+            r"terceir[ao]\s+reclamad[ao]|litisconsorte\s+passiv[ao]|litisconsorte|"
+            r"tomador[ao]\s+(?:de|dos|do)\s+servi[cç]os?|tomador[ao])\s*[:\-–]?\s*"
+            r"([A-Za-z0-9À-ÿ\s\.\-–—/&]+?)(?:;|\.|\n|,?\s+(?:e\s+outr|advogad|cpf|cnpj|inscrit|nos\s+termos)|$)",
+            txt,
+            re.IGNORECASE
+        )
+        for m in matches:
+            matched_name = m.group(1).strip()
+            if len(matched_name) >= 3:
+                candidates.append(matched_name)
+
+    valid_contractors: List[str] = []
+    seen = set()
+    for cand in candidates:
+        cleaned = sanitize_contractor_pj_name(cand, evaluated_company, evaluated_cnpj)
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            valid_contractors.append(cleaned)
+
+    return valid_contractors
+
+
+def process_has_subsidiary_text(proc: Dict[str, Any]) -> bool:
+    """
+    Verifica se o processo possui padrões textuais de condenação / responsabilidade subsidiária
+    (Súmula 331 TST) nas publicações, movimentos ou observações.
+    """
+    texts = list(proc.get("publicacoes_texto") or [])
+    if proc.get("observation"):
+        texts.append(str(proc["observation"]))
+    if proc.get("resumoPublicacao"):
+        texts.append(str(proc["resumoPublicacao"]))
+
+    movs = proc.get("movimentos") or []
+    if isinstance(movs, list):
+        for m in movs:
+            if isinstance(m, dict):
+                desc = m.get("nome") or m.get("descricao") or m.get("texto")
+                if desc and isinstance(desc, str):
+                    texts.append(desc)
+
+    combined_text = " ".join(str(t) for t in texts if t)
+    if not combined_text:
+        return False
+
+    for pattern in SUBSIDIARY_PATTERNS:
+        if pattern.search(combined_text):
+            return True
+
+    return False
+
+
+def detect_subsidiary_liability_in_processes(
+    processes: List[Dict[str, Any]],
+    evaluated_company: str = "",
+    evaluated_cnpj: str = "",
+) -> Dict[str, Any]:
+    """
+    Executa a mineração jurídica estruturada de responsabilidade subsidiária (Súmula 331 TST)
+    sobre 100% dos processos coletados (sem fatiamento artificial).
+    """
+    affected_processes: List[str] = []
+    seen_process_numbers = set()
+    all_tomadoras: List[str] = []
+    seen_tomadoras = set()
+    process_contractors_map: Dict[str, List[str]] = {}
+
+    for proc in processes:
+        if not isinstance(proc, dict):
+            continue
+
+        p_num = proc.get("numero_processo") or proc.get("numeroProcesso") or ""
+        norm_num = re.sub(r"\D", "", str(p_num))
+        if not norm_num:
+            norm_num = str(p_num).strip()
+        if not norm_num:
+            continue
+
+        if norm_num in seen_process_numbers:
+            continue
+
+        seen_process_numbers.add(norm_num)
+
+        has_text_signal = process_has_subsidiary_text(proc)
+        contractors = extract_pj_contractors_from_process(proc, evaluated_company, evaluated_cnpj)
+
+        if has_text_signal and contractors:
+            affected_processes.append(p_num)
+            process_contractors_map[p_num] = contractors
+            proc["has_subsidiary_liability"] = True
+            proc["subsidiary_contractors"] = contractors
+            for c in contractors:
+                if c not in seen_tomadoras:
+                    seen_tomadoras.add(c)
+                    all_tomadoras.append(c)
+        else:
+            proc.setdefault("has_subsidiary_liability", False)
+            proc.setdefault("subsidiary_contractors", [])
+
+    count = len(affected_processes)
+    limited_tomadoras = sorted(all_tomadoras)[:15]
+
+    if count > 0:
+        mensagem = f"Histórico de Responsabilidade Subsidiária: {count} processos com condenação subsidiária atribuída a contratantes anteriores"
+    else:
+        mensagem = "Nenhuma condenação subsidiária de contratante identificada na amostra"
+
+    return {
+        "condenacoes_subsidiarias_tomadoras_count": count,
+        "tomadoras_subsidiarias_pj": limited_tomadoras,
+        "mensagem_responsabilidade_subsidiaria": mensagem,
+        "mensagem": mensagem,
+        "processos_afetados": affected_processes,
+        "process_contractors_map": process_contractors_map,
+    }
 
 # Integração nativa com o diretório radarjusAgent (Google ADK + Vertex AI)
 RADARJUS_AGENT_DIR = Path(__file__).resolve().parents[2] / "radarjusAgent"
@@ -219,13 +486,34 @@ class LegalAIAnalyzer:
                 "taxa_historica_condenacao_pct": None,
                 "processos_em_aberto_monitorados": 0,
                 "principais_vulnerabilidades": [],
-                "alertas_sumula_331": [],
+                "alertas_sumula_331": [
+                    "Nenhuma condenação subsidiária de contratante identificada na amostra."
+                ],
+                "historico_responsabilidade_subsidiaria": {
+                    "condenacoes_subsidiarias_tomadoras_count": 0,
+                    "tomadoras_subsidiarias_pj": [],
+                    "mensagem": "Nenhuma condenação subsidiária de contratante identificada na amostra",
+                },
                 "recomendacoes_compliance": [
                     "Manter rotinas preventivas de conformidade trabalhista (CLT e eSocial).",
                     "Acompanhar periodicamente novas publicações ou eventuais citações judiciais."
                 ],
                 "status": "sucesso"
             }
+
+        # Sub-informações de Responsabilidade Subsidiária (Súmula 331 TST - US-19)
+        sub_count = int(summary_data.get("condenacoes_subsidiarias_tomadoras_count", 0) or 0)
+        sub_tomadoras = list(summary_data.get("tomadoras_subsidiarias_pj", []) or [])
+        sub_msg = (
+            f"Histórico de Responsabilidade Subsidiária: {sub_count} processos com condenação subsidiária atribuída a contratantes anteriores"
+            if sub_count > 0
+            else "Nenhuma condenação subsidiária de contratante identificada na amostra"
+        )
+        alerta_sub_txt = (
+            f"Histórico de Responsabilidade Subsidiária: {sub_count} processos com condenação subsidiária atribuída a contratantes anteriores ({', '.join(sub_tomadoras[:3])})."
+            if sub_count > 0
+            else "Nenhuma condenação subsidiária de contratante identificada na amostra."
+        )
 
         # Caso 2: Empresa com processos abertos, mas sem histórico anterior julgado (condenações/improcedências/acordos)
         if total_julgados == 0:
@@ -274,8 +562,14 @@ class LegalAIAnalyzer:
                 "processos_em_aberto_monitorados": em_aberto,
                 "principais_vulnerabilidades": top_motivos,
                 "alertas_sumula_331": [
-                    f"Demandas em aberto concentradas em: {motivos_str}."
+                    f"Demandas em aberto concentradas em: {motivos_str}.",
+                    alerta_sub_txt,
                 ],
+                "historico_responsabilidade_subsidiaria": {
+                    "condenacoes_subsidiarias_tomadoras_count": sub_count,
+                    "tomadoras_subsidiarias_pj": sub_tomadoras,
+                    "mensagem": sub_msg,
+                },
                 "recomendacoes_compliance": [
                     "Estruturar auditoria prévia de provas documentais e testemunhais para os processos em curso.",
                     "Avaliar viabilidade de conciliação nas primeiras audiências para reduzir custos processuais."
@@ -367,8 +661,14 @@ class LegalAIAnalyzer:
             "principais_vulnerabilidades": top_motivos,
             "alertas_sumula_331": [
                 f"Assuntos recorrentes: {motivos_str}.",
-                f"Desfechos analisados: {condenacoes} condenações, {acordos} acordos, {improcedentes} improcedentes e {em_aberto} em aberto."
+                f"Desfechos analisados: {condenacoes} condenações, {acordos} acordos, {improcedentes} improcedentes e {em_aberto} em aberto.",
+                alerta_sub_txt,
             ],
+            "historico_responsabilidade_subsidiaria": {
+                "condenacoes_subsidiarias_tomadoras_count": sub_count,
+                "tomadoras_subsidiarias_pj": sub_tomadoras,
+                "mensagem": sub_msg,
+            },
             "recomendacoes_compliance": recomendacoes,
             "status": "sucesso"
         }
@@ -380,6 +680,16 @@ class LegalAIAnalyzer:
         2. Tenta Gemini REST se GEMINI_API_KEY estiver configurada.
         3. Fallback para o motor analítico local.
         """
+        if "condenacoes_subsidiarias_tomadoras_count" not in summary_data and "processos" in summary_data:
+            empresa = summary_data.get("empresa", "")
+            sub_res = detect_subsidiary_liability_in_processes(
+                summary_data.get("processos", []),
+                evaluated_company=empresa,
+                evaluated_cnpj=summary_data.get("cnpj", ""),
+            )
+            summary_data["condenacoes_subsidiarias_tomadoras_count"] = sub_res["condenacoes_subsidiarias_tomadoras_count"]
+            summary_data["tomadoras_subsidiarias_pj"] = sub_res["tomadoras_subsidiarias_pj"]
+            summary_data["mensagem_responsabilidade_subsidiaria"] = sub_res["mensagem_responsabilidade_subsidiaria"]
         total = summary_data.get("total_processos", 0)
         outcomes = summary_data.get("desfechos_sentencas", {})
         total_julgados = (

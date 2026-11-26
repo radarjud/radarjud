@@ -1175,3 +1175,13 @@ class CNJProcessSearcher:
     def _infer_subjects_from_text(texto: str) -> List[Dict[str, Any]]:
         """Infere o motivo do processo pelo texto da publicação utilizando extract_real_cause_fast."""
         return extract_real_cause_fast([], [texto])
+
+
+def detect_subsidiary_liability_in_processes(
+    processes: List[Dict[str, Any]],
+    evaluated_company: str = "",
+    evaluated_cnpj: str = "",
+) -> Dict[str, Any]:
+    """Re-exportação utilitária de detecção de responsabilidade subsidiária (US-19)."""
+    from app.services.ai_analyzer import detect_subsidiary_liability_in_processes as _detect
+    return _detect(processes, evaluated_company=evaluated_company, evaluated_cnpj=evaluated_cnpj)

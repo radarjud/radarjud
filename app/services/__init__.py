@@ -9,6 +9,7 @@ from app.services.monitoring_job import (
     evaluate_monitored_supplier,
     dispatch_alert,
 )
+from app.services.ai_analyzer import detect_subsidiary_liability_in_processes
 
 __all__ = [
     "CNJClient",
@@ -21,5 +22,6 @@ __all__ = [
     "run_monitoring_job",
     "evaluate_monitored_supplier",
     "dispatch_alert",
+    "detect_subsidiary_liability_in_processes",
 ]
 
