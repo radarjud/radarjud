@@ -740,7 +740,7 @@ class LegalAIAnalyzer:
                 "'perfil_risco_consolidado', 'resumo_executivo', 'recomendacao_homologacao', "
                 "'taxa_historica_vitoria_empresa_pct', 'principais_vulnerabilidades', "
                 "'alertas_sumula_331', 'recomendacoes_compliance'.\n"
-                f"Metadados: {json.dumps(summary_data, ensure_ascii=False)}"
+                f"Metadados: {json.dumps(summary_data, ensure_ascii=False, default=str)}"
             )
             cloud_result = self._call_gemini_api(prompt)
             if cloud_result:
@@ -839,7 +839,7 @@ class LegalAIAnalyzer:
             "Súmula 331 do TST e governança de risco com terceiros (RiskTech).\n"
             "Analise os fornecedores abaixo, já matematicamente ranqueados por menor risco subsidiário e solvência:\n\n"
             f"Segmento: {cnae_str}\n"
-            f"Dados consolidados: {json.dumps(summary_items, ensure_ascii=False, indent=2)}\n\n"
+            f"Dados consolidados: {json.dumps(summary_items, ensure_ascii=False, indent=2, default=str)}\n\n"
             "DIRETRIZES E GUARDRAILS ANTI-ALUCINAÇÃO:\n"
             f"1. A empresa em 1º lugar DEVE SER EXATAMENTE '{vencedora}'. É estritamente proibido alterar o ranking ou trocar a vencedora.\n"
             "2. Não invente números, percentuais ou valores financeiros diferentes dos informados nos dados acima.\n"

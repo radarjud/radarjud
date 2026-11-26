@@ -62,6 +62,6 @@ def generate_movements_hash(processes_data: list[dict[str, Any]], rfb_status: st
     if rfb_status is not None:
         payload["rfb_status"] = str(rfb_status).strip().upper()
 
-    serialized = json.dumps(payload if rfb_status is not None else normalized_entries, sort_keys=True, separators=(",", ":"))
+    serialized = json.dumps(payload if rfb_status is not None else normalized_entries, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 

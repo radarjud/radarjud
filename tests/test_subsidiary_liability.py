@@ -372,3 +372,40 @@ def test_bayesian_simplex_and_blocking_rule_not_broken(app_instance):
             + p.get("probabilidade_vencer_pct", 0.0)
         )
         assert round(soma_simplex, 1) == 100.0
+
+
+def test_ai_analyzer_json_serialization_with_date_and_datetime(monkeypatch):
+    """
+    Garante que objetos date e datetime presentes nos metadados ou processos
+    são serializados com sucesso sem levantar TypeError (500) ao invocar o analisador.
+    """
+    import datetime
+    from app.services.ai_analyzer import LegalAIAnalyzer
+
+    analyzer = LegalAIAnalyzer()
+    analyzer.gemini_api_key = "dummy_test_key"
+
+    # Simula resposta da API Gemini para forçar passagem pelo bloco json.dumps
+    monkeypatch.setattr(analyzer, "_call_gemini_api", lambda prompt: None)
+
+    summary_data = {
+        "empresa": "EMPRESA TESTE S/A",
+        "cnpj": "12345678000199",
+        "total_processos": 2,
+        "desfechos_sentencas": {"condenacoes": 1, "acordos": 1, "improcedentes": 0},
+        "processos": [
+            {
+                "numero_processo": "0001234-56.2023.5.01.0001",
+                "tribunal": "TRT1",
+                "data_distribuicao": datetime.date(2023, 5, 15),
+                "data_hora_movimento": datetime.datetime(2023, 5, 15, 10, 30, 0),
+                "sentence_outcome": "condenacoes",
+                "observation": "Condenacao em 1a instancia",
+            }
+        ],
+    }
+
+    result = analyzer.analyze_company(summary_data)
+    assert result is not None
+    assert result.get("status") == "sucesso"
+
