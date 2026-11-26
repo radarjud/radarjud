@@ -72,6 +72,9 @@ ul { margin: 4pt 0 8pt; padding-left: 15pt; }
 <tbody>{% for item in ranking %}<tr><td>{{ loop.index }}</td><td>{{ item.motivo }}</td><td class="num">{{ item.quantidade }}</td><td class="num">{{ pct(item.taxa_no_motivo) if report.ranking_condenacoes and item.taxa_no_motivo is defined and item.taxa_no_motivo is not none else '—' }}</td></tr>{% endfor %}</tbody></table>
 {% else %}<p>Nenhuma condenação ou vetor de risco recorrente mapeado para esta empresa.</p>{% endif %}
 {% endif %}
+<<<<<<< HEAD
+<h2>Diligência complementar</h2>{% if comp.alertas_331 %}<ul>{% for item in comp.alertas_331 %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}{% if econ.sinais_solvencia_publica and econ.sinais_solvencia_publica.resumo_solvencia %}<p><strong>Solvência e Certidões Públicas:</strong> {{ econ.sinais_solvencia_publica.resumo_solvencia }}</p>{% if econ.sinais_solvencia_publica.orientacao_homologacao %}<p><strong>Orientação de Homologação:</strong> {{ econ.sinais_solvencia_publica.orientacao_homologacao }}</p>{% endif %}{% else %}<p>Histórico de responsabilidade subsidiária, contratos públicos e alertas de PEP: dados específicos não disponibilizados nesta consulta.</p>{% endif %}<h2>Resumo executivo</h2><p>{{ comp.resumo_executivo }}</p><h2>Resumo dos processos analisados</h2><table class="kpis"><tr>{% for label,value in [('Processos',report.total_processes),('Condenações',out.condenacoes),('Acordos',out.acordos),('Improcedentes',out.improcedentes),('Em aberto',out.em_aberto)] %}<td><div class="kpi-label">{{ label }}</div><div class="kpi-value num">{{ value }}</div></td>{% endfor %}</tr></table>{% if outcomes_svg %}<section class="chart-block"><h2>Distribuição de desfechos</h2><div class="chart-frame">{{ outcomes_svg | safe }}</div></section>{% endif %}<h2>Mais informações</h2><table class="econ"><colgroup><col style="width:54%"><col style="width:46%"></colgroup><tr>
+=======
 <h2>Diligência complementar</h2>
 {% if comp.condenacoes_subsidiarias_tomadoras_count and comp.condenacoes_subsidiarias_tomadoras_count > 0 %}
 <div class="subsidiary-card" style="background:#fef7ea; border-left:4px solid #b67b23; padding:8px 12px; margin-bottom:10px; border-radius:4px;">
@@ -116,11 +119,24 @@ ul { margin: 4pt 0 8pt; padding-left: 15pt; }
 </div>
 {% endif %}
 <h2>Resumo executivo</h2><p>{{ comp.resumo_executivo }}</p><h2>Resumo dos processos analisados</h2><table class="kpis"><tr>{% for label,value in [('Processos',report.total_processes),('Condenações',out.condenacoes),('Acordos',out.acordos),('Improcedentes',out.improcedentes),('Em aberto',out.em_aberto)] %}<td><div class="kpi-label">{{ label }}</div><div class="kpi-value num">{{ value }}</div></td>{% endfor %}</tr></table>{% if outcomes_svg %}<section class="chart-block"><h2>Distribuição de desfechos</h2><div class="chart-frame">{{ outcomes_svg | safe }}</div></section>{% endif %}<h2>Mais informações</h2><table class="econ"><colgroup><col style="width:54%"><col style="width:46%"></colgroup><tr>
+>>>>>>> ef49f8a00ed57bf052dd843c995348cebbe39c92
 <td><div class="econ-label">CAPITAL SOCIAL DECLARATÓRIO</div><div class="econ-value num">{{ econ.capital_fmt }}</div><div class="detail">{{ econ.badge_porte }}<br>{{ econ.subtitulo_unidades }}</div></td>
 <td><div class="econ-label">SITUAÇÃO CADASTRAL RFB</div><div class="econ-value" style="color:{{ '#25865a' if econ.situacao_rfb == 'ATIVA' else '#c34a4a' }}">{{ econ.situacao_rfb }}</div><div class="detail">Sanções/Débitos: {{ econ.sancoes_texto }}</div></td>
 </tr><tr>
 <td><div class="econ-label">PROBABILIDADE DE INSOLVÊNCIA</div><div class="econ-value num">{{ pct(econ.prob_insolv) }}</div><div class="detail">Estimativa de solvência</div></td>
 <td><div class="econ-label">STATUS DA VARREDURA</div><div class="econ-value">{{ scan_label(report.scan_status) }}</div><div class="detail">Confiança da estimativa: {{ report.conf_label }}</div></td>
 </tr></table>
+{% if econ.fontes_consultadas %}
+<table class="ranking" style="margin-top:8pt;"><colgroup><col style="width:36%"><col style="width:24%"><col style="width:40%"></colgroup>
+<thead><tr><th>Fonte / Certidão Verificada</th><th>Status Canônico</th><th>Detalhamento Oficial</th></tr></thead>
+<tbody>{% for f in econ.fontes_consultadas %}
+<tr>
+<td><strong>{{ f.fonte }}</strong></td>
+<td style="font-weight:bold;color:{{ '#25865a' if f.status == 'Regular' else '#c34a4a' if f.status == 'Restrição identificada' else '#526477' }}">{{ f.status }}</td>
+<td style="font-size:7.5pt;">{{ f.detalhe }}</td>
+</tr>
+{% endfor %}</tbody></table>
+<p class="detail" style="margin-top:4pt;"><strong>Demonstrações Contábeis:</strong> {{ econ.demonstracao_contabil_status or 'Demonstração contábil pública indisponível' }}.</p>
+{% endif %}
 <p class="detail">Estimativa baseada no histórico e porte. Faixa provável de variação (90% de confiança), quando disponível.</p><p class="sources">Fontes Oficiais Consultadas: Comunica PJe (CNJ), DataJud (CNJ), Receita Federal do Brasil, CGU (CEIS/CNEP) e PGFN. Relatório gerado automaticamente pelo RadarJus v2.0 (Estimativa baseada no histórico + Auditoria de Solvência).</p>
 </body></html>

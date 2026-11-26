@@ -174,6 +174,7 @@ class CompanySearch(db.Model):
                 "descricao": self.cnae_descricao,
             },
             "idoneidade_economica": econ_data,
+            "sinais_solvencia_publica": econ_data.get("sinais_solvencia_publica") if isinstance(econ_data, dict) else None,
             "logo": self._sanitize_logo_for_export(econ_data.get("logo", {}) if isinstance(econ_data, dict) else {}),
             "ai_analysis": self.ai_analysis or {},
             "condenacoes_subsidiarias_tomadoras_count": sub_count,

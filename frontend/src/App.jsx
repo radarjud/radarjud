@@ -166,6 +166,7 @@ function normalize(raw) {
     previsaoBloqueada: isPrevisaoBloqueada,
     motivoBloqueioPrevisao: payload.motivo_bloqueio_previsao || (isPrevisaoBloqueada ? 'Previsão de condenação desativada por ausência de passivo condenatório prévio na amostra (presunção de conformidade e integridade probatória - Súmula 331 TST).' : null),
     idoneidadeEconomica: econ,
+    sinaisSolvenciaPublica: payload.sinais_solvencia_publica || econ?.sinais_solvencia_publica || null,
     subsidiaryRisk: subsidiaryRisk(rawEcon),
     hasEconomicData: Boolean(rawEcon),
     logo: logo,
@@ -473,218 +474,19 @@ function Overview({ data, navigate, catalogTerm }) {
       )}
 
 
-      {hasData && (
-        <Panel title="Diligência complementar" subtitle="Informações para verificar antes da contratação">
-          {data.subsidiaryLiabilityCount > 0 ? (
-            <div
-              className="subsidiary-alert-card"
-              style={{
-                background: '#fef7ea',
-                borderLeft: '4px solid #b67b23',
-                padding: '14px 18px',
-                borderRadius: '8px',
-                marginBottom: '16px',
-                boxSizing: 'border-box',
-                maxWidth: '100%',
-              }}
-            >
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', flexWrap: 'wrap' }}>
-                <ShieldAlert size={18} color="#b67b23" />
-                <strong style={{ color: '#b67b23', fontSize: '14px' }}>
-                  Histórico de Responsabilidade Subsidiária: {data.subsidiaryLiabilityCount} processos com condenação subsidiária atribuída a contratantes anteriores
-                </strong>
-              </div>
-              {data.subsidiaryContractorsPJ && data.subsidiaryContractorsPJ.length > 0 && (
-                <div style={{ marginTop: '8px' }}>
-                  <small style={{ color: '#556677', display: 'block', marginBottom: '6px', fontWeight: 600 }}>
-                    Contratantes / Tomadoras PJ identificadas no polo passivo:
-                  </small>
-                  <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-                    {data.subsidiaryContractorsPJ.map((tomadora, idx) => (
-                      <span
-                        key={idx}
-                        style={{
-                          background: '#fff',
-                          border: '1px solid #d8b888',
-                          color: '#7a5113',
-                          padding: '3px 8px',
-                          borderRadius: '4px',
-                          fontSize: '11px',
-                          fontWeight: 600,
-                          wordBreak: 'break-word',
-                        }}
-                      >
-                        {tomadora}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          ) : (
-            <div
-              className="subsidiary-empty-card"
-              style={{
-                background: '#f0f9f4',
-                borderLeft: '4px solid #25865a',
-                padding: '12px 16px',
-                borderRadius: '8px',
-                marginBottom: '16px',
-                display: 'flex',
-                alignItems: 'center',
-                gap: '8px',
-                flexWrap: 'wrap',
-                boxSizing: 'border-box',
-                maxWidth: '100%',
-              }}
-            >
-              <ShieldCheck size={18} color="#25865a" />
-              <span style={{ color: '#25865a', fontSize: '13px', fontWeight: 600 }}>
-                Nenhuma condenação subsidiária de contratante identificada na amostra
-              </span>
-            </div>
-          )}
-
-          {/* US-20: Contratos com o Poder Público (PNCP / Portal da Transparência) */}
-          <div
-            className="public-contracts-section"
-            style={{
-              marginTop: '16px',
-              marginBottom: '16px',
-              boxSizing: 'border-box',
-              maxWidth: '100%',
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', flexWrap: 'wrap' }}>
-              <Building2 size={16} color="#1a56db" />
-              <strong style={{ fontSize: '13px', color: '#17283a', textTransform: 'uppercase', letterSpacing: '0.02em' }}>
-                Contratos com o Poder Público
-              </strong>
-            </div>
-
-            {data.publicContractsStatus === 'INDISPONIVEL' ? (
-              <div
-                className="public-contracts-unavailable-card"
-                style={{
-                  background: '#f8fafc',
-                  borderLeft: '4px solid #64748b',
-                  padding: '12px 16px',
-                  borderRadius: '8px',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '8px',
-                  flexWrap: 'wrap',
-                  boxSizing: 'border-box',
-                  maxWidth: '100%',
-                }}
-              >
-                <AlertCircle size={18} color="#64748b" />
-                <span style={{ color: '#475569', fontSize: '13px' }}>
-                  Base governamental temporariamente indisponível no momento da consulta.
-                </span>
-              </div>
-            ) : data.publicContractsTotal > 0 ? (
-              <div
-                className="public-contracts-active-card"
-                style={{
-                  background: '#f0f7fc',
-                  borderLeft: '4px solid #1a56db',
-                  padding: '14px 18px',
-                  borderRadius: '8px',
-                  boxSizing: 'border-box',
-                  maxWidth: '100%',
-                }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap', marginBottom: '8px' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                    <strong style={{ color: '#1a56db', fontSize: '14px' }}>
-                      {data.publicContractsTotal} contrato(s) público(s) localizado(s)
-                    </strong>
-                    {data.publicContractsValorFormatado && (
-                      <span style={{ fontSize: '12px', color: '#1e293b', fontWeight: 600, background: '#e0effe', padding: '2px 8px', borderRadius: '4px' }}>
-                        Valor Global: {data.publicContractsValorFormatado}
-                      </span>
-                    )}
-                  </div>
-                  {data.publicContractsEsferas && data.publicContractsEsferas.length > 0 && (
-                    <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
-                      {data.publicContractsEsferas.map((esfera, idx) => (
-                        <span
-                          key={idx}
-                          style={{
-                            background: '#dbeafe',
-                            color: '#1e40af',
-                            padding: '2px 7px',
-                            borderRadius: '4px',
-                            fontSize: '11px',
-                            fontWeight: 600,
-                          }}
-                        >
-                          {esfera}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                {data.publicContractsOrgaos && data.publicContractsOrgaos.length > 0 && (
-                  <div style={{ marginTop: '8px' }}>
-                    <small style={{ color: '#556677', display: 'block', marginBottom: '6px', fontWeight: 600 }}>
-                      Órgãos Contratantes Identificados:
-                    </small>
-                    <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-                      {data.publicContractsOrgaos.map((orgao, idx) => (
-                        <span
-                          key={idx}
-                          style={{
-                            background: '#fff',
-                            border: '1px solid #bfdbfe',
-                            color: '#1e3a8a',
-                            padding: '3px 8px',
-                            borderRadius: '4px',
-                            fontSize: '11px',
-                            fontWeight: 600,
-                            wordBreak: 'break-word',
-                          }}
-                        >
-                          {orgao}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div
-                className="public-contracts-empty-card"
-                style={{
-                  background: '#f0f9f4',
-                  borderLeft: '4px solid #25865a',
-                  padding: '12px 16px',
-                  borderRadius: '8px',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '8px',
-                  flexWrap: 'wrap',
-                  boxSizing: 'border-box',
-                  maxWidth: '100%',
-                }}
-              >
-                <CheckCircle2 size={18} color="#25865a" />
-                <span style={{ color: '#25865a', fontSize: '13px', fontWeight: 600 }}>
-                  Nenhum contrato público localizado nas bases consultadas
-                </span>
-              </div>
-            )}
-          </div>
-
-          {data.hasEconomicData && (
-            <p style={{ margin: 0, fontSize: '13px', color: '#556677' }}>
-              Restrições federais: {data.idoneidadeEconomica.possui_sancoes_cgu || data.idoneidadeEconomica.possui_divida_ativa ? 'Apontamentos informados' : 'Consulte as bases oficiais para confirmação'}.
-            </p>
-          )}
-        </Panel>
-      )}
+      {hasData && <Panel title="Diligência complementar" subtitle="Informações para verificar antes da contratação">
+        {data.sinaisSolvenciaPublica?.resumo_solvencia ? (
+          <p><strong>Solvência e Certidões:</strong> {businessText(data.sinaisSolvenciaPublica.resumo_solvencia)}</p>
+        ) : (
+          <p>Histórico de responsabilidade subsidiária, contratos públicos e alertas de PEP: dados específicos não disponibilizados nesta consulta.</p>
+        )}
+        {data.sinaisSolvenciaPublica?.orientacao_homologacao && (
+          <p style={{ color: '#245a81', fontWeight: 600 }}>
+            📌 Orientação de Homologação: {businessText(data.sinaisSolvenciaPublica.orientacao_homologacao)}
+          </p>
+        )}
+        {data.hasEconomicData && <p>Restrições federais: {data.idoneidadeEconomica.possui_sancoes_cgu || data.idoneidadeEconomica.possui_divida_ativa ? 'Apontamentos informados' : 'Consulte as bases oficiais para confirmação'}.</p>}
+      </Panel>}
       {/* Parecer do Consultor de Inteligência Artificial (Agente ADK radarjusAgent) */}
       {ai && (
         <Panel
@@ -799,6 +601,7 @@ function Overview({ data, navigate, catalogTerm }) {
       {/* Idoneidade Econômica & Risco de Exposição Subsidiária */}
       {data?.hasEconomicData && (() => {
         const econ = data.idoneidadeEconomica;
+        const sinais = data.sinaisSolvenciaPublica || econ?.sinais_solvencia_publica || {};
         const isCenarioA = (econ.cenario_tipo === 'CENARIO_A') || (econ.cenario === 'CENARIO_A') || (econ.cenario_class === 'seguro');
         const badgePorte = econ.badge_compatibilidade_porte || econ.observacao_porte || econ.capital_social_display?.observacao_porte;
         const capitalFormatted = econ.capital_social_formatado || econ.valor_formatado || econ.capital_social_display?.valor_formatado || 'R$ 0,00';
@@ -898,6 +701,39 @@ function Overview({ data, navigate, catalogTerm }) {
                   </small>
                 </div>
               </div>
+
+              {/* Sinais Públicos de Solvência e Certidões (US-22) */}
+              {Array.isArray(sinais?.fontes_consultadas) && sinais.fontes_consultadas.length > 0 && (
+                <div style={{ marginTop: '12px', background: '#f8fafc', padding: '14px', borderRadius: '8px', border: '1px solid #e2e8f0' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap', gap: '6px' }}>
+                    <strong style={{ fontSize: '13px', color: '#1e293b' }}>
+                      Fontes e Certidões Públicas Verificadas
+                    </strong>
+                    <span style={{ fontSize: '12px', color: '#475569' }}>
+                      Demonstrações Contábeis: <b>{sinais.demonstracao_contabil_status || 'Demonstração contábil pública indisponível'}</b>
+                    </span>
+                  </div>
+                  <div style={{ display: 'grid', gap: '8px' }}>
+                    {sinais.fontes_consultadas.map((f, idx) => (
+                      <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px', padding: '8px 10px', background: '#fff', borderRadius: '6px', border: '1px solid #edf2f7', flexWrap: 'wrap', gap: '8px' }}>
+                        <span style={{ color: '#334155' }}>
+                          <strong>{f.fonte}:</strong> {f.detalhe}
+                        </span>
+                        <span style={{
+                          fontWeight: 600,
+                          padding: '2px 8px',
+                          borderRadius: '4px',
+                          fontSize: '11px',
+                          background: f.status === 'Regular' ? '#dcfce7' : f.status === 'Restrição identificada' ? '#fee2e2' : '#f1f5f9',
+                          color: f.status === 'Regular' ? '#166534' : f.status === 'Restrição identificada' ? '#991b1b' : '#475569',
+                        }}>
+                          {f.status}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           <p>Status da varredura: {translateScanStatus(data.scanStatus)} · Desfechos mapeados: {formatNumber(classified)} · Transparência: {secrecyEntries.length ? "Parcial" : "Indisponível"}</p><p>Estimativa baseada no histórico e porte; faixa provável de variação (90% de confiança) quando disponível.</p></details>
         );

@@ -486,6 +486,18 @@ class LegalAIAnalyzer:
             or ""
         )
 
+        # Sinais Públicos de Solvência Real e Certidões (US-22)
+        sinais = (
+            summary_data.get("sinais_solvencia_publica")
+            or econ.get("sinais_solvencia_publica")
+            or {}
+        )
+        alerta_homologacao_privada = bool(
+            sinais.get("alerta_homologacao_privada")
+            or sinais.get("demonstracao_contabil_status") == "Demonstração contábil pública indisponível"
+        )
+        possui_restricoes = bool(sinais.get("possui_restricoes"))
+
         # Caso 1: Empresa sem nenhum processo localizado no CNJ
         if total == 0:
             resumo = (
@@ -514,6 +526,8 @@ class LegalAIAnalyzer:
                     "mensagem": "Nenhuma condenação subsidiária de contratante identificada na amostra",
                 },
                 "recomendacoes_compliance": [
+                    *(["Exigir certidões negativas atualizadas e balanço patrimonial recente diretamente do fornecedor no processo de homologação."] if alerta_homologacao_privada else []),
+                    *(["Exigir comprovação de regularidade fiscal e quitação das restrições identificadas em certidões públicas antes da contratação."] if possui_restricoes else []),
                     "Manter rotinas preventivas de conformidade trabalhista (CLT e eSocial).",
                     "Acompanhar periodicamente novas publicações ou eventuais citações judiciais."
                 ],
@@ -590,6 +604,8 @@ class LegalAIAnalyzer:
                     "mensagem": sub_msg,
                 },
                 "recomendacoes_compliance": [
+                    *(["Exigir certidões negativas atualizadas e balanço patrimonial recente diretamente do fornecedor no processo de homologação."] if alerta_homologacao_privada else []),
+                    *(["Exigir comprovação de regularidade fiscal e quitação das restrições identificadas em certidões públicas antes da contratação."] if possui_restricoes else []),
                     "Estruturar auditoria prévia de provas documentais e testemunhais para os processos em curso.",
                     "Avaliar viabilidade de conciliação nas primeiras audiências para reduzir custos processuais."
                 ],
@@ -659,12 +675,21 @@ class LegalAIAnalyzer:
                 f"com risco reflexo direto para tomadores de serviço sob a ótica da Súmula 331 do TST."
             )
 
-        recomendacoes = [
+        recomendacoes = []
+        if alerta_homologacao_privada:
+            recomendacoes.append(
+                "Exigir certidões negativas atualizadas e balanço patrimonial recente diretamente do fornecedor no processo de homologação."
+            )
+        if possui_restricoes:
+            recomendacoes.append(
+                "Exigir comprovação de regularidade fiscal e quitação das restrições identificadas em certidões públicas antes da contratação."
+            )
+        recomendacoes.extend([
             "Auditar cartões de ponto eletrônicos e escalas de descanso para suprimir passivo de jornada.",
             "Instituir comitê de prevenção e canal de ouvidoria independente para mitigar queixas de assédio/dano moral.",
             "Fiscalizar guias de recolhimento de FGTS e rescisões contratuais rigorosamente no prazo do art. 477 da CLT.",
             "Exigir certidões negativas e comprovantes fiscais periódicos de prestadores terceirizados (Súmula 331/TST)."
-        ]
+        ])
 
         return {
             "modelo_utilizado": "Local-Legal-NLP-v2",
