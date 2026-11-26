@@ -759,8 +759,14 @@ class CNJMetadataOrchestrator:
                                 rec.valor_causa = proc.get("valor_causa")
                             if proc.get("raw_metadata"):
                                 rec.raw_metadata = proc.get("raw_metadata")
+                            if "has_subsidiary_liability" in proc:
+                                rec.has_subsidiary_liability = bool(proc.get("has_subsidiary_liability", False))
+                            if "subsidiary_contractors" in proc:
+                                rec.subsidiary_contractors_json = proc.get("subsidiary_contractors") or []
                     else:
                         # Insere novo processo
+                        has_sub = bool(proc.get("has_subsidiary_liability", False))
+                        sub_contractors = proc.get("subsidiary_contractors") or []
                         new_record = ProcessRecord(
                             company_search_id=company_search_id,
                             numero_processo=p_num,
@@ -773,6 +779,8 @@ class CNJMetadataOrchestrator:
                             observation=proc.get("observation"),
                             sentence_outcome=proc.get("sentence_outcome", "em_aberto"),
                             has_expert_report=proc.get("has_expert_report", False),
+                            has_subsidiary_liability=has_sub,
+                            subsidiary_contractors_json=sub_contractors,
                             data_distribuicao=proc.get("data_distribuicao"),
                             valor_causa=proc.get("valor_causa"),
                             raw_metadata=proc.get("raw_metadata"),
@@ -808,6 +816,14 @@ class CNJMetadataOrchestrator:
         metrics["scan_status"] = scan_status
         metrics["movements_hash"] = generate_movements_hash(processes)
         metrics["processos"] = processes
+
+        # US-19: Detecção de Responsabilidade Subsidiária de Tomadoras PJ (Súmula 331 TST)
+        from app.services.ai_analyzer import detect_subsidiary_liability_in_processes
+        subsidiary_info = detect_subsidiary_liability_in_processes(processes, evaluated_company=company_name)
+        metrics["condenacoes_subsidiarias_tomadoras_count"] = subsidiary_info["condenacoes_subsidiarias_tomadoras_count"]
+        metrics["tomadoras_subsidiarias_pj"] = subsidiary_info["tomadoras_subsidiarias_pj"]
+        metrics["mensagem_responsabilidade_subsidiaria"] = subsidiary_info["mensagem_responsabilidade_subsidiaria"]
+        metrics["subsidiary_liability_summary"] = subsidiary_info
         return metrics
 
     def analyze_company_by_name(

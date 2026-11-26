@@ -2328,12 +2328,29 @@ class EconomicStandingService:
             search_strategy=search_strategy,
         )
 
-        # Incorpora alertas judiciais graves (Falência / Recuperação Judicial no DataJud)
-        # Distingue grandes empresas solventes (com solvência comprovada) de devedores falimentares reais
+        # Consolidação unificada de sinais públicos de solvência real e certidões (US-22)
+        from app.services.solvency_signals_service import solvency_signals_service
+        solvency_signals = solvency_signals_service.consolidate_solvency_signals(
+            company_name=company_name,
+            cnpj=effective_cnpj,
+            cadastral_data=cadastral_data,
+            processes=processes,
+            pgfn_data=pgfn_data,
+            cgu_data=cgu_data,
+            insolvency_data=insolvency_data,
+            capital_social=float(econ_result.get("capital_social_num") or 0.0),
+        )
+        econ_result["sinais_solvencia_publica"] = solvency_signals
+
+        # Incorpora alertas judiciais graves e restrições públicas oficiais (PGFN, CGU, Falência/RJ)
+        # Distingue grandes companhias abertas com solvência auditada de empresas com restrições fiscais ou judiciais
         total_cap_num = float(econ_result.get("capital_social_num") or 0.0)
-        is_large_solvent_company = total_cap_num >= 100_000_000.0
-        has_real_bankruptcy_alert = (insolvency_data.get("pedidos_falencia", 0) > 0 and not is_large_solvent_company) or cgu_data.get("possui_sancoes")
-        has_insolvency_risk = has_real_bankruptcy_alert or (insolvency_data.get("alerta_insolvencia_judicial") and total_cap_num < 10_000_000.0 and not is_large_solvent_company)
+        is_sa_auditada = (not solvency_signals.get("alerta_homologacao_privada")) and (solvency_signals.get("demonstracao_contabil_status") == "Regular")
+        is_large_solvent_company = (total_cap_num >= 100_000_000.0) and is_sa_auditada and not solvency_signals.get("possui_restricoes")
+
+        has_public_restriction = bool(solvency_signals.get("possui_restricoes"))
+        has_real_bankruptcy_alert = (insolvency_data.get("pedidos_falencia", 0) > 0 and not is_large_solvent_company) or cgu_data.get("possui_sancoes") or pgfn_data.get("possui_divida_ativa")
+        has_insolvency_risk = has_real_bankruptcy_alert or has_public_restriction or (insolvency_data.get("alerta_insolvencia_judicial") and total_cap_num < 10_000_000.0 and not is_large_solvent_company)
         if has_insolvency_risk:
             econ_result["cenario_tipo"] = "CENARIO_B"
             econ_result["cenario"] = "CENARIO_B"

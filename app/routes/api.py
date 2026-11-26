@@ -316,6 +316,7 @@ def _deep_scan_background_worker(
             deep_results["unidades_consolidadas"] = econ.get("unidades_consolidadas") or cap_display.get("unidades_consolidadas", 1)
             deep_results["observacao_porte"] = econ.get("observacao_porte") or cap_display.get("observacao_porte", "")
             deep_results["capital_social_display"] = econ.get("capital_social_display") or cap_display
+            deep_results["sinais_solvencia_publica"] = econ.get("sinais_solvencia_publica")
 
             deep_results["ai_analysis"] = orchestrator.ai_analyzer.analyze_company(deep_results)
             deep_results["parecer_agente_adk"] = deep_results["ai_analysis"]
@@ -337,6 +338,23 @@ def _deep_scan_background_worker(
             search.predictions_summary = deep_results.get("plus_previsao_condenacao", [])
             search.overall_risk_score = deep_results.get("score_risco_terceirizacao", 0.0)
             search.ai_analysis = deep_results.get("ai_analysis", {})
+            if "condenacoes_subsidiarias_tomadoras_count" in deep_results:
+                search.condenacoes_subsidiarias_tomadoras_count = deep_results.get("condenacoes_subsidiarias_tomadoras_count", 0)
+                search.tomadoras_subsidiarias_pj = deep_results.get("tomadoras_subsidiarias_pj", [])
+            if search.contratos_poder_publico is None or (
+                isinstance(search.contratos_poder_publico, dict) and search.contratos_poder_publico.get("total_contratos", 0) == 0
+            ):
+                from app.services.public_contracts_service import public_contracts_service
+                deep_cnpj = next(iter(cnpjs_found), None) or (
+                    econ.get("cnpj_utilizado") or
+                    econ.get("cnpj_triangulado") or
+                    (econ.get("cnpjs_consolidados")[0] if econ.get("cnpjs_consolidados") else None) or
+                    econ.get("cnpj")
+                ) if isinstance(econ, dict) else None
+                search.contratos_poder_publico = public_contracts_service.get_public_contracts(
+                    cnpj=deep_cnpj,
+                    company_name=search.company_name,
+                )
             search.movements_hash = deep_results.get("movements_hash")
             search.economic_standing = deep_results["idoneidade_economica"]
             if search.economic_standing and isinstance(search.economic_standing, dict):
@@ -370,6 +388,8 @@ def _deep_scan_background_worker(
                             observation=proc.get("observation"),
                             sentence_outcome=proc.get("sentence_outcome", "em_aberto"),
                             has_expert_report=proc.get("has_expert_report", False),
+                            has_subsidiary_liability=bool(proc.get("has_subsidiary_liability", False)),
+                            subsidiary_contractors_json=proc.get("subsidiary_contractors") or [],
                             data_distribuicao=proc.get("data_distribuicao"),
                             valor_causa=proc.get("valor_causa"),
                             raw_metadata=_compact_raw_metadata(proc.get("raw_metadata")),
@@ -693,13 +713,13 @@ def search_company():
                 res["capital_social_consolidado"] = econ_data.get("valor_formatado") or econ_data.get("capital_social_formatado")
                 res["observacao_porte"] = econ_data.get("observacao_porte")
                 res["capital_social_display"] = econ_data.get("capital_social_display")
+                res["sinais_solvencia_publica"] = econ_data.get("sinais_solvencia_publica")
                 if econ_data.get("indice_exposicao_financeira") is not None:
                     res["indice_exposicao_financeira"] = econ_data["indice_exposicao_financeira"]
                     res["score_risco_terceirizacao"] = econ_data["indice_exposicao_financeira"]
                     res["overall_risk_score"] = econ_data["indice_exposicao_financeira"]
 
-                # Reutiliza parecer de IA persistido quando disponível (evita chamada Gemini em L1 hit)
-                if isinstance(cached_search.ai_analysis, dict) and cached_search.ai_analysis:
+if isinstance(cached_search.ai_analysis, dict) and cached_search.ai_analysis:
                     res["ai_analysis"] = cached_search.ai_analysis
                 else:
                     fresh_ai = orchestrator.ai_analyzer.analyze_company(res)
@@ -708,6 +728,23 @@ def search_company():
                         cached_search.ai_analysis = fresh_ai
                         econ_dirty = True
 
+                # Contratos com o Poder Público (US-20): hidratação resiliente se ainda não computado
+                from app.services.public_contracts_service import public_contracts_service
+                clean_search_cnpj = cnpj_used or (
+                    econ_data.get("cnpj_utilizado") or
+                    econ_data.get("cnpj_triangulado") or
+                    (econ_data.get("cnpjs_consolidados")[0] if econ_data.get("cnpjs_consolidados") else None) or
+                    econ_data.get("cnpj")
+                ) if isinstance(econ_data, dict) else None
+                if not cached_search.contratos_poder_publico or cached_search.contratos_poder_publico.get("total_contratos", 0) == 0:
+                    contratos_pub = public_contracts_service.get_public_contracts(
+                        cnpj=clean_search_cnpj,
+                        company_name=cached_search.company_name,
+                    )
+                    if contratos_pub.get("total_contratos", 0) > 0 or not cached_search.contratos_poder_publico:
+                        cached_search.contratos_poder_publico = contratos_pub
+                        res["contratos_poder_publico"] = contratos_pub
+                        econ_dirty = True
                 res["cached"] = True
                 res["cache_level"] = "L1_DATABASE"
                 res["search_id"] = cached_search.id
@@ -837,6 +874,7 @@ def search_company():
         fast_results["capital_social_consolidado"] = econ_data.get("valor_formatado") or econ_data.get("capital_social_formatado")
         fast_results["observacao_porte"] = econ_data.get("observacao_porte")
         fast_results["capital_social_display"] = econ_data.get("capital_social_display")
+        fast_results["sinais_solvencia_publica"] = econ_data.get("sinais_solvencia_publica")
         if econ_data.get("indice_exposicao_financeira") is not None:
             fast_results["indice_exposicao_financeira"] = econ_data["indice_exposicao_financeira"]
             fast_results["score_risco_terceirizacao"] = econ_data["indice_exposicao_financeira"]
@@ -847,6 +885,20 @@ def search_company():
         if fresh_ai:
             fast_results["ai_analysis"] = fresh_ai
             fast_results["parecer_agente_adk"] = fresh_ai
+
+        # Consulta de Contratos com o Poder Público (PNCP / Portal da Transparência - US-20)
+        from app.services.public_contracts_service import public_contracts_service
+        clean_search_cnpj = cnpj_used or (
+            econ_data.get("cnpj_utilizado") or
+            econ_data.get("cnpj_triangulado") or
+            (econ_data.get("cnpjs_consolidados")[0] if econ_data.get("cnpjs_consolidados") else None) or
+            econ_data.get("cnpj")
+        ) if isinstance(econ_data, dict) else None
+        contratos_pub = public_contracts_service.get_public_contracts(
+            cnpj=clean_search_cnpj,
+            company_name=display_title,
+        )
+        fast_results["contratos_poder_publico"] = contratos_pub
 
         # Persistência do resultado no PostgreSQL
         search_id = None
@@ -868,6 +920,9 @@ def search_company():
                 economic_standing=econ_data,
                 cnae_codigo=econ_data.get("cnae_codigo") if isinstance(econ_data, dict) else None,
                 cnae_descricao=econ_data.get("cnae_descricao") if isinstance(econ_data, dict) else None,
+                condenacoes_subsidiarias_tomadoras_count=fast_results.get("condenacoes_subsidiarias_tomadoras_count", 0),
+                tomadoras_subsidiarias_pj=fast_results.get("tomadoras_subsidiarias_pj", []),
+                contratos_poder_publico=contratos_pub,
                 overall_risk_score=fast_results.get("score_risco_terceirizacao", 0.0),
                 ai_analysis=fast_results.get("ai_analysis", {}),
                 movements_hash=new_hash,
@@ -892,6 +947,8 @@ def search_company():
                     observation=proc.get("observation"),
                     sentence_outcome=proc.get("sentence_outcome", "em_aberto"),
                     has_expert_report=proc.get("has_expert_report", False),
+                    has_subsidiary_liability=bool(proc.get("has_subsidiary_liability", False)),
+                    subsidiary_contractors_json=proc.get("subsidiary_contractors") or [],
                     data_distribuicao=proc.get("data_distribuicao"),
                     valor_causa=proc.get("valor_causa"),
                     raw_metadata=_compact_raw_metadata(proc.get("raw_metadata")),
@@ -2072,6 +2129,7 @@ def get_search_history():
 
 
 @api_bp.route("/history/<int:search_id>", methods=["GET", "DELETE"])
+@api_bp.route("/searches/<int:search_id>", methods=["GET"])
 def get_search_detail(search_id: int):
     """
     GET: Retorna os dados detalhados e a lista de processos de uma análise específica.
@@ -2116,7 +2174,30 @@ def get_search_detail(search_id: int):
             result["condenacao_por_motivo"] = fresh_metrics.get("condenacao_por_motivo", search.condenacao_por_motivo or [])
             result["previsao_bloqueada"] = fresh_metrics.get("previsao_bloqueada", False)
             result["motivo_bloqueio_previsao"] = fresh_metrics.get("motivo_bloqueio_previsao")
+        result["sinais_solvencia_publica"] = result.get("sinais_solvencia_publica") or (result.get("idoneidade_economica") or {}).get("sinais_solvencia_publica")
         result["parecer_agente_adk"] = result.get("ai_analysis", {})
+        if not result.get("contratos_poder_publico") or (
+            isinstance(result.get("contratos_poder_publico"), dict) and result.get("contratos_poder_publico", {}).get("total_contratos", 0) == 0
+        ):
+            from app.services.public_contracts_service import public_contracts_service
+            econ_s = search.economic_standing if isinstance(search.economic_standing, dict) else {}
+            c_cnpj = (
+                econ_s.get("cnpj_utilizado") or
+                econ_s.get("cnpj_triangulado") or
+                (econ_s.get("cnpjs_consolidados")[0] if econ_s.get("cnpjs_consolidados") else None) or
+                econ_s.get("cnpj")
+            )
+            contratos_det = public_contracts_service.get_public_contracts(
+                cnpj=c_cnpj,
+                company_name=search.company_name,
+            )
+            if contratos_det.get("total_contratos", 0) > 0 or not result.get("contratos_poder_publico"):
+                result["contratos_poder_publico"] = contratos_det
+                search.contratos_poder_publico = contratos_det
+                try:
+                    db.session.commit()
+                except Exception:
+                    pass
         return jsonify(result), 200
     except Exception as exc:
         logger.error("Erro ao obter detalhes da pesquisa ID %d: %s", search_id, exc)

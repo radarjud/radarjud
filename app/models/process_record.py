@@ -39,6 +39,10 @@ class ProcessRecord(db.Model):
     sentence_outcome = db.Column(db.String(50), default="em_aberto", nullable=False, index=True)
     has_expert_report = db.Column(db.Boolean, default=False, nullable=False)
 
+    # Responsabilidade Subsidiária de Tomadora PJ (Súmula 331 TST - US-19)
+    has_subsidiary_liability = db.Column(db.Boolean, default=False, nullable=True)
+    subsidiary_contractors_json = db.Column(db.JSON, nullable=True)
+
     # Metadados Processuais Avançados (DataJud / PJe)
     data_distribuicao = db.Column(db.Date, nullable=True, index=True)
     valor_causa = db.Column(db.Numeric(15, 2), nullable=True)
@@ -63,5 +67,7 @@ class ProcessRecord(db.Model):
             "observation": self.observation,
             "sentence_outcome": self.sentence_outcome,
             "has_expert_report": self.has_expert_report,
+            "has_subsidiary_liability": bool(self.has_subsidiary_liability),
+            "subsidiary_contractors": self.subsidiary_contractors_json or [],
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }

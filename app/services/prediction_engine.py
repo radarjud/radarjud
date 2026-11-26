@@ -1075,6 +1075,8 @@ class BayesianRiskPredictor:
             metrics["unidades_consolidadas"] = capital_info.get("unidades_consolidadas", 1)
             metrics["observacao_porte"] = capital_info.get("observacao_porte")
             metrics["capital_social_display"] = capital_info.get("capital_social_display")
+            if capital_info.get("sinais_solvencia_publica"):
+                metrics["sinais_solvencia_publica"] = capital_info.get("sinais_solvencia_publica")
 
         sum_outcomes = sum(metrics.get("desfechos_sentencas", {}).values())
         if sum_outcomes < metrics.get("total_processos", 0):
@@ -1324,23 +1326,74 @@ def build_sector_benchmark(
             "formatado": f"{round(lo, 1)}% a {round(hi, 1)}%",
         }
 
-        # Classificação em 3 faixas de decisão (Súmula 331 TST + Solvência):
-        # APROVAR: Cenário A com risco subsidiário baixo a moderado ou lastro patrimonial expressivo (>= R$ 50M)
-        # CAUTELA: Faixa intermediária ou Cenário A com passivo relevante (retenção técnica preventiva sugerida: 10%)
-        # REPROVAR: Cenário B com risco de insolvência / calote crítico (>= 40%)
-        if cenario_clean == "CENARIO_A":
-            if r_sub <= 15.0 or cap_num >= 50_000_000.0:
-                faixa = "APROVAR"
-                rec = "Aprovar fornecedor. Baixo risco subsidiário e solvência econômico-trabalhista preservada."
+        # Sinais Públicos de Solvência Real e Certidões (US-22)
+        sinais = (
+            p.get("sinais_solvencia_publica")
+            or econ.get("sinais_solvencia_publica")
+            or {}
+        )
+        if not sinais:
+            from app.services.solvency_signals_service import solvency_signals_service
+            sinais = solvency_signals_service.consolidate_solvency_signals(
+                company_name=empresa_nome,
+                cnpj=cnpj_val,
+                cadastral_data={"situacao_cadastral": p.get("situacao_cadastral") or econ.get("situacao_cadastral")},
+                processes=p.get("processos") or p.get("processes") or [],
+                capital_social=cap_num,
+            )
+
+        possui_restricoes = bool(sinais.get("possui_restricoes"))
+        dem_status = sinais.get("demonstracao_contabil_status")
+        alerta_homologacao_privada = bool(sinais.get("alerta_homologacao_privada"))
+
+        # Se houver restrições públicas identificadas (PGFN, CGU, Falência ou RFB irregular),
+        # impede classificação artificialmente otimista
+        if possui_restricoes:
+            if cenario_clean is None or cenario_clean == "CENARIO_A":
+                cenario_clean = "CENARIO_B"
+
+        # Classificação em 3 faixas de decisão (Súmula 331 TST + Sinais Públicos de Solvência):
+        # APROVAR: Cenário A com risco subsidiário baixo a moderado (<= 15.0%) E sem restrições públicas.
+        #          Capital Social alto (> 50M) NÃO concede aprovação automática se houver restrições ou se for declaratório sem balanço.
+        # CAUTELA: Faixa intermediária OU Cenário A com passivo relevante OU ressalva de balanço privado declaratório.
+        # REPROVAR: Cenário B ou risco de insolvência / calote crítico (>= 40%) OU restrições fiscais/judiciais em certidões.
+        if possui_restricoes:
+            if r_sub >= 25.0 or cenario_clean == "CENARIO_B":
+                faixa = "REPROVAR"
+                rec = "Reprovar / Restrição identificada em certidões públicas ou passivo crítico associado a risco de calote (Súmula 331 TST)."
             else:
                 faixa = "CAUTELA"
-                rec = "Contratar com cautela. Recomendação de retenção técnica de 10% do valor contratual para contingências."
+                rec = "Contratar com cautela. Restrição identificada em bases públicas: exigir regularização fiscal e retenção cautelar preventiva."
+        elif cenario_clean == "CENARIO_A":
+            if r_sub <= 15.0:
+                faixa = "APROVAR"
+                if alerta_homologacao_privada:
+                    rec = (
+                        "Aprovar fornecedor com baixo risco subsidiário. Capital social declaratório: "
+                        "exigir certidões negativas atualizadas e balanço patrimonial recente diretamente do fornecedor no processo de homologação."
+                    )
+                else:
+                    rec = "Aprovar fornecedor. Baixo risco subsidiário e solvência econômico-trabalhista preservada."
+            else:
+                # Com r_sub > 15.0, apenas S.A. com balanço público auditado na CVM pode mitigar risco via capital social
+                if cap_num >= 50_000_000.0 and not alerta_homologacao_privada and dem_status == "Regular":
+                    faixa = "APROVAR"
+                    rec = "Aprovar fornecedor. Solvência pública comprovada perante a CVM mitigando o risco subsidiário."
+                else:
+                    faixa = "CAUTELA"
+                    rec = "Contratar com cautela. Recomendação de retenção técnica de 10% do valor contratual para contingências."
+                    if alerta_homologacao_privada:
+                        rec += " Exigir certidões negativas atualizadas e balanço patrimonial recente diretamente do fornecedor no processo de homologação."
         elif r_sub <= 10.0:
             faixa = "APROVAR"
-            rec = "Aprovar fornecedor. Baixo risco subsidiário e solvência econômico-trabalhista preservada."
+            rec = "Aprovar fornecedor. Baixo risco subsidiário."
+            if alerta_homologacao_privada:
+                rec += " Exigir certidões negativas atualizadas e balanço patrimonial recente diretamente do fornecedor no processo de homologação."
         elif r_sub < 40.0:
             faixa = "CAUTELA"
             rec = "Contratar com cautela. Recomendação de retenção técnica de 10% do valor contratual para contingências."
+            if alerta_homologacao_privada:
+                rec += " Exigir certidões negativas atualizadas e balanço patrimonial recente diretamente do fornecedor no processo de homologação."
         else:
             faixa = "REPROVAR"
             rec = "Reprovar / Alto risco subsidiário de calote trabalhista (Súmula 331 TST)."
@@ -1374,6 +1427,10 @@ def build_sector_benchmark(
             "cenario_tipo": cenario_clean,
             "faixa_decisao": faixa,
             "recomendacao": rec,
+            "sinais_solvencia_publica": sinais,
+            "demonstracao_contabil_status": dem_status,
+            "possui_restricoes": possui_restricoes,
+            "alerta_homologacao_privada": alerta_homologacao_privada,
             "cnae_codigo": str(cnae_cod).strip() if cnae_cod else None,
             "cnae_descricao": str(cnae_desc).strip() if cnae_desc else None,
             "previsao_bloqueada": previsao_bloqueada,
@@ -1385,11 +1442,13 @@ def build_sector_benchmark(
 
     # Ordenação determinística (do melhor para o pior fornecedor):
     # 1º critério: menor risco_subsidiario (crescente)
-    # 2º critério (desempate): maior capital_social (decrescente, portanto -capital_social_num)
-    # 3º critério (desempate): menor probabilidade_condenacao (crescente)
+    # 2º critério (desempate): menor presença de restrições (sem restrições primeiro)
+    # 3º critério (desempate): maior capital_social (decrescente, portanto -capital_social_num)
+    # 4º critério (desempate): menor probabilidade_condenacao (crescente)
     processed_companies.sort(
         key=lambda x: (
             x["risco_subsidiario"],
+            1 if x.get("possui_restricoes") else 0,
             -x["capital_social_num"],
             x["probabilidade_condenacao"],
         )

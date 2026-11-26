@@ -44,6 +44,13 @@ class CompanySearch(db.Model):
     cnae_codigo = db.Column(db.String(20), nullable=True, index=True)
     cnae_descricao = db.Column(db.String(255), nullable=True)
 
+    # Responsabilidade Subsidiária de Tomadoras PJ (Súmula 331 TST - US-19)
+    condenacoes_subsidiarias_tomadoras_count = db.Column(db.Integer, default=0, nullable=True)
+    tomadoras_subsidiarias_pj = db.Column(db.JSON, nullable=True)
+
+    # Contratos com o Poder Público (PNCP / Portal da Transparência - US-20)
+    contratos_poder_publico = db.Column(db.JSON, nullable=True)
+
     created_at = db.Column(db.DateTime, default=get_utc_now, nullable=False)
     updated_at = db.Column(db.DateTime, default=get_utc_now, onupdate=get_utc_now, nullable=False)
 
@@ -106,6 +113,36 @@ class CompanySearch(db.Model):
             from app.services.prediction_engine import build_condenacao_por_motivo
             cond_por_motivo = build_condenacao_por_motivo([p.to_dict() for p in self.processes])
 
+        sub_count = self.condenacoes_subsidiarias_tomadoras_count
+        sub_tomadoras = self.tomadoras_subsidiarias_pj
+        if (sub_count is None or sub_tomadoras is None) and self.processes:
+            from app.services.ai_analyzer import detect_subsidiary_liability_in_processes
+            sub_res = detect_subsidiary_liability_in_processes(
+                [p.to_dict() for p in self.processes],
+                evaluated_company=self.company_name,
+            )
+            sub_count = sub_res["condenacoes_subsidiarias_tomadoras_count"]
+            sub_tomadoras = sub_res["tomadoras_subsidiarias_pj"]
+        sub_count = int(sub_count or 0)
+        sub_tomadoras = list(sub_tomadoras or [])
+        msg_sub = (
+            f"Histórico de Responsabilidade Subsidiária: {sub_count} processos com condenação subsidiária atribuída a contratantes anteriores"
+            if sub_count > 0
+            else "Nenhuma condenação subsidiária de contratante identificada na amostra"
+        )
+
+        contratos_pub = self.contratos_poder_publico
+        if not isinstance(contratos_pub, dict):
+            contratos_pub = {
+                "status": "DISPONIVEL",
+                "total_contratos": 0,
+                "esferas": [],
+                "orgaos_contratantes": [],
+                "valor_global_total": None,
+                "valor_global_formatado": None,
+                "mensagem": "Nenhum contrato público localizado nas bases consultadas",
+            }
+
         return {
             "id": self.id,
             "tenant_id": self.tenant_id,
@@ -137,8 +174,13 @@ class CompanySearch(db.Model):
                 "descricao": self.cnae_descricao,
             },
             "idoneidade_economica": econ_data,
+            "sinais_solvencia_publica": econ_data.get("sinais_solvencia_publica") if isinstance(econ_data, dict) else None,
             "logo": self._sanitize_logo_for_export(econ_data.get("logo", {}) if isinstance(econ_data, dict) else {}),
             "ai_analysis": self.ai_analysis or {},
+            "condenacoes_subsidiarias_tomadoras_count": sub_count,
+            "tomadoras_subsidiarias_pj": sub_tomadoras,
+            "mensagem_responsabilidade_subsidiaria": msg_sub,
+            "contratos_poder_publico": contratos_pub,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
