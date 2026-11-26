@@ -758,16 +758,16 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
     )
     story.append(Spacer(1, 6))
     if sub_count > 0:
-        sub_card_bg = HexColor("#fef7ea")
-        sub_border = HexColor("#b67b23")
+        sub_card_bg = colors.HexColor("#fef7ea")
+        sub_border = colors.HexColor("#b67b23")
         tomadoras_line = f"<br/><font size='8' color='#445566'><b>Tomadoras PJ identificadas:</b> {_xml_escape(', '.join(sub_tomadoras[:10]))}</font>" if sub_tomadoras else ""
         sub_para = Paragraph(
             f"<font color='#b67b23'><b>{_xml_escape(sub_msg)}</b></font>{tomadoras_line}",
             style_small,
         )
     else:
-        sub_card_bg = HexColor("#f0f9f4")
-        sub_border = HexColor("#25865a")
+        sub_card_bg = colors.HexColor("#f0f9f4")
+        sub_border = colors.HexColor("#25865a")
         sub_para = Paragraph(
             f"<font color='#25865a'><b>{_xml_escape(sub_msg)}</b></font>",
             style_small,

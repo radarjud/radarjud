@@ -12,7 +12,11 @@ from app.services.ai_analyzer import (
     extract_pj_contractors_from_process,
     process_has_subsidiary_text,
 )
-from app.services.pdf_report import generate_company_report_pdf, normalize_report_payload
+from app.services.pdf_report import (
+    generate_company_report_pdf,
+    normalize_report_payload,
+    _generate_pdf_pure_python,
+)
 
 
 @pytest.fixture
@@ -276,9 +280,21 @@ def test_pdf_rendering_exact_messages_positive_and_empty():
         "tomadoras_subsidiarias_pj": ["PETROBRAS S/A", "MUNICIPIO DE SUAPE"],
         "desfechos_sentencas": {"condenacoes": 2, "acordos": 1, "improcedentes": 2, "em_aberto": 0},
     }
+    norm_pos = normalize_report_payload(payload_pos)
+    assert norm_pos["compliance"]["condenacoes_subsidiarias_tomadoras_count"] == 3
+    assert "Histórico de Responsabilidade Subsidiária: 3 processos" in norm_pos["compliance"]["mensagem_responsabilidade_subsidiaria"]
+    assert norm_pos["compliance"]["tomadoras_subsidiarias_pj"] == ["PETROBRAS S/A", "MUNICIPIO DE SUAPE"]
+
+    pure_pdf_pos = _generate_pdf_pure_python(norm_pos)
+    assert pure_pdf_pos.startswith(b"%PDF-1.4")
+    assert b"Responsabilidade Subsidi" in pure_pdf_pos
+    assert b"PETROBRAS S/A" in pure_pdf_pos
+    assert b"MUNICIPIO DE SUAPE" in pure_pdf_pos
+
     pdf_pos = generate_company_report_pdf(payload_pos)
     assert isinstance(pdf_pos, bytes)
-    assert b"Hist" in pdf_pos or b"Subsidi" in pdf_pos
+    assert pdf_pos.startswith(b"%PDF-")
+    assert b"%%EOF" in pdf_pos
 
     # Cenário Vazio (Empty State)
     payload_empty = {
@@ -288,10 +304,19 @@ def test_pdf_rendering_exact_messages_positive_and_empty():
         "tomadoras_subsidiarias_pj": [],
         "desfechos_sentencas": {"condenacoes": 0, "acordos": 1, "improcedentes": 1, "em_aberto": 0},
     }
+    norm_empty = normalize_report_payload(payload_empty)
+    assert norm_empty["compliance"]["condenacoes_subsidiarias_tomadoras_count"] == 0
+    assert norm_empty["compliance"]["mensagem_responsabilidade_subsidiaria"] == "Nenhuma condenação subsidiária de contratante identificada na amostra"
+
+    pure_pdf_empty = _generate_pdf_pure_python(norm_empty)
+    assert pure_pdf_empty.startswith(b"%PDF-1.4")
+    assert b"Nenhuma" in pure_pdf_empty
+    assert b"subsidi" in pure_pdf_empty.lower()
+
     pdf_empty = generate_company_report_pdf(payload_empty)
     assert isinstance(pdf_empty, bytes)
-    # Verifica que o PDF gerado contém o fallback de ausência
-    assert b"Nenhuma" in pdf_empty or b"subsidia" in pdf_empty.lower()
+    assert pdf_empty.startswith(b"%PDF-")
+    assert b"%%EOF" in pdf_empty
 
 
 def test_bayesian_simplex_and_blocking_rule_not_broken(app_instance):
