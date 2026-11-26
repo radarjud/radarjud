@@ -307,11 +307,20 @@ def _deep_scan_background_worker(
             if "condenacoes_subsidiarias_tomadoras_count" in deep_results:
                 search.condenacoes_subsidiarias_tomadoras_count = deep_results.get("condenacoes_subsidiarias_tomadoras_count", 0)
                 search.tomadoras_subsidiarias_pj = deep_results.get("tomadoras_subsidiarias_pj", [])
-            if search.contratos_poder_publico is None:
+            if search.contratos_poder_publico is None or (
+                isinstance(search.contratos_poder_publico, dict) and search.contratos_poder_publico.get("total_contratos", 0) == 0
+            ):
                 from app.services.public_contracts_service import public_contracts_service
-                deep_cnpj = next(iter(cnpjs_found), None) or (econ.get("cnpj") if isinstance(econ, dict) else None)
-                if deep_cnpj:
-                    search.contratos_poder_publico = public_contracts_service.get_public_contracts(deep_cnpj)
+                deep_cnpj = next(iter(cnpjs_found), None) or (
+                    econ.get("cnpj_utilizado") or
+                    econ.get("cnpj_triangulado") or
+                    (econ.get("cnpjs_consolidados")[0] if econ.get("cnpjs_consolidados") else None) or
+                    econ.get("cnpj")
+                ) if isinstance(econ, dict) else None
+                search.contratos_poder_publico = public_contracts_service.get_public_contracts(
+                    cnpj=deep_cnpj,
+                    company_name=search.company_name,
+                )
             search.movements_hash = deep_results.get("movements_hash")
             search.economic_standing = deep_results["idoneidade_economica"]
             if search.economic_standing and isinstance(search.economic_standing, dict):
@@ -635,6 +644,23 @@ def search_company():
                 if fresh_ai:
                     res["ai_analysis"] = fresh_ai
                     cached_search.ai_analysis = fresh_ai
+
+                # Contratos com o Poder Público (US-20): hidratação resiliente se ainda não computado
+                from app.services.public_contracts_service import public_contracts_service
+                clean_search_cnpj = cnpj_used or (
+                    econ_data.get("cnpj_utilizado") or
+                    econ_data.get("cnpj_triangulado") or
+                    (econ_data.get("cnpjs_consolidados")[0] if econ_data.get("cnpjs_consolidados") else None) or
+                    econ_data.get("cnpj")
+                ) if isinstance(econ_data, dict) else None
+                if not cached_search.contratos_poder_publico or cached_search.contratos_poder_publico.get("total_contratos", 0) == 0:
+                    contratos_pub = public_contracts_service.get_public_contracts(
+                        cnpj=clean_search_cnpj,
+                        company_name=cached_search.company_name,
+                    )
+                    if contratos_pub.get("total_contratos", 0) > 0 or not cached_search.contratos_poder_publico:
+                        cached_search.contratos_poder_publico = contratos_pub
+                        res["contratos_poder_publico"] = contratos_pub
                 res["cached"] = True
                 res["cache_level"] = "L1_DATABASE"
                 res["search_id"] = cached_search.id
@@ -774,16 +800,16 @@ def search_company():
 
         # Consulta de Contratos com o Poder Público (PNCP / Portal da Transparência - US-20)
         from app.services.public_contracts_service import public_contracts_service
-        clean_search_cnpj = cnpj_used or (econ_data.get("cnpj") if isinstance(econ_data, dict) else None)
-        contratos_pub = public_contracts_service.get_public_contracts(clean_search_cnpj) if clean_search_cnpj else {
-            "status": "DISPONIVEL",
-            "total_contratos": 0,
-            "esferas": [],
-            "orgaos_contratantes": [],
-            "valor_global_total": None,
-            "valor_global_formatado": None,
-            "mensagem": "Nenhum contrato público localizado nas bases consultadas",
-        }
+        clean_search_cnpj = cnpj_used or (
+            econ_data.get("cnpj_utilizado") or
+            econ_data.get("cnpj_triangulado") or
+            (econ_data.get("cnpjs_consolidados")[0] if econ_data.get("cnpjs_consolidados") else None) or
+            econ_data.get("cnpj")
+        ) if isinstance(econ_data, dict) else None
+        contratos_pub = public_contracts_service.get_public_contracts(
+            cnpj=clean_search_cnpj,
+            company_name=display_title,
+        )
         fast_results["contratos_poder_publico"] = contratos_pub
 
         # Persistência do resultado no PostgreSQL
@@ -2060,19 +2086,28 @@ def get_search_detail(search_id: int):
             result["previsao_bloqueada"] = fresh_metrics.get("previsao_bloqueada", False)
             result["motivo_bloqueio_previsao"] = fresh_metrics.get("motivo_bloqueio_previsao")
         result["parecer_agente_adk"] = result.get("ai_analysis", {})
-        if not result.get("contratos_poder_publico"):
+        if not result.get("contratos_poder_publico") or (
+            isinstance(result.get("contratos_poder_publico"), dict) and result.get("contratos_poder_publico", {}).get("total_contratos", 0) == 0
+        ):
             from app.services.public_contracts_service import public_contracts_service
             econ_s = search.economic_standing if isinstance(search.economic_standing, dict) else {}
-            c_cnpj = econ_s.get("cnpj")
-            result["contratos_poder_publico"] = public_contracts_service.get_public_contracts(c_cnpj) if c_cnpj else {
-                "status": "DISPONIVEL",
-                "total_contratos": 0,
-                "esferas": [],
-                "orgaos_contratantes": [],
-                "valor_global_total": None,
-                "valor_global_formatado": None,
-                "mensagem": "Nenhum contrato público localizado nas bases consultadas",
-            }
+            c_cnpj = (
+                econ_s.get("cnpj_utilizado") or
+                econ_s.get("cnpj_triangulado") or
+                (econ_s.get("cnpjs_consolidados")[0] if econ_s.get("cnpjs_consolidados") else None) or
+                econ_s.get("cnpj")
+            )
+            contratos_det = public_contracts_service.get_public_contracts(
+                cnpj=c_cnpj,
+                company_name=search.company_name,
+            )
+            if contratos_det.get("total_contratos", 0) > 0 or not result.get("contratos_poder_publico"):
+                result["contratos_poder_publico"] = contratos_det
+                search.contratos_poder_publico = contratos_det
+                try:
+                    db.session.commit()
+                except Exception:
+                    pass
         return jsonify(result), 200
     except Exception as exc:
         logger.error("Erro ao obter detalhes da pesquisa ID %d: %s", search_id, exc)

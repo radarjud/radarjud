@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import time
+import urllib.parse
 from typing import Any
 
 import requests
@@ -12,11 +13,11 @@ from app.models.public_contract_cache import PublicContractCache, get_utc_now
 
 logger = logging.getLogger(__name__)
 
-# Headers padrão RadarJus (User-Agent rastreável e identificável)
-USER_AGENT = "RadarJus/2.0 (Compliance e Risco Trabalhista; contato@radarjus.gov.br)"
+# Headers padrão RadarJus (User-Agent com assinatura de browser aceita pelos gateways do PNCP/Serpro)
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 (RadarJus Compliance; contato@radarjus.gov.br)"
 DEFAULT_HEADERS = {
     "User-Agent": USER_AGENT,
-    "Accept": "application/json",
+    "Accept": "application/json, text/plain, */*",
 }
 
 # Timeouts estritos: connect=2.0s, read=5.0s (total <= 5.0s para não onerar o Render Free 512 MB)
@@ -107,76 +108,115 @@ class PublicContractsService:
         self.session = session or requests.Session()
         self.session.headers.update(DEFAULT_HEADERS)
 
-    def get_public_contracts(self, cnpj: str, force_refresh: bool = False) -> dict[str, Any]:
+    def get_public_contracts(
+        self,
+        cnpj: str | None = None,
+        company_name: str | None = None,
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
         """
-        Consulta contratos públicos por CNPJ, consultando primeiramente os caches L0/L1
+        Consulta contratos públicos por CNPJ ou Razão Social, consultando primeiramente os caches L0/L1
         e, em caso de cache miss, disparando requisições externas para o PNCP / Portal da Transparência.
         """
         clean_cnpj = sanitize_cnpj(cnpj)
-        if not clean_cnpj or len(clean_cnpj) != 14:
+        clean_name = " ".join(str(company_name or "").strip().upper().split())
+
+        if (not clean_cnpj or len(clean_cnpj) != 14) and (not clean_name or len(clean_name) < 3):
             return self._build_empty_response("Nenhum contrato público localizado nas bases consultadas")
+
+        # Cache key: preferencialmente pelo CNPJ de 14 dígitos; senão, pelo nome normalizado
+        cache_key = clean_cnpj if (clean_cnpj and len(clean_cnpj) == 14) else f"NAME::{clean_name}"
 
         # 1. Verificação de Cache L0 (em memória)
         if not force_refresh:
-            cached_l0 = _L0_CACHE.get(clean_cnpj)
+            cached_l0 = _L0_CACHE.get(cache_key)
             if cached_l0:
                 ts, data = cached_l0
                 if (time.time() - ts) < _L0_CACHE_TTL:
-                    logger.debug("L0 Memory Cache hit para contratos públicos do CNPJ %s", clean_cnpj)
+                    logger.debug("L0 Memory Cache hit para contratos públicos de %s", cache_key)
                     return data
 
-        # 2. Verificação de Cache L1 (PostgreSQL)
-        if not force_refresh:
+        # 2. Verificação de Cache L1 (PostgreSQL) - se houver CNPJ
+        if not force_refresh and clean_cnpj and len(clean_cnpj) == 14:
             try:
                 cached_l1 = PublicContractCache.query.filter_by(cnpj=clean_cnpj).first()
                 if cached_l1 and cached_l1.is_valid(ttl_hours=24):
                     logger.debug("L1 Database Cache hit para contratos públicos do CNPJ %s", clean_cnpj)
                     res_data = dict(cached_l1.data)
-                    _L0_CACHE[clean_cnpj] = (time.time(), res_data)
+                    _L0_CACHE[cache_key] = (time.time(), res_data)
                     return res_data
             except Exception as e:  # noqa: BLE001
                 logger.warning("Falha ao consultar cache L1 de contratos públicos: %s", e)
 
         # 3. Consulta Externa às APIs Governamentais
-        data = self._fetch_contracts_external(clean_cnpj)
+        data = self._fetch_contracts_external(clean_cnpj=clean_cnpj, company_name=clean_name)
 
         # 4. Se a consulta foi bem sucedida ('DISPONIVEL'), persiste no cache L1 e L0
         if data.get("status") == "DISPONIVEL":
-            _L0_CACHE[clean_cnpj] = (time.time(), data)
-            self._save_l1_cache(clean_cnpj, data)
+            _L0_CACHE[cache_key] = (time.time(), data)
+            target_cnpj_to_cache = clean_cnpj if (clean_cnpj and len(clean_cnpj) == 14) else data.get("cnpj_identificado")
+            if target_cnpj_to_cache and len(target_cnpj_to_cache) == 14:
+                self._save_l1_cache(target_cnpj_to_cache, data)
 
         return data
 
-    def _fetch_contracts_external(self, clean_cnpj: str) -> dict[str, Any]:
+    def _fetch_contracts_external(
+        self,
+        clean_cnpj: str | None = None,
+        company_name: str | None = None,
+    ) -> dict[str, Any]:
         """
-        Executa chamadas HTTP para as APIs abertas do PNCP e, opcionalmente,
-        Portal da Transparência (se chave presente no ambiente).
+        Executa chamadas HTTP para as APIs abertas do PNCP (busca por CNPJ e Razão Social)
+        e, opcionalmente, Portal da Transparência (se chave presente no ambiente).
         """
         # 1. Tentativa primária: Portal Nacional de Contratações Públicas (PNCP)
-        pncp_url = f"https://pncp.gov.br/api/consulta/v1/contratos?cnpjContratado={clean_cnpj}&pagina=1&tamanhoPagina=15"
-        try:
-            resp = self.session.get(pncp_url, timeout=HTTP_TIMEOUT)
-            if resp.status_code == 200:
-                payload = resp.json()
-                return self._parse_pncp_payload(payload)
-            elif resp.status_code == 404:
-                # 404 na API de contratos do PNCP indica ausência de contratos cadastrados
-                return self._build_empty_response("Nenhum contrato público localizado nas bases consultadas")
-            elif resp.status_code in (429, 500, 502, 503, 504):
-                logger.warning("PNCP retornou status HTTP %d para CNPJ %s", resp.status_code, clean_cnpj)
-                # Tenta fallback secundário para Portal da Transparência se chave estiver disponível
-                fallback_data = self._try_portal_transparencia_fallback(clean_cnpj)
-                if fallback_data:
-                    return fallback_data
-                return self._build_unavailable_response()
-        except (requests.exceptions.RequestException, requests.exceptions.Timeout, ValueError) as exc:
-            logger.warning("Exceção ao consultar API PNCP para CNPJ %s: %s", clean_cnpj, exc)
+        # Suporta tanto o endpoint aberto de pesquisa (/api/search/) quanto a rota REST
+        pncp_queries = []
+        if clean_cnpj and len(clean_cnpj) == 14:
+            pncp_queries.append((
+                f"https://pncp.gov.br/api/search/?q={clean_cnpj}&tipos_documento=contrato&pagina=1&tam_pagina=15",
+                clean_cnpj,
+            ))
+            pncp_queries.append((
+                f"https://pncp.gov.br/api/consulta/v1/contratos?cnpjContratado={clean_cnpj}&pagina=1&tamanhoPagina=15",
+                clean_cnpj,
+            ))
+
+        if company_name and len(company_name) >= 3:
+            encoded_name = urllib.parse.quote(company_name)
+            pncp_queries.append((
+                f"https://pncp.gov.br/api/search/?q={encoded_name}&tipos_documento=contrato&pagina=1&tam_pagina=15",
+                company_name,
+            ))
+
+        network_failure = False
+        for pncp_url, query_term in pncp_queries:
+            try:
+                resp = self.session.get(pncp_url, timeout=HTTP_TIMEOUT)
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    parsed = self._parse_pncp_payload(
+                        payload,
+                        expected_name=company_name if query_term == company_name else None,
+                    )
+                    if parsed.get("total_contratos", 0) > 0:
+                        return parsed
+                elif resp.status_code in (429, 500, 502, 503, 504):
+                    logger.warning("PNCP retornou status HTTP %d para query %s", resp.status_code, query_term)
+                    network_failure = True
+            except (requests.exceptions.RequestException, requests.exceptions.Timeout, ValueError) as exc:
+                logger.warning("Exceção ao consultar API PNCP para query %s: %s", query_term, exc)
+                network_failure = True
+
+        # 2. Fallback secundário: Portal da Transparência se chave configurada
+        if clean_cnpj and len(clean_cnpj) == 14:
             fallback_data = self._try_portal_transparencia_fallback(clean_cnpj)
             if fallback_data:
                 return fallback_data
+
+        if network_failure:
             return self._build_unavailable_response()
 
-        # Fallback genérico caso a chamada retorne outros status
         return self._build_empty_response("Nenhum contrato público localizado nas bases consultadas")
 
     def _try_portal_transparencia_fallback(self, clean_cnpj: str) -> dict[str, Any] | None:
@@ -200,7 +240,7 @@ class PublicContractsService:
 
         return None
 
-    def _parse_pncp_payload(self, payload: Any) -> dict[str, Any]:
+    def _parse_pncp_payload(self, payload: Any, expected_name: str | None = None) -> dict[str, Any]:
         """Processa a resposta JSON do PNCP de forma enxuta e defensiva."""
         items: list[dict[str, Any]] = []
         total_registros = 0
@@ -221,18 +261,36 @@ class PublicContractsService:
         orgaos_list: list[str] = []
         valor_global_acumulado: float = 0.0
         teve_valor = False
+        valid_items_count = 0
+        detected_cnpj: str | None = None
+
+        # Termo de validação caso a consulta tenha sido realizada por nome
+        expected_words = set(re.findall(r"\w{4,}", (expected_name or "").upper())) - {
+            "LTDA", "EIRELI", "COMPANHIA", "SOCIEDADE", "SERVICOS", "COMERCIO", "BRASIL", "PARTICIPACOES", "HOME", "CARE"
+        }
 
         for contract in items:
             if not isinstance(contract, dict):
                 continue
 
-            # Órgão contratante
-            orgao_entidade = contract.get("orgaoEntidade") or {}
-            organ_name = ""
-            raw_esfera = ""
-            if isinstance(orgao_entidade, dict):
-                organ_name = orgao_entidade.get("razaoSocial") or orgao_entidade.get("nomeOrgao") or ""
-                raw_esfera = orgao_entidade.get("esferaId") or orgao_entidade.get("esfera") or ""
+            forn_nome = str(contract.get("fornecedor_nome") or "").upper()
+            forn_ni = sanitize_cnpj(contract.get("fornecedor_ni"))
+
+            # Se a busca foi por nome textual, valida pertinência do fornecedor contratado
+            if expected_words and forn_nome and not any(w in forn_nome for w in expected_words):
+                continue
+
+            if forn_ni and len(forn_ni) == 14 and not detected_cnpj:
+                detected_cnpj = forn_ni
+
+            # Órgão contratante: suporta chave do search API ('orgao_nome') e legado ('orgaoEntidade')
+            organ_name = contract.get("orgao_nome")
+            raw_esfera = contract.get("esfera_nome") or contract.get("esfera_id")
+            if not organ_name:
+                orgao_entidade = contract.get("orgaoEntidade") or {}
+                if isinstance(orgao_entidade, dict):
+                    organ_name = orgao_entidade.get("razaoSocial") or orgao_entidade.get("nomeOrgao")
+                    raw_esfera = raw_esfera or orgao_entidade.get("esferaId") or orgao_entidade.get("esfera")
             if not organ_name:
                 organ_name = contract.get("orgaoContratante") or contract.get("nomeOrgao") or ""
 
@@ -245,12 +303,19 @@ class PublicContractsService:
             if esf:
                 esferas_set.add(esf)
 
-            # Valor global
-            val = contract.get("valorGlobal")
+            # Valor global: suporta chave do search API ('valor_global') e legado ('valorGlobal', etc.)
+            val = contract.get("valor_global")
+            if val is None:
+                val = contract.get("valorGlobal")
             if val is None:
                 val = contract.get("valorInicial")
             if val is None:
                 val = contract.get("valorContratado")
+            if val is None:
+                val = contract.get("valor_total_homologado")
+            if val is None:
+                val = contract.get("valor_total_estimado")
+
             if val is not None:
                 try:
                     num_val = float(val)
@@ -259,21 +324,31 @@ class PublicContractsService:
                 except (ValueError, TypeError):
                     pass
 
+            valid_items_count += 1
+
+        if valid_items_count == 0:
+            return self._build_empty_response("Nenhum contrato público localizado nas bases consultadas")
+
         final_esferas = sorted(esferas_set)
         if not final_esferas:
             final_esferas = ["Municipal"]  # Fallback padrão seguro
 
         val_total = round(valor_global_acumulado, 2) if teve_valor else None
+        res_total = valid_items_count if expected_name else total_registros
 
-        return {
+        res_dict = {
             "status": "DISPONIVEL",
-            "total_contratos": total_registros,
+            "total_contratos": res_total,
             "esferas": final_esferas,
             "orgaos_contratantes": orgaos_list[:10],
             "valor_global_total": val_total,
             "valor_global_formatado": format_currency_brl(val_total),
-            "mensagem": f"{total_registros} contrato(s) público(s) identificado(s) nas bases governamentais",
+            "mensagem": f"{res_total} contrato(s) público(s) identificado(s) nas bases governamentais",
         }
+        if detected_cnpj:
+            res_dict["cnpj_identificado"] = detected_cnpj
+
+        return res_dict
 
     def _parse_portal_transparencia_payload(self, payload: Any) -> dict[str, Any]:
         """Processa a resposta do Portal da Transparência."""
@@ -379,6 +454,14 @@ class PublicContractsService:
 public_contracts_service = PublicContractsService()
 
 
-def get_public_contracts(cnpj: str, force_refresh: bool = False) -> dict[str, Any]:
+def get_public_contracts(
+    cnpj: str | None = None,
+    company_name: str | None = None,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
     """Helper global para consulta de contratos públicos com o Poder Público."""
-    return public_contracts_service.get_public_contracts(cnpj=cnpj, force_refresh=force_refresh)
+    return public_contracts_service.get_public_contracts(
+        cnpj=cnpj,
+        company_name=company_name,
+        force_refresh=force_refresh,
+    )

@@ -338,3 +338,88 @@ def test_pdf_rendering_with_public_contracts(app_instance):
     norm_unavail = normalize_report_payload(payload_unavail)
     pure_pdf_unavail = _generate_pdf_pure_python(norm_unavail)
     assert b"temporariamente indisponivel" in pure_pdf_unavail
+
+
+def test_public_contracts_search_by_company_name_and_pncp_catalog_format(app_instance):
+    """
+    Simula consulta realizada por Razão Social (ex.: BRIDI E VACCARI HOME CARE LTDA),
+    onde o retorno vem no formato de catálogo de busca aberta do PNCP (/api/search/),
+    identificando contratos com o Ministério da Defesa (Comando do Exército).
+    """
+    company_query = "BRIDI E VACCARI HOME CARE LTDA"
+
+    mock_pncp_search_response = {
+        "total": 4,
+        "items": [
+            {
+                "id": "item1",
+                "title": "Contrato nº 00025/2026",
+                "description": "PRESTAÇÃO DE SERVIÇOS DE ATENÇÃO DOMICILIAR À SAÚDE",
+                "orgao_nome": "COMANDO DO EXERCITO",
+                "esfera_nome": "Federal",
+                "esfera_id": "F",
+                "fornecedor_nome": "BRIDI E VACCARI HOME CARE LTDA",
+                "fornecedor_ni": "41926714000102",
+                "valor_global": 300000.0,
+            },
+            {
+                "id": "item2",
+                "title": "Contrato nº 00585/2024",
+                "description": "CONTRATAÇÃO DE SERVIÇOS DE HOME CARE",
+                "orgao_nome": "COMANDO DO EXERCITO",
+                "esfera_nome": "Federal",
+                "esfera_id": "F",
+                "fornecedor_nome": "BRIDI E VACCARI HOME CARE LTDA",
+                "fornecedor_ni": "41926714000102",
+                "valor_global": 300000.0,
+            },
+            {
+                "id": "item3",
+                "title": "Contrato nº 00012/2025",
+                "description": "Contratação de pessoa Jurídica para prestação de serviços",
+                "orgao_nome": "INSTITUTO DE PREVIDENCIA E ASSIST DOS SERV MUNICIPAIS",
+                "esfera_nome": "Municipal",
+                "esfera_id": "M",
+                "fornecedor_nome": "BRIDI E VACCARI HOME CARE LTDA",
+                "fornecedor_ni": "41926714000102",
+                "valor_global": 179520.0,
+            },
+            {
+                "id": "item4",
+                "title": "Contrato nº 00001/2023",
+                "description": "GARANTIR AOS MILITARES DA ATIVA ASSISTENCIA",
+                "orgao_nome": "COMANDO DO EXERCITO",
+                "esfera_nome": "Federal",
+                "esfera_id": "F",
+                "fornecedor_nome": "BRIDI E VACCARI HOME CARE LTDA",
+                "fornecedor_ni": "41926714000102",
+                "valor_global": 1500000.0,
+            },
+        ],
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = mock_pncp_search_response
+
+    service = PublicContractsService()
+
+    with patch.object(service.session, "get", return_value=mock_resp) as mock_get:
+        # Consulta sem CNPJ prévio, passando apenas Razão Social
+        res = service.get_public_contracts(company_name=company_query)
+
+        assert mock_get.call_count == 1
+        assert res["status"] == "DISPONIVEL"
+        assert res["total_contratos"] == 4
+        assert sorted(res["esferas"]) == ["Federal", "Municipal"]
+        assert "COMANDO DO EXERCITO" in res["orgaos_contratantes"]
+        assert "INSTITUTO DE PREVIDENCIA E ASSIST DOS SERV MUNICIPAIS" in res["orgaos_contratantes"]
+        assert res["valor_global_total"] == 2279520.0
+        assert "2.279.520,00" in res["valor_global_formatado"]
+        assert res.get("cnpj_identificado") == "41926714000102"
+        assert "4 contrato(s) público(s) identificado(s)" in res["mensagem"]
+
+        # Verifica se o cache L1 no banco foi gravado com o CNPJ identificado
+        cached_entry = PublicContractCache.query.filter_by(cnpj="41926714000102").first()
+        assert cached_entry is not None
+        assert cached_entry.data["total_contratos"] == 4
