@@ -14,12 +14,16 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 
 
 def test_database_url_converts_postgres_scheme_and_falls_back_to_sqlite(monkeypatch):
-    monkeypatch.setenv("DATABASE_URL", "postgres://user:pass@aws-0-sa-east-1.pooler.supabase.com:6543/postgres?sslmode=require")
-    uri = config_module._database_url()
-    assert uri.startswith("postgresql://")
-    assert uri == "postgresql://user:pass@aws-0-sa-east-1.pooler.supabase.com:6543/postgres?sslmode=require"
+    expected_uri = "postgresql+psycopg2://user:pass@aws-0-sa-east-1.pooler.supabase.com:6543/postgres?sslmode=require"
+    for scheme in ("postgres://", "postgresql://", "postgresql+psycopg://", "postgresql+psycopg2://"):
+        monkeypatch.setenv(
+            "DATABASE_URL",
+            f"{scheme}user:pass@aws-0-sa-east-1.pooler.supabase.com:6543/postgres?sslmode=require",
+        )
+        uri = config_module._database_url()
+        assert uri == expected_uri
 
-    opts = config_module._build_engine_options(uri)
+    opts = config_module._build_engine_options(expected_uri)
     assert opts == {
         "pool_pre_ping": True,
         "pool_size": 3,

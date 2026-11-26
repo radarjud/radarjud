@@ -14,14 +14,17 @@ load_dotenv(BASE_DIR / ".env")
 def _database_url() -> str:
     """
     Resolve a URI do banco de dados:
-    - Normaliza postgres:// para postgresql://.
-    - Preserva drivers explícitos como postgresql+psycopg2://.
+    - Normaliza postgres://, postgresql:// e postgresql+psycopg:// para postgresql+psycopg2://
+      garantindo o uso explícito do psycopg2-binary no SQLAlchemy.
+    - Preserva postgresql+psycopg2:// quando já informado.
     - Faz fallback para SQLite local se DATABASE_URL não estiver definida ou apontar para 'db' fora do Docker.
     """
     configured_url = os.getenv("DATABASE_URL", "").strip()
     if configured_url:
-        if configured_url.startswith("postgres://"):
-            configured_url = "postgresql://" + configured_url[len("postgres://"):]
+        for prefix in ("postgres://", "postgresql+psycopg://", "postgresql://"):
+            if configured_url.startswith(prefix):
+                configured_url = "postgresql+psycopg2://" + configured_url[len(prefix):]
+                break
 
         # Se a URL aponta para o host 'db' (Docker) e estamos rodando fora do Docker (sem resolver 'db')
         if "@db:" in configured_url or "@db/" in configured_url:
@@ -39,7 +42,7 @@ def _database_url() -> str:
         host = os.getenv("POSTGRES_HOST", "localhost")
         port = os.getenv("POSTGRES_PORT", "5432")
         db_name = os.getenv("POSTGRES_DB", "radarjud")
-        return f"postgresql://{user}:{password}@{host}:{port}/{db_name}"
+        return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db_name}"
 
     db_file = BASE_DIR / "radarjud.db"
     return f"sqlite:///{db_file}"

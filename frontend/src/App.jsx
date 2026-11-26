@@ -42,6 +42,7 @@ const OUTCOME_LABELS = {
 };
 const CHART_COLORS = ['#245a81', '#674b3c', '#b79b85', '#8998a7'];
 const formatNumber = (value) => new Intl.NumberFormat('pt-BR').format(Number(value) || 0);
+const formatMoneyBRL = (value) => value == null ? null : new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(Number(value) || 0);
 const formatPercent = (value) => `${Number(value || 0).toLocaleString('pt-BR', { maximumFractionDigits: 1 })}%`;
 const formatProcessNumber = (raw) => {
   if (!raw) return 'Não informado';
@@ -118,11 +119,44 @@ function normalize(raw) {
   const isPrevisaoBloqueada = Boolean(payload.previsao_bloqueada) || (numCondenacoes === 0 && total > 0);
   const effectiveRiskScore = (total === 0 || isPrevisaoBloqueada) ? 0.0 : riskScore;
 
+  const subCount = Number(payload.condenacoes_subsidiarias_tomadoras_count ?? payload.condenacoes_subsidiarias_count ?? 0);
+  const subTomadoras = Array.isArray(payload.tomadoras_subsidiarias_pj) ? payload.tomadoras_subsidiarias_pj : [];
+  const subMsg = payload.mensagem_responsabilidade_subsidiaria || (
+    subCount > 0
+      ? `Histórico de Responsabilidade Subsidiária: ${subCount} processos com condenação subsidiária atribuída a contratantes anteriores`
+      : 'Nenhuma condenação subsidiária de contratante identificada na amostra'
+  );
+
+  const cpObj = isRecord(payload.contratos_poder_publico) ? payload.contratos_poder_publico : {};
+  const cpStatus = String(cpObj.status || 'DISPONIVEL').toUpperCase();
+  const cpTotal = typeof cpObj.total_contratos === 'number' ? cpObj.total_contratos : 0;
+  const cpEsferas = Array.isArray(cpObj.esferas) ? cpObj.esferas : [];
+  const cpOrgaos = Array.isArray(cpObj.orgaos_contratantes) ? cpObj.orgaos_contratantes : [];
+  const cpValorTotal = typeof cpObj.valor_global_total === 'number' ? cpObj.valor_global_total : null;
+  const cpValorFormatado = cpObj.valor_global_formatado || (cpValorTotal != null ? formatMoneyBRL(cpValorTotal) : null);
+  const cpMsg = cpObj.mensagem || (
+    cpStatus === 'INDISPONIVEL'
+      ? 'Base governamental temporariamente indisponível no momento da consulta.'
+      : (cpTotal === 0
+        ? 'Nenhum contrato público localizado nas bases consultadas'
+        : `${cpTotal} contrato(s) público(s) identificado(s) nas bases governamentais`)
+  );
+
   return {
     name: companyName,
     total: total,
     riskScore: effectiveRiskScore,
     overallRiskScore: effectiveRiskScore,
+    subsidiaryLiabilityCount: subCount,
+    subsidiaryContractorsPJ: subTomadoras,
+    subsidiaryMessage: subMsg,
+    publicContractsStatus: cpStatus,
+    publicContractsTotal: cpTotal,
+    publicContractsEsferas: cpEsferas,
+    publicContractsOrgaos: cpOrgaos,
+    publicContractsValorTotal: cpValorTotal,
+    publicContractsValorFormatado: cpValorFormatado,
+    publicContractsMensagem: cpMsg,
     reasons: Array.isArray(payload.ranking_motivos) ? payload.ranking_motivos : [],
     rankingCondenacoes: Array.isArray(payload.ranking_motivos_condenacao) ? payload.ranking_motivos_condenacao : [],
     condenacaoPorMotivo: Array.isArray(payload.condenacao_por_motivo) ? payload.condenacao_por_motivo : [],

@@ -361,6 +361,55 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
     scan_status = _safe_str(data.get("scan_status") or data.get("scanStatus"), "COMPLETED")
 
+    # Histórico de Responsabilidade Subsidiária (Súmula 331 TST - US-19)
+    sub_count = int(
+        data.get("condenacoes_subsidiarias_tomadoras_count")
+        if data.get("condenacoes_subsidiarias_tomadoras_count") is not None
+        else (
+            (ai.get("historico_responsabilidade_subsidiaria") or {}).get("condenacoes_subsidiarias_tomadoras_count") or 0
+        )
+    )
+    raw_sub_tomadoras = (
+        data.get("tomadoras_subsidiarias_pj")
+        or (ai.get("historico_responsabilidade_subsidiaria") or {}).get("tomadoras_subsidiarias_pj")
+        or []
+    )
+    sub_tomadoras = [str(t) for t in raw_sub_tomadoras if t] if isinstance(raw_sub_tomadoras, list) else []
+    sub_msg = (
+        f"Histórico de Responsabilidade Subsidiária: {sub_count} processos com condenação subsidiária atribuída a contratantes anteriores"
+        if sub_count > 0
+        else "Nenhuma condenação subsidiária de contratante identificada na amostra"
+    )
+
+    # Contratos com o Poder Público (PNCP / Portal da Transparência - US-20)
+    raw_cp = data.get("contratos_poder_publico") or {}
+    cp_status = _safe_str(raw_cp.get("status"), "DISPONIVEL").upper()
+    cp_total = int(raw_cp.get("total_contratos") or 0)
+    cp_esferas = list(raw_cp.get("esferas") or [])
+    cp_orgaos = [str(o) for o in (raw_cp.get("orgaos_contratantes") or []) if o]
+    cp_valor = raw_cp.get("valor_global_total")
+    cp_valor_fmt = raw_cp.get("valor_global_formatado")
+    if cp_valor is not None and not cp_valor_fmt:
+        cp_valor_fmt = _format_brl(cp_valor)
+    cp_msg = raw_cp.get("mensagem")
+    if not cp_msg:
+        if cp_status == "INDISPONIVEL":
+            cp_msg = "Base governamental temporariamente indisponível no momento da consulta."
+        elif cp_total == 0:
+            cp_msg = "Nenhum contrato público localizado nas bases consultadas"
+        else:
+            cp_msg = f"{cp_total} contrato(s) público(s) identificado(s) nas bases governamentais"
+
+    contratos_dict = {
+        "status": cp_status,
+        "total_contratos": cp_total,
+        "esferas": cp_esferas,
+        "orgaos_contratantes": cp_orgaos,
+        "valor_global_total": cp_valor,
+        "valor_global_formatado": cp_valor_fmt,
+        "mensagem": cp_msg,
+    }
+
     return {
         "company_name": _safe_str(company_name, "Empresa Consultada"),
         "cnpj_formatted": cnpj_formatted,
@@ -371,6 +420,9 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         "prob_condenacao": prob_condenacao,
         "conf_label": conf_label,
         "conf_detail": conf_detail,
+        "condenacoes_subsidiarias_tomadoras_count": sub_count,
+        "tomadoras_subsidiarias_pj": sub_tomadoras,
+        "mensagem_responsabilidade_subsidiaria": sub_msg,
         "outcomes": {
             "condenacoes": int(outcomes.get("condenacoes") or 0),
             "acordos": int(outcomes.get("acordos") or 0),
@@ -399,12 +451,17 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         "ranking_condenacoes": ranking_condenacoes,
         "ranking_motivos": ranking_motivos,
         "condenacao_por_motivo": condenacao_por_motivo,
+        "contratos_poder_publico": contratos_dict,
         "compliance": {
             "recomendacao": recomendacao,
             "perfil_risco": perfil_risco,
             "resumo_executivo": resumo_executivo,
             "alertas_331": [str(a) for a in alertas_331 if a][:5],
             "recomendacoes": [str(r) for r in recomendacoes_comp if r][:5],
+            "condenacoes_subsidiarias_tomadoras_count": sub_count,
+            "tomadoras_subsidiarias_pj": sub_tomadoras,
+            "mensagem_responsabilidade_subsidiaria": sub_msg,
+            "contratos_poder_publico": contratos_dict,
         },
     }
 
@@ -742,6 +799,84 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
         for rec_item in comp["recomendacoes"]:
             story.append(Paragraph(f"• {_xml_escape(rec_item)}", style_small))
 
+    # Histórico de Responsabilidade Subsidiária (Súmula 331 TST - US-19)
+    sub_count = int(comp.get("condenacoes_subsidiarias_tomadoras_count", 0) or 0)
+    sub_tomadoras = comp.get("tomadoras_subsidiarias_pj") or []
+    sub_msg = comp.get("mensagem_responsabilidade_subsidiaria") or (
+        f"Histórico de Responsabilidade Subsidiária: {sub_count} processos com condenação subsidiária atribuída a contratantes anteriores"
+        if sub_count > 0
+        else "Nenhuma condenação subsidiária de contratante identificada na amostra"
+    )
+    story.append(Spacer(1, 6))
+    if sub_count > 0:
+        sub_card_bg = colors.HexColor("#fef7ea")
+        sub_border = colors.HexColor("#b67b23")
+        tomadoras_line = f"<br/><font size='8' color='#445566'><b>Tomadoras PJ identificadas:</b> {_xml_escape(', '.join(sub_tomadoras[:10]))}</font>" if sub_tomadoras else ""
+        sub_para = Paragraph(
+            f"<font color='#b67b23'><b>{_xml_escape(sub_msg)}</b></font>{tomadoras_line}",
+            style_small,
+        )
+    else:
+        sub_card_bg = colors.HexColor("#f0f9f4")
+        sub_border = colors.HexColor("#25865a")
+        sub_para = Paragraph(
+            f"<font color='#25865a'><b>{_xml_escape(sub_msg)}</b></font>",
+            style_small,
+        )
+    sub_box = Table([[sub_para]], colWidths=[page_w])
+    sub_box.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), sub_card_bg),
+        ("BOX", (0, 0), (-1, -1), 0.8, sub_border),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(sub_box)
+
+    # Contratos com o Poder Público (PNCP / Portal da Transparência - US-20)
+    cp = report.get("contratos_poder_publico") or {}
+    cp_status = str(cp.get("status") or "DISPONIVEL").upper()
+    cp_total = int(cp.get("total_contratos") or 0)
+    cp_msg = str(cp.get("mensagem") or "")
+    story.append(Spacer(1, 6))
+
+    if cp_status == "INDISPONIVEL":
+        cp_card_bg = colors.HexColor("#f8fafc")
+        cp_border = colors.HexColor("#64748b")
+        cp_para = Paragraph(
+            f"<font color='#475569'><b>Contratos com o Poder Público:</b> {_xml_escape(cp_msg or 'Base governamental temporariamente indisponível no momento da consulta.')}</font>",
+            style_small,
+        )
+    elif cp_total > 0:
+        cp_card_bg = colors.HexColor("#f0f7fc")
+        cp_border = colors.HexColor("#1a56db")
+        val_str = f" · Valor Global: {cp.get('valor_global_formatado')}" if cp.get("valor_global_formatado") else ""
+        esf_str = f"<br/><font size='8' color='#334155'><b>Esferas:</b> {_xml_escape(', '.join(cp.get('esferas') or []))}</font>" if cp.get("esferas") else ""
+        org_str = f"<br/><font size='8' color='#445566'><b>Órgãos Contratantes:</b> {_xml_escape(', '.join((cp.get('orgaos_contratantes') or [])[:6]))}</font>" if cp.get("orgaos_contratantes") else ""
+        cp_para = Paragraph(
+            f"<font color='#1a56db'><b>Contratos com o Poder Público: {cp_total} contrato(s) localizado(s){val_str}</b></font>{esf_str}{org_str}",
+            style_small,
+        )
+    else:
+        cp_card_bg = colors.HexColor("#f0f9f4")
+        cp_border = colors.HexColor("#25865a")
+        cp_para = Paragraph(
+            f"<font color='#25865a'><b>Contratos com o Poder Público:</b> {_xml_escape(cp_msg or 'Nenhum contrato público localizado nas bases consultadas')}</font>",
+            style_small,
+        )
+
+    cp_box = Table([[cp_para]], colWidths=[page_w])
+    cp_box.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), cp_card_bg),
+        ("BOX", (0, 0), (-1, -1), 0.8, cp_border),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(cp_box)
+
     story.append(Spacer(1, 10))
     story.append(Paragraph(
         "Fontes Oficiais Consultadas: Comunica PJe (CNJ), DataJud (CNJ), Receita Federal do Brasil, CGU (CEIS/CNEP) e PGFN. "
@@ -809,11 +944,36 @@ def _generate_pdf_pure_python(report: Dict[str, Any]) -> bytes:
         else:
             lines.append("   Nenhuma condenacao ou vetor recorrente mapeado.")
 
+    sub_count_pure = int(comp.get("condenacoes_subsidiarias_tomadoras_count", 0) or 0)
+    sub_msg_pure = comp.get("mensagem_responsabilidade_subsidiaria") or (
+        f"Histórico de Responsabilidade Subsidiária: {sub_count_pure} processos com condenação subsidiária atribuída a contratantes anteriores"
+        if sub_count_pure > 0
+        else "Nenhuma condenação subsidiária de contratante identificada na amostra"
+    )
     lines.extend([
         "-" * 78,
         "4. PARECER EXECUTIVO DE COMPLIANCE (SUMULA 331 TST)",
         f"   Recomendacao: {comp['recomendacao']} | Perfil de Risco: {comp['perfil_risco']}",
+        f"   {sub_msg_pure}",
     ])
+    if comp.get("tomadoras_subsidiarias_pj"):
+        lines.append(f"   Tomadoras PJ: {', '.join(comp['tomadoras_subsidiarias_pj'][:5])}")
+
+    cp_pure = report.get("contratos_poder_publico") or comp.get("contratos_poder_publico") or {}
+    cp_status_pure = str(cp_pure.get("status") or "DISPONIVEL").upper()
+    cp_total_pure = int(cp_pure.get("total_contratos") or 0)
+    cp_msg_pure = cp_pure.get("mensagem")
+    if cp_status_pure == "INDISPONIVEL":
+        lines.append(f"   Contratos com o Poder Publico: Base governamental temporariamente indisponivel no momento da consulta.")
+    elif cp_total_pure > 0:
+        val_txt = f" | Valor Global: {cp_pure.get('valor_global_formatado')}" if cp_pure.get("valor_global_formatado") else ""
+        lines.append(f"   Contratos com o Poder Publico: {cp_total_pure} contratos identificados{val_txt}")
+        if cp_pure.get("esferas"):
+            lines.append(f"   Esferas: {', '.join(cp_pure['esferas'])}")
+        if cp_pure.get("orgaos_contratantes"):
+            lines.append(f"   Orgaos Contratantes: {', '.join(cp_pure['orgaos_contratantes'][:4])}")
+    else:
+        lines.append(f"   Contratos com o Poder Publico: Nenhum contrato publico localizado nas bases consultadas")
 
     # Quebra linhas longas para caber confortavelmente em A4
     wrapped_lines: List[str] = []
