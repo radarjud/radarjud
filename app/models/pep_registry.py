@@ -65,7 +65,7 @@ class PEPRegistry(db.Model):
         # Guardrail LGPD ativo no construtor
         if "cpf_parcial_mascarado" in kwargs:
             kwargs["cpf_parcial_mascarado"] = mask_cpf_lgpd(kwargs["cpf_parcial_mascarado"])
-        if "nome_normalizado" in kwargs and kwargs["nome_normalizado"]:
+        if kwargs.get("nome_normalizado"):
             from app.utils.sanitizer import sanitize_company_name
             # Normalização de nome (sem acentos, uppercase, sem espaços extras)
             kwargs["nome_normalizado"] = sanitize_company_name(kwargs["nome_normalizado"]).upper()
