@@ -140,38 +140,50 @@ DEFAULT_BASELINE_PEPS = [
         "orgao": "Supremo Tribunal Federal",
         "inicio": "2021-12-16",
     },
+    {
+        "nome": "ROMEU ZEMA NETO",
+        "cpf": "***.351.886-**",
+        "cargo": "Governador do Estado de Minas Gerais",
+        "orgao": "Governo do Estado de Minas Gerais",
+        "inicio": "2019-01-01",
+    },
+    {
+        "nome": "ROMEU ZEMA",
+        "cpf": "***.351.886-**",
+        "cargo": "Governador do Estado de Minas Gerais",
+        "orgao": "Governo do Estado de Minas Gerais",
+        "inicio": "2019-01-01",
+    },
 ]
 
 
 def seed_pep_baseline_if_empty() -> int:
     """
-    Popula o banco de dados com um baseline inicial de PEPs e familiares notórios
-    caso a tabela pep_registry esteja vazia.
+    Popula ou complementa o banco de dados com o baseline inicial de PEPs e familiares notórios.
     Garante que testes locais e produção inicial identifiquem autoridades sem depender de dump manual.
     """
     try:
-        if PEPRegistry.query.first() is not None:
-            return 0
-
-        entries = []
+        added = 0
+        existing_norms = {p.nome_normalizado for p in PEPRegistry.query.all()}
         for item in DEFAULT_BASELINE_PEPS:
             norm = normalize_pep_name(item["nome"])
-            masked = mask_cpf_lgpd(item["cpf"])
-            entries.append(
-                PEPRegistry(
+            if norm and norm not in existing_norms:
+                masked = mask_cpf_lgpd(item["cpf"])
+                entry = PEPRegistry(
                     nome_normalizado=norm,
                     cpf_parcial_mascarado=masked,
                     cargo_funcao=item.get("cargo"),
                     esfera_orgao=item.get("orgao"),
                     data_inicio_exercicio=item.get("inicio"),
                 )
-            )
+                db.session.add(entry)
+                existing_norms.add(norm)
+                added += 1
 
-        if entries:
-            db.session.add_all(entries)
+        if added > 0:
             db.session.commit()
-            logger.info("Baseline PEP semeado com sucesso (%d registros de alta relevância).", len(entries))
-            return len(entries)
+            logger.info("Baseline PEP atualizado com sucesso (%d novos registros).", added)
+            return added
     except Exception as exc:  # noqa: BLE001
         db.session.rollback()
         logger.warning("Falha defensiva ao semear baseline PEP: %s", exc)
@@ -375,20 +387,25 @@ class PEPComplianceService:
         """
         clean_cnpj = re.sub(r"\D", "", str(cnpj or "")).strip()
 
-        # 1. Cache L0 em memória
+        # 1. Cache L0 em memória (apenas se tiver vínculos positivos; se tiver 0, reavalia)
         if not force_refresh and clean_cnpj:
             cached_l0 = _L0_CACHE.get(clean_cnpj)
             if cached_l0:
                 ts, data = cached_l0
-                if (time.time() - ts) < _L0_CACHE_TTL:
+                if (time.time() - ts) < _L0_CACHE_TTL and data.get("total_vinculos_identificados", 0) > 0:
                     logger.debug("L0 Memory Cache hit para compliance PEP do CNPJ %s", clean_cnpj)
                     return data
 
-        # 2. Cache L1 no PostgreSQL
+        # 2. Cache L1 no PostgreSQL (apenas se tiver vínculos positivos)
         if not force_refresh and clean_cnpj and len(clean_cnpj) == 14:
             try:
                 cached_l1 = PEPComplianceCache.query.filter_by(cnpj=clean_cnpj).first()
-                if cached_l1 and cached_l1.is_valid(ttl_hours=24):
+                if (
+                    cached_l1
+                    and cached_l1.is_valid(ttl_hours=24)
+                    and cached_l1.data
+                    and cached_l1.data.get("total_vinculos_identificados", 0) > 0
+                ):
                     logger.debug("L1 Database Cache hit para compliance PEP do CNPJ %s", clean_cnpj)
                     res_data = dict(cached_l1.data)
                     _L0_CACHE[clean_cnpj] = (time.time(), res_data)

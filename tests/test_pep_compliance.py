@@ -410,3 +410,27 @@ def test_pep_compliance_baseline_and_roxel_participacoes(app, client):
         assert any("Ministro do Supremo Tribunal Federal" in c for c in cargos)
         assert any("Familiar de PEP (Filho de Ministro do STF)" in c for c in cargos)
 
+
+def test_pep_compliance_zema_credito(app, client):
+    """
+    Valida a detecção de PEP para a Zema Crédito, Financiamento e Investimento S/A,
+    identificando Romeu Zema Neto (Governador do Estado de Minas Gerais - PEP Direto).
+    """
+    from app.services.economic_service import EconomicStandingService
+    from app.services.pep_compliance_service import check_qsa_pep_compliance
+
+    with app.app_context():
+        econ = EconomicStandingService()
+        data = econ.fetch_brasilapi_data("05351887000186")
+        assert data.get("razao_social") == "ZEMA CREDITO, FINANCIAMENTO E INVESTIMENTO S/A"
+        qsa = data.get("qsa")
+        assert any("ROMEU ZEMA" in s.get("nome_socio", "") for s in qsa)
+
+        res = check_qsa_pep_compliance(qsa=qsa, cnpj="05351887000186", force_refresh=True)
+        assert res["status"] == "ALERTA_PEP"
+        assert res["total_vinculos_identificados"] >= 1
+
+        cargos = [oc["cargo_funcao"] for oc in res["ocorrencias"]]
+        assert any("Governador do Estado de Minas Gerais" in c for c in cargos)
+
+

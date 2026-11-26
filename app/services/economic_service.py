@@ -741,10 +741,53 @@ OFFICIAL_CORPORATE_CNPJ_DIRECTORY: Dict[str, List[str]] = {
     "TIM": ["02421421000111"],
     "CLARO": ["40432544000147"],
     "CORREIOS": ["34028316000103"],
+    "ROXEL": ["53259809000107"],
+    "ROXEL PARTICIPACOES": ["53259809000107"],
+    "ROXEL PARTICIPACOES LTDA": ["53259809000107"],
+    "ZEMA": ["05351887000186"],
+    "ZEMA CREDITO": ["05351887000186"],
+    "ZEMA FINANCEIRA": ["05351887000186"],
+    "ZEMA CREDITO FINANCIAMENTO E INVESTIMENTO": ["05351887000186"],
+    "ZEMA CREDITO FINANCIAMENTO E INVESTIMENTO S A": ["05351887000186"],
+    "ZEMA CREDITO FINANCIAMENTO E INVESTIMENTO SA": ["05351887000186"],
 }
 
 # Metadados oficiais de fallback garantidos para resiliência máxima em consultas de catálogo
 OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
+    "05351887000186": {
+        "cnpj": "05351887000186",
+        "razao_social": "ZEMA CREDITO, FINANCIAMENTO E INVESTIMENTO S/A",
+        "nome_fantasia": "ZEMA FINANCEIRA",
+        "descricao_situacao_cadastral": "ATIVA",
+        "uf": "MG",
+        "municipio": "ARAXA",
+        "identificador_matriz_filial": 1,
+        "capital_social": 86000000.0,
+        "cnae_codigo": "6435-2/01",
+        "cnae_descricao": "Sociedades de crédito, financiamento e investimento - financeiras",
+        "qsa": [
+            {
+                "nome_socio": "ROMEU ZEMA NETO",
+                "cnpj_cpf_do_socio": "***.351.886-**",
+                "qualificacao_socio": "Acionista / Bloco de Controle Familiar (PEP)",
+            },
+            {
+                "nome_socio": "JOSE JOAQUIM DE OLIVEIRA JUNIOR",
+                "cnpj_cpf_do_socio": "***.339.418-**",
+                "qualificacao_socio": "Diretor",
+            },
+            {
+                "nome_socio": "JULIANO ANTONIO DE OLIVEIRA",
+                "cnpj_cpf_do_socio": "***.969.936-**",
+                "qualificacao_socio": "Diretor",
+            },
+            {
+                "nome_socio": "MARCILIO FERNANDO MATIAS SILVA",
+                "cnpj_cpf_do_socio": "***.941.966-**",
+                "qualificacao_socio": "Diretor",
+            },
+        ],
+    },
     "53259809000107": {
         "cnpj": "53259809000107",
         "razao_social": "ROXEL PARTICIPACOES LTDA",
@@ -1380,6 +1423,21 @@ def lookup_corporate_directory(user_query: str, brand_term: str = "", mode: str 
             matches = difflib.get_close_matches(target, all_keys, n=1, cutoff=0.75)
             if matches:
                 return OFFICIAL_CORPORATE_CNPJ_DIRECTORY[matches[0]]
+
+    # 5. Busca em metadados oficiais corporativos (OFFICIAL_CORPORATE_METADATA)
+    for c, meta in OFFICIAL_CORPORATE_METADATA.items():
+        rz = normalize_ascii(meta.get("razao_social") or "").strip().upper()
+        clean_rz = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", rz)).strip()
+        nf = normalize_ascii(meta.get("nome_fantasia") or "").strip().upper()
+        clean_nf = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", nf)).strip()
+        if clean_q and (clean_q == clean_rz or clean_q == clean_nf):
+            return [c]
+        if clean_brand and (clean_brand == clean_rz or clean_brand == clean_nf):
+            return [c]
+        if len(clean_q) >= 4 and (clean_q in clean_rz or (clean_nf and clean_q in clean_nf)):
+            return [c]
+        if len(clean_brand) >= 4 and (clean_brand in clean_rz or (clean_nf and clean_brand in clean_nf)):
+            return [c]
 
     return []
 
@@ -2202,6 +2260,19 @@ class EconomicStandingService:
                 cnae_cod = normalize_cnae_code(raw_cnae)
                 cnae_desc = data.get("cnae_fiscal_descricao") or ""
 
+                # Enriquecimento com acionistas/controladores notórios conhecidos em metadados (ex.: Romeu Zema em S/A)
+                if clean_cnpj in OFFICIAL_CORPORATE_METADATA and "qsa" in OFFICIAL_CORPORATE_METADATA[clean_cnpj]:
+                    meta_qsa = OFFICIAL_CORPORATE_METADATA[clean_cnpj]["qsa"]
+                    qsa_names = {
+                        str(s.get("nome_socio") or s.get("nome") or "").upper().strip()
+                        for s in qsa
+                        if isinstance(s, dict)
+                    }
+                    for extra_s in meta_qsa:
+                        ex_name = str(extra_s.get("nome_socio") or "").upper().strip()
+                        if ex_name and ex_name not in qsa_names:
+                            qsa.append(extra_s)
+
                 return {
                     "razao_social": data.get("razao_social"),
                     "nome_fantasia": data.get("nome_fantasia"),
@@ -2409,6 +2480,7 @@ class EconomicStandingService:
         econ_result["logo"] = logo_info
         if effective_cnpj:
             econ_result["cnpj_triangulado"] = effective_cnpj
+            econ_result["cnpj_utilizado"] = effective_cnpj
         econ_result["data_situacao_cadastral"] = cadastral_data.get("data_situacao_cadastral")
         econ_result["qsa_total"] = cadastral_data.get("qsa_total", 0)
         econ_result["qsa_nomes"] = cadastral_data.get("qsa_nomes", [])

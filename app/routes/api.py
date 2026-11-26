@@ -671,15 +671,25 @@ def search_company():
                         cached_search.contratos_poder_publico = contratos_pub
                         res["contratos_poder_publico"] = contratos_pub
 
-                # Compliance PEP no QSA (CGU - US-21): hidratação se ainda não computado
+                # Compliance PEP no QSA (CGU - US-21): hidratação se ainda não computado ou sem vínculos
                 from app.services.pep_compliance_service import pep_compliance_service
                 qsa_list = econ_data.get("qsa") or econ_data.get("qsa_nomes") or []
-                if not cached_search.compliance_pep or (
-                    isinstance(cached_search.compliance_pep, dict) and cached_search.compliance_pep.get("status") == "INDISPONIVEL"
+                if not qsa_list and clean_search_cnpj:
+                    raw_reg = economic_service.fetch_brasilapi_data(clean_search_cnpj)
+                    if raw_reg and raw_reg.get("qsa"):
+                        qsa_list = raw_reg.get("qsa")
+                        econ_data["qsa"] = qsa_list
+
+                if (
+                    not cached_search.compliance_pep
+                    or not isinstance(cached_search.compliance_pep, dict)
+                    or cached_search.compliance_pep.get("status") == "INDISPONIVEL"
+                    or cached_search.compliance_pep.get("total_vinculos_identificados", 0) == 0
                 ):
                     pep_comp = pep_compliance_service.check_qsa_compliance(
                         qsa=qsa_list,
                         cnpj=clean_search_cnpj,
+                        force_refresh=True,
                     )
                     cached_search.compliance_pep = pep_comp
                     res["compliance_pep"] = pep_comp
@@ -839,9 +849,16 @@ def search_company():
         # Compliance de Pessoas Politicamente Expostas no QSA (CGU - US-21)
         from app.services.pep_compliance_service import pep_compliance_service
         qsa_list = econ_data.get("qsa") or econ_data.get("qsa_nomes") or []
+        if not qsa_list and clean_search_cnpj:
+            raw_reg = economic_service.fetch_brasilapi_data(clean_search_cnpj)
+            if raw_reg and raw_reg.get("qsa"):
+                qsa_list = raw_reg.get("qsa")
+                econ_data["qsa"] = qsa_list
+
         pep_compliance = pep_compliance_service.check_qsa_compliance(
             qsa=qsa_list,
             cnpj=clean_search_cnpj,
+            force_refresh=True,
         )
         fast_results["compliance_pep"] = pep_compliance
 
