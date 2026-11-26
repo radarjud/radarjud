@@ -11,6 +11,11 @@ from app.services.monitoring_job import (
 )
 from app.services.ai_analyzer import detect_subsidiary_liability_in_processes
 from app.services.notifier import NotificationService
+from app.services.public_contracts_service import (
+    PublicContractsService,
+    public_contracts_service,
+    get_public_contracts,
+)
 from app.services.task_dispatcher import (
     TaskDispatcher,
     UpstashRedisDispatcher,
@@ -31,6 +36,9 @@ __all__ = [
     "dispatch_alert",
     "detect_subsidiary_liability_in_processes",
     "NotificationService",
+    "PublicContractsService",
+    "public_contracts_service",
+    "get_public_contracts",
     "TaskDispatcher",
     "UpstashRedisDispatcher",
     "InProcessFallbackDispatcher",
