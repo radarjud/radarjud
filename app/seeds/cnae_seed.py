@@ -8,10 +8,8 @@ from typing import Any
 from app.extensions import db
 from app.models.company_search import CompanySearch, get_utc_now
 from app.models.CompanyRegistry import CompanyRegistry
-from app.services.economic_service import (
-    OFFICIAL_CORPORATE_METADATA,
-    normalize_cnae_code,
-)
+from app.seeds.catalog_seed import get_full_catalog_entries
+from app.services.economic_service import normalize_cnae_code
 from app.utils.sanitizer import sanitize_company_name
 
 logger = logging.getLogger(__name__)
@@ -28,7 +26,7 @@ def backfill_cnae_metadata(app: Any | None = None) -> dict[str, int]:
         reg_updated = 0
         searches_updated = 0
 
-        for cnpj_raw, meta in OFFICIAL_CORPORATE_METADATA.items():
+        for cnpj_raw, meta in get_full_catalog_entries().items():
             clean_cnpj = re.sub(r"\D", "", str(cnpj_raw or ""))
             cnae_code = normalize_cnae_code(meta.get("cnae_codigo"))
             cnae_desc = meta.get("cnae_descricao") or ""
