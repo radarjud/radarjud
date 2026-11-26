@@ -273,7 +273,7 @@
 
   <!-- Gráfico Comparativo Vetorial SVG -->
   <div class="section-card">
-    <div class="section-title">Comparativo Visual de Risco e Volume Processual</div>
+    <div class="section-title">Comparativo de Risco Subsidiário e Volume Processual</div>
     <div class="chart-container">
       {{ comparative_svg | safe }}
     </div>
@@ -288,7 +288,7 @@
           <th style="width: 28%;">Empresa / Razão Social</th>
           <th style="width: 18%;">CNPJ Matriz</th>
           <th class="text-right" style="width: 12%;">Processos</th>
-          <th class="text-right" style="width: 12%;">Score Risco</th>
+          <th class="text-right" style="width: 12%;">Risco Subsidiário</th>
           <th style="width: 15%;">Cenário</th>
           <th style="width: 15%;">Recomendação</th>
         </tr>
@@ -299,8 +299,8 @@
             <td><strong>{{ comp.company_name }}</strong></td>
             <td>{{ comp.cnpj_formatted }}</td>
             <td class="text-right">{{ comp.total_processes }}</td>
-            <td class="text-right" style="font-weight: 700; color: {% if comp.exposure_score < 30 %}#16a34a{% elif comp.exposure_score < 60 %}#d97706{% else %}#dc2626{% endif %};">
-              {{ "%.1f"|format(comp.exposure_score) }}%
+            <td class="text-right" style="font-weight: 700; color: {% if (comp.economic.risco_sub or 0) < 30 %}#16a34a{% elif (comp.economic.risco_sub or 0) < 60 %}#d97706{% else %}#dc2626{% endif %};">
+              {% if comp.economic.risco_sub is not none %}{{ "%.1f"|format(comp.economic.risco_sub|float) }}%{% else %}Não informado{% endif %}
             </td>
             <td>
               {% if comp.economic.is_cenario_a %}
@@ -332,15 +332,15 @@
               {{ comp.economic.cenario_badge }}
             </span>
           </div>
-          <div class="company-item-meta">
-            <span><strong>Capital:</strong> {{ comp.economic.capital_fmt }}</span>
-            <span><strong>Situação RFB:</strong> {{ comp.economic.situacao_rfb }}</span>
-            <span><strong>Risco Subsidiário:</strong> {{ "%.1f"|format(comp.economic.risco_sub or 0.0) }}%</span>
+          <p style="font-size:12pt;font-weight:bold">{{ comp.compliance.recomendacao }}</p>{% if comp.compliance.recomendacoes %}<ul>{% for item in comp.compliance.recomendacoes %}<li><strong>{{ item }}</strong></li>{% endfor %}</ul>{% endif %}<div class="company-item-meta">
+            
+            
+            <span><strong>Risco Subsidiário:</strong> {% if comp.economic.risco_sub is not none %}{{ "%.1f"|format(comp.economic.risco_sub|float) }}%{% else %}Não informado{% endif %}</span>
             <span><strong>Confiança:</strong> {{ comp.conf_label }}</span>
           </div>
           <p style="font-size: 7.2pt; color: #475569; margin-top: 4px;">
             {{ comp.compliance.resumo_executivo }}
-          </p>
+          </p><p><strong>Mais informações:</strong> Capital declaratório: {{ comp.economic.capital_fmt }} · RFB: {{ comp.economic.situacao_rfb }} · {{ comp.economic.sancoes_texto }}</p>
         </div>
       {% endfor %}
     </div>

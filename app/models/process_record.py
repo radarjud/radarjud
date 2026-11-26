@@ -12,6 +12,12 @@ class ProcessRecord(db.Model):
     Focado estritamente na Pessoa Jurídica (Compliance LGPD).
     """
     __tablename__ = "process_records"
+    __table_args__ = (
+        db.UniqueConstraint("company_search_id", "numero_processo", name="uq_process_records_search_numero"),
+        db.Index("ix_process_records_search_tribunal_data", "company_search_id", "tribunal", "data_distribuicao"),
+        db.Index("ix_process_records_search_valor", "company_search_id", "valor_causa"),
+        db.Index("ix_process_records_search_outcome", "company_search_id", "sentence_outcome"),
+    )
 
     id = db.Column(db.Integer, primary_key=True)
     company_search_id = db.Column(db.Integer, db.ForeignKey("company_searches.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -33,6 +39,14 @@ class ProcessRecord(db.Model):
     sentence_outcome = db.Column(db.String(50), default="em_aberto", nullable=False, index=True)
     has_expert_report = db.Column(db.Boolean, default=False, nullable=False)
 
+    # Responsabilidade Subsidiária de Tomadora PJ (Súmula 331 TST - US-19)
+    has_subsidiary_liability = db.Column(db.Boolean, default=False, nullable=True)
+    subsidiary_contractors_json = db.Column(db.JSON, nullable=True)
+
+    # Metadados Processuais Avançados (DataJud / PJe)
+    data_distribuicao = db.Column(db.Date, nullable=True, index=True)
+    valor_causa = db.Column(db.Numeric(15, 2), nullable=True)
+
     # Armazena metadados brutos do Elasticsearch / PJe para rastreabilidade
     raw_metadata = db.Column(db.JSON, nullable=True)
 
@@ -45,11 +59,15 @@ class ProcessRecord(db.Model):
             "tribunal": self.tribunal,
             "grau": self.grau,
             "nivel_sigilo": self.nivel_sigilo,
+            "data_distribuicao": self.data_distribuicao.isoformat() if hasattr(self.data_distribuicao, "isoformat") else (str(self.data_distribuicao) if self.data_distribuicao else None),
+            "valor_causa": float(self.valor_causa) if self.valor_causa is not None else None,
             "primary_subject": self.primary_subject,
             "primary_subject_code": self.primary_subject_code,
             "subjects": self.subjects_json or [],
             "observation": self.observation,
             "sentence_outcome": self.sentence_outcome,
             "has_expert_report": self.has_expert_report,
+            "has_subsidiary_liability": bool(self.has_subsidiary_liability),
+            "subsidiary_contractors": self.subsidiary_contractors_json or [],
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }

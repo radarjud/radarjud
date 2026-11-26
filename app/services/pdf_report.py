@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from app.services.business_labels import business_text
 from app.services.pdf_svg_charts import (
     generate_bayes_vs_sumula331_svg,
     generate_comparative_bars_svg,
@@ -266,6 +267,21 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         else "Nada Consta (CEIS/CNEP/PGFN)"
     )
 
+    # Sinais Públicos de Solvência Real e Certidões (US-22)
+    sinais_solvencia = (
+        data.get("sinais_solvencia_publica")
+        or econ.get("sinais_solvencia_publica")
+        or {}
+    )
+    if not sinais_solvencia:
+        from app.services.solvency_signals_service import solvency_signals_service
+        sinais_solvencia = solvency_signals_service.consolidate_solvency_signals(
+            company_name=company_name,
+            cnpj=raw_cnpj,
+            cadastral_data={"situacao_cadastral": situacao_rfb},
+            capital_social=float(econ.get("capital_social_num") or 0.0),
+        )
+
     # Rankings
     raw_cond_ranking = (
         data.get("ranking_motivos_condenacao")
@@ -290,19 +306,38 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 qtd = int(
                     it.get("quantidade_condenacoes")
+                    or it.get("condenacoes")
                     or it.get("quantidade")
                     or it.get("total")
                     or it.get("count")
                     or 0
                 )
                 pct = it.get("percentual") or it.get("pct") or it.get("taxa_condenacao_pct")
-                normalized.append({"motivo": nome, "quantidade": qtd, "percentual": pct})
+                normalized.append({"motivo": nome, "quantidade": qtd, "percentual": pct, "taxa_no_motivo": next((it[k] for k in ("taxa_no_motivo", "taxa_condenacao_no_motivo", "taxa_perda_no_motivo") if it.get(k) is not None), None)})
             elif isinstance(it, str):
                 normalized.append({"motivo": it, "quantidade": 0, "percentual": None})
         return normalized
 
     ranking_condenacoes = _normalize_ranking(raw_cond_ranking)
     ranking_motivos = _normalize_ranking(raw_motivos_ranking)
+
+    # Condenações por Motivo do Processo (US-18)
+    condenacao_por_motivo = []
+    raw_cpm = data.get("condenacao_por_motivo")
+    if not raw_cpm and (data.get("processes") or data.get("processos")):
+        from app.services.prediction_engine import build_condenacao_por_motivo
+        raw_cpm = build_condenacao_por_motivo(data.get("processes") or data.get("processos") or [])
+
+    if isinstance(raw_cpm, list):
+        for it in raw_cpm:
+            if isinstance(it, dict):
+                condenacao_por_motivo.append({
+                    "motivo": str(it.get("motivo") or "Assunto não especificado"),
+                    "total_processos": int(it.get("total_processos") or 0),
+                    "condenacoes": int(it.get("condenacoes") or 0),
+                    "taxa_condenacao": float(it.get("taxa_condenacao") or 0.0),
+                    "faixa_variacao": str(it.get("faixa_variacao") or "0,0% a 0,0%"),
+                })
 
     # Parecer Executivo de Compliance (Súmula 331 TST)
     recomendacao = _safe_str(
@@ -326,6 +361,55 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
     scan_status = _safe_str(data.get("scan_status") or data.get("scanStatus"), "COMPLETED")
 
+    # Histórico de Responsabilidade Subsidiária (Súmula 331 TST - US-19)
+    sub_count = int(
+        data.get("condenacoes_subsidiarias_tomadoras_count")
+        if data.get("condenacoes_subsidiarias_tomadoras_count") is not None
+        else (
+            (ai.get("historico_responsabilidade_subsidiaria") or {}).get("condenacoes_subsidiarias_tomadoras_count") or 0
+        )
+    )
+    raw_sub_tomadoras = (
+        data.get("tomadoras_subsidiarias_pj")
+        or (ai.get("historico_responsabilidade_subsidiaria") or {}).get("tomadoras_subsidiarias_pj")
+        or []
+    )
+    sub_tomadoras = [str(t) for t in raw_sub_tomadoras if t] if isinstance(raw_sub_tomadoras, list) else []
+    sub_msg = (
+        f"Histórico de Responsabilidade Subsidiária: {sub_count} processos com condenação subsidiária atribuída a contratantes anteriores"
+        if sub_count > 0
+        else "Nenhuma condenação subsidiária de contratante identificada na amostra"
+    )
+
+    # Contratos com o Poder Público (PNCP / Portal da Transparência - US-20)
+    raw_cp = data.get("contratos_poder_publico") or {}
+    cp_status = _safe_str(raw_cp.get("status"), "DISPONIVEL").upper()
+    cp_total = int(raw_cp.get("total_contratos") or 0)
+    cp_esferas = list(raw_cp.get("esferas") or [])
+    cp_orgaos = [str(o) for o in (raw_cp.get("orgaos_contratantes") or []) if o]
+    cp_valor = raw_cp.get("valor_global_total")
+    cp_valor_fmt = raw_cp.get("valor_global_formatado")
+    if cp_valor is not None and not cp_valor_fmt:
+        cp_valor_fmt = _format_brl(cp_valor)
+    cp_msg = raw_cp.get("mensagem")
+    if not cp_msg:
+        if cp_status == "INDISPONIVEL":
+            cp_msg = "Base governamental temporariamente indisponível no momento da consulta."
+        elif cp_total == 0:
+            cp_msg = "Nenhum contrato público localizado nas bases consultadas"
+        else:
+            cp_msg = f"{cp_total} contrato(s) público(s) identificado(s) nas bases governamentais"
+
+    contratos_dict = {
+        "status": cp_status,
+        "total_contratos": cp_total,
+        "esferas": cp_esferas,
+        "orgaos_contratantes": cp_orgaos,
+        "valor_global_total": cp_valor,
+        "valor_global_formatado": cp_valor_fmt,
+        "mensagem": cp_msg,
+    }
+
     return {
         "company_name": _safe_str(company_name, "Empresa Consultada"),
         "cnpj_formatted": cnpj_formatted,
@@ -336,6 +420,9 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         "prob_condenacao": prob_condenacao,
         "conf_label": conf_label,
         "conf_detail": conf_detail,
+        "condenacoes_subsidiarias_tomadoras_count": sub_count,
+        "tomadoras_subsidiarias_pj": sub_tomadoras,
+        "mensagem_responsabilidade_subsidiaria": sub_msg,
         "outcomes": {
             "condenacoes": int(outcomes.get("condenacoes") or 0),
             "acordos": int(outcomes.get("acordos") or 0),
@@ -355,15 +442,26 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             "prob_insolv": prob_insolv,
             "risco_sub": risco_sub,
             "sancoes_texto": sancoes_texto,
+            "sinais_solvencia_publica": sinais_solvencia,
+            "demonstracao_contabil_status": sinais_solvencia.get("demonstracao_contabil_status"),
+            "resumo_solvencia": sinais_solvencia.get("resumo_solvencia"),
+            "fontes_consultadas": sinais_solvencia.get("fontes_consultadas", []),
         },
+        "sinais_solvencia_publica": sinais_solvencia,
         "ranking_condenacoes": ranking_condenacoes,
         "ranking_motivos": ranking_motivos,
+        "condenacao_por_motivo": condenacao_por_motivo,
+        "contratos_poder_publico": contratos_dict,
         "compliance": {
             "recomendacao": recomendacao,
             "perfil_risco": perfil_risco,
             "resumo_executivo": resumo_executivo,
             "alertas_331": [str(a) for a in alertas_331 if a][:5],
             "recomendacoes": [str(r) for r in recomendacoes_comp if r][:5],
+            "condenacoes_subsidiarias_tomadoras_count": sub_count,
+            "tomadoras_subsidiarias_pj": sub_tomadoras,
+            "mensagem_responsabilidade_subsidiaria": sub_msg,
+            "contratos_poder_publico": contratos_dict,
         },
     }
 
@@ -463,16 +561,19 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
     ]))
     story.append(header_table)
     story.append(Spacer(1, 8))
+    story.append(Paragraph("Recomendação de contratação: " + _xml_escape(comp["recomendacao"]), style_h2))
+    for action in comp["recomendacoes"]:
+        story.append(Paragraph("<b>" + _xml_escape(action) + "</b>", style_h2))
 
     # 2. KPIs Principais (Exposição Financeira, Eventos, Confiança Bayesiana, Desfechos)
-    exp_num = float(report["exposure_score"] or 0.0)
+    exp_num = float(econ["risco_sub"] or 0.0)
     exp_color = "#c34a4a" if exp_num >= 60 else ("#b67b23" if exp_num >= 35 else "#25865a")
     kpi_table = Table(
         [[
             Paragraph(
-                f"ÍNDICE DE EXPOSIÇÃO FINANCEIRA<br/>"
-                f"<font size='14' color='{exp_color}'><b>{_format_pct(report['exposure_score'])}</b></font><br/>"
-                f"<font size='7.5' color='#526477'>Score geral de impacto subsidiário</font>",
+                f"RISCO SUBSIDIÁRIO<br/>"
+                f"<font size='14' color='{exp_color}'><b>{_format_pct(econ['risco_sub'], '—')}</b></font><br/>"
+                f"<font size='7.5' color='#526477'>Estimativa de risco ao contratante</font>",
                 style_kpi_label,
             ),
             Paragraph(
@@ -482,7 +583,7 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
                 style_kpi_label,
             ),
             Paragraph(
-                f"CONFIANÇA BAYESIANA<br/>"
+                f"CONFIANÇA DA ESTIMATIVA<br/>"
                 f"<font size='11' color='#245a81'><b>{_xml_escape(report['conf_label'])}</b></font><br/>"
                 f"<font size='7.5' color='#526477'>{_xml_escape(report['conf_detail'])}</font>",
                 style_kpi_label,
@@ -584,31 +685,31 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
     story.append(econ_grid)
     story.append(Spacer(1, 8))
 
-    # 4. Ranking dos Motivos de Condenação / Vetores de Risco
-    ranking_items = report["ranking_condenacoes"] or report["ranking_motivos"]
-    ranking_title = (
-        "Ranking dos Motivos de Condenação"
-        if report["ranking_condenacoes"]
-        else "Principais Vetores de Risco Processual"
-    )
-    story.append(Paragraph(ranking_title, style_h2))
-
-    if ranking_items:
+    # 4. Condenações por Motivo do Processo / Vetores de Risco (US-18)
+    cpm_items = report.get("condenacao_por_motivo") or []
+    if cpm_items:
+        story.append(Paragraph("Condenações por Motivo do Processo", style_h2))
         rows = [[
             Paragraph("<b>#</b>", style_small),
-            Paragraph("<b>Motivo / Vetor Identificado</b>", style_small),
-            Paragraph("<b>Ocorrências</b>", style_small),
-            Paragraph("<b>Participação</b>", style_small),
+            Paragraph("<b>Motivo / Assunto</b>", style_small),
+            Paragraph("<b>Processos</b>", style_small),
+            Paragraph("<b>Condenações</b>", style_small),
+            Paragraph("<b>Taxa</b>", style_small),
+            Paragraph("<b>Faixa de Variação</b>", style_small),
         ]]
-        for idx, item in enumerate(ranking_items[:8], start=1):
-            pct_str = _format_pct(item["percentual"], "—") if item.get("percentual") is not None else "—"
+        for idx, item in enumerate(cpm_items, start=1):
             rows.append([
                 Paragraph(str(idx), style_small),
                 Paragraph(_xml_escape(item["motivo"]), style_body),
-                Paragraph(str(item["quantidade"]), style_body),
-                Paragraph(pct_str, style_body),
+                Paragraph(str(item["total_processos"]), style_body),
+                Paragraph(str(item["condenacoes"]), style_body),
+                Paragraph(f"{item['taxa_condenacao']:.1f}%", style_body),
+                Paragraph(_xml_escape(item["faixa_variacao"]), style_small),
             ])
-        rank_table = Table(rows, colWidths=[page_w * 0.07, page_w * 0.65, page_w * 0.14, page_w * 0.14])
+        rank_table = Table(
+            rows,
+            colWidths=[page_w * 0.05, page_w * 0.39, page_w * 0.13, page_w * 0.13, page_w * 0.12, page_w * 0.18],
+        )
         rank_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), bg_soft),
             ("BOX", (0, 0), (-1, -1), 0.6, border_col),
@@ -621,7 +722,43 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
         ]))
         story.append(rank_table)
     else:
-        story.append(Paragraph("Nenhuma condenação ou vetor de risco recorrente mapeado para esta empresa.", style_small))
+        ranking_items = report["ranking_condenacoes"] or report["ranking_motivos"]
+        ranking_title = (
+            "Ranking dos Motivos de Condenação"
+            if report["ranking_condenacoes"]
+            else "Principais Vetores de Risco Processual"
+        )
+        story.append(Paragraph(ranking_title, style_h2))
+
+        if ranking_items:
+            rows = [[
+                Paragraph("<b>#</b>", style_small),
+                Paragraph("<b>Motivo / Vetor Identificado</b>", style_small),
+                Paragraph("<b>Ocorrências</b>", style_small),
+                Paragraph("<b>Participação</b>", style_small),
+            ]]
+            for idx, item in enumerate(ranking_items[:8], start=1):
+                pct_str = _format_pct(item["percentual"], "—") if item.get("percentual") is not None else "—"
+                rows.append([
+                    Paragraph(str(idx), style_small),
+                    Paragraph(_xml_escape(item["motivo"]), style_body),
+                    Paragraph(str(item["quantidade"]), style_body),
+                    Paragraph(pct_str, style_body),
+                ])
+            rank_table = Table(rows, colWidths=[page_w * 0.07, page_w * 0.65, page_w * 0.14, page_w * 0.14])
+            rank_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), bg_soft),
+                ("BOX", (0, 0), (-1, -1), 0.6, border_col),
+                ("INNERGRID", (0, 0), (-1, -1), 0.4, border_col),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]))
+            story.append(rank_table)
+        else:
+            story.append(Paragraph("Nenhuma condenação ou vetor de risco recorrente mapeado para esta empresa.", style_small))
 
     story.append(Spacer(1, 8))
 
@@ -662,10 +799,88 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
         for rec_item in comp["recomendacoes"]:
             story.append(Paragraph(f"• {_xml_escape(rec_item)}", style_small))
 
+    # Histórico de Responsabilidade Subsidiária (Súmula 331 TST - US-19)
+    sub_count = int(comp.get("condenacoes_subsidiarias_tomadoras_count", 0) or 0)
+    sub_tomadoras = comp.get("tomadoras_subsidiarias_pj") or []
+    sub_msg = comp.get("mensagem_responsabilidade_subsidiaria") or (
+        f"Histórico de Responsabilidade Subsidiária: {sub_count} processos com condenação subsidiária atribuída a contratantes anteriores"
+        if sub_count > 0
+        else "Nenhuma condenação subsidiária de contratante identificada na amostra"
+    )
+    story.append(Spacer(1, 6))
+    if sub_count > 0:
+        sub_card_bg = colors.HexColor("#fef7ea")
+        sub_border = colors.HexColor("#b67b23")
+        tomadoras_line = f"<br/><font size='8' color='#445566'><b>Tomadoras PJ identificadas:</b> {_xml_escape(', '.join(sub_tomadoras[:10]))}</font>" if sub_tomadoras else ""
+        sub_para = Paragraph(
+            f"<font color='#b67b23'><b>{_xml_escape(sub_msg)}</b></font>{tomadoras_line}",
+            style_small,
+        )
+    else:
+        sub_card_bg = colors.HexColor("#f0f9f4")
+        sub_border = colors.HexColor("#25865a")
+        sub_para = Paragraph(
+            f"<font color='#25865a'><b>{_xml_escape(sub_msg)}</b></font>",
+            style_small,
+        )
+    sub_box = Table([[sub_para]], colWidths=[page_w])
+    sub_box.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), sub_card_bg),
+        ("BOX", (0, 0), (-1, -1), 0.8, sub_border),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(sub_box)
+
+    # Contratos com o Poder Público (PNCP / Portal da Transparência - US-20)
+    cp = report.get("contratos_poder_publico") or {}
+    cp_status = str(cp.get("status") or "DISPONIVEL").upper()
+    cp_total = int(cp.get("total_contratos") or 0)
+    cp_msg = str(cp.get("mensagem") or "")
+    story.append(Spacer(1, 6))
+
+    if cp_status == "INDISPONIVEL":
+        cp_card_bg = colors.HexColor("#f8fafc")
+        cp_border = colors.HexColor("#64748b")
+        cp_para = Paragraph(
+            f"<font color='#475569'><b>Contratos com o Poder Público:</b> {_xml_escape(cp_msg or 'Base governamental temporariamente indisponível no momento da consulta.')}</font>",
+            style_small,
+        )
+    elif cp_total > 0:
+        cp_card_bg = colors.HexColor("#f0f7fc")
+        cp_border = colors.HexColor("#1a56db")
+        val_str = f" · Valor Global: {cp.get('valor_global_formatado')}" if cp.get("valor_global_formatado") else ""
+        esf_str = f"<br/><font size='8' color='#334155'><b>Esferas:</b> {_xml_escape(', '.join(cp.get('esferas') or []))}</font>" if cp.get("esferas") else ""
+        org_str = f"<br/><font size='8' color='#445566'><b>Órgãos Contratantes:</b> {_xml_escape(', '.join((cp.get('orgaos_contratantes') or [])[:6]))}</font>" if cp.get("orgaos_contratantes") else ""
+        cp_para = Paragraph(
+            f"<font color='#1a56db'><b>Contratos com o Poder Público: {cp_total} contrato(s) localizado(s){val_str}</b></font>{esf_str}{org_str}",
+            style_small,
+        )
+    else:
+        cp_card_bg = colors.HexColor("#f0f9f4")
+        cp_border = colors.HexColor("#25865a")
+        cp_para = Paragraph(
+            f"<font color='#25865a'><b>Contratos com o Poder Público:</b> {_xml_escape(cp_msg or 'Nenhum contrato público localizado nas bases consultadas')}</font>",
+            style_small,
+        )
+
+    cp_box = Table([[cp_para]], colWidths=[page_w])
+    cp_box.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), cp_card_bg),
+        ("BOX", (0, 0), (-1, -1), 0.8, cp_border),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(cp_box)
+
     story.append(Spacer(1, 10))
     story.append(Paragraph(
         "Fontes Oficiais Consultadas: Comunica PJe (CNJ), DataJud (CNJ), Receita Federal do Brasil, CGU (CEIS/CNEP) e PGFN. "
-        "Relatório gerado automaticamente pelo RadarJus v2.0 (Motor Bayesiano Empírico + Auditoria de Solvência).",
+        "Relatório gerado automaticamente pelo RadarJus v2.0 (Estimativa baseada no histórico + Auditoria de Solvência).",
         style_small,
     ))
 
@@ -693,9 +908,9 @@ def _generate_pdf_pure_python(report: Dict[str, Any]) -> bytes:
         f"CNPJ Matriz: {report['cnpj_formatted']} | Emissao: {report['generated_at']}",
         "-" * 78,
         "1. INDICADORES PREDITIVOS & EXPOSICAO",
-        f"   Indice de Exposicao Financeira: {_format_pct(report['exposure_score'])}",
+        f"   Risco Subsidiario: {_format_pct(econ['risco_sub'], '—')}",
         f"   Eventos Identificados: {report['total_processes']}",
-        f"   Grau de Confianca Bayesiano: {report['conf_detail']}",
+        f"   Confianca da estimativa: {report['conf_detail']}",
         f"   Desfechos: Condenacoes={out['condenacoes']} | Acordos={out['acordos']} | Improcedentes={out['improcedentes']} | Em Aberto={out['em_aberto']}",
         "-" * 78,
         "2. IDONEIDADE ECONOMICA & EXPOSICAO SUBSIDIARIA",
@@ -704,22 +919,61 @@ def _generate_pdf_pure_python(report: Dict[str, Any]) -> bytes:
         f"   Unidades: {econ['subtitulo_unidades']}",
         f"   Situacao Cadastral RFB: {econ['situacao_rfb']} | Sancoes/Debitos: {econ['sancoes_texto']}",
         f"   Probabilidade de Insolvencia: {_format_pct(econ['prob_insolv'])} | Risco Subsidiario: {_format_pct(econ['risco_sub'])}",
-        "-" * 78,
-        "3. RANKING DOS MOTIVOS DE CONDENACAO / VETORES DE RISCO",
     ]
 
-    ranking_items = report["ranking_condenacoes"] or report["ranking_motivos"]
-    if ranking_items:
-        for idx, item in enumerate(ranking_items[:8], start=1):
-            lines.append(f"   {idx}. {item['motivo']} ({item['quantidade']} ocorrencias)")
+    cpm_items = report.get("condenacao_por_motivo") or []
+    if cpm_items:
+        lines.extend([
+            "-" * 78,
+            "3. CONDENAÇÕES POR MOTIVO DO PROCESSO",
+        ])
+        for idx, item in enumerate(cpm_items, start=1):
+            lines.append(
+                f"   {idx}. {item['motivo']}: {item['condenacoes']}/{item['total_processos']} "
+                f"({item['taxa_condenacao']:.1f}%) | Faixa: {item['faixa_variacao']}"
+            )
     else:
-        lines.append("   Nenhuma condenacao ou vetor recorrente mapeado.")
+        lines.extend([
+            "-" * 78,
+            "3. RANKING DOS MOTIVOS DE CONDENACAO / VETORES DE RISCO",
+        ])
+        ranking_items = report["ranking_condenacoes"] or report["ranking_motivos"]
+        if ranking_items:
+            for idx, item in enumerate(ranking_items[:8], start=1):
+                lines.append(f"   {idx}. {item['motivo']} ({item['quantidade']} ocorrencias)")
+        else:
+            lines.append("   Nenhuma condenacao ou vetor recorrente mapeado.")
 
+    sub_count_pure = int(comp.get("condenacoes_subsidiarias_tomadoras_count", 0) or 0)
+    sub_msg_pure = comp.get("mensagem_responsabilidade_subsidiaria") or (
+        f"Histórico de Responsabilidade Subsidiária: {sub_count_pure} processos com condenação subsidiária atribuída a contratantes anteriores"
+        if sub_count_pure > 0
+        else "Nenhuma condenação subsidiária de contratante identificada na amostra"
+    )
     lines.extend([
         "-" * 78,
         "4. PARECER EXECUTIVO DE COMPLIANCE (SUMULA 331 TST)",
         f"   Recomendacao: {comp['recomendacao']} | Perfil de Risco: {comp['perfil_risco']}",
+        f"   {sub_msg_pure}",
     ])
+    if comp.get("tomadoras_subsidiarias_pj"):
+        lines.append(f"   Tomadoras PJ: {', '.join(comp['tomadoras_subsidiarias_pj'][:5])}")
+
+    cp_pure = report.get("contratos_poder_publico") or comp.get("contratos_poder_publico") or {}
+    cp_status_pure = str(cp_pure.get("status") or "DISPONIVEL").upper()
+    cp_total_pure = int(cp_pure.get("total_contratos") or 0)
+    cp_msg_pure = cp_pure.get("mensagem")
+    if cp_status_pure == "INDISPONIVEL":
+        lines.append(f"   Contratos com o Poder Publico: Base governamental temporariamente indisponivel no momento da consulta.")
+    elif cp_total_pure > 0:
+        val_txt = f" | Valor Global: {cp_pure.get('valor_global_formatado')}" if cp_pure.get("valor_global_formatado") else ""
+        lines.append(f"   Contratos com o Poder Publico: {cp_total_pure} contratos identificados{val_txt}")
+        if cp_pure.get("esferas"):
+            lines.append(f"   Esferas: {', '.join(cp_pure['esferas'])}")
+        if cp_pure.get("orgaos_contratantes"):
+            lines.append(f"   Orgaos Contratantes: {', '.join(cp_pure['orgaos_contratantes'][:4])}")
+    else:
+        lines.append(f"   Contratos com o Poder Publico: Nenhum contrato publico localizado nas bases consultadas")
 
     # Quebra linhas longas para caber confortavelmente em A4
     wrapped_lines: List[str] = []
@@ -838,7 +1092,7 @@ def _generate_comparative_pdf_reportlab(companies: List[Dict[str, Any]]) -> byte
         Paragraph("<b>EMPRESA</b>", cell_head),
         Paragraph("<b>CNPJ</b>", cell_head),
         Paragraph("<b>PROCESSOS</b>", cell_head),
-        Paragraph("<b>SCORE RISCO</b>", cell_head),
+        Paragraph("<b>RISCO SUBSIDIÁRIO</b>", cell_head),
         Paragraph("<b>CENÁRIO</b>", cell_head),
         Paragraph("<b>RECOMENDAÇÃO</b>", cell_head),
     ]]
@@ -850,7 +1104,7 @@ def _generate_comparative_pdf_reportlab(companies: List[Dict[str, Any]]) -> byte
             Paragraph(comp["company_name"][:28], cell_body),
             Paragraph(comp["cnpj_formatted"], cell_body),
             Paragraph(str(comp["total_processes"]), cell_body),
-            Paragraph(f"{comp['exposure_score']:.1f}%", cell_body),
+            Paragraph(_format_pct(comp["economic"]["risco_sub"], "—"), cell_body),
             Paragraph(c_badge, cell_body),
             Paragraph(recom[:26], cell_body),
         ])
@@ -893,7 +1147,7 @@ def _generate_comparative_pdf_pure_python(companies: List[Dict[str, Any]]) -> by
     ]
     for comp in companies:
         lines.append(f"Empresa: {_ascii_latin1(comp['company_name'])}")
-        lines.append(f"CNPJ: {comp['cnpj_formatted']} | Processos: {comp['total_processes']} | Score: {comp['exposure_score']:.1f}%")
+        lines.append(f"CNPJ: {comp['cnpj_formatted']} | Processos: {comp['total_processes']} | Risco Subsidiario: {_format_pct(comp['economic']['risco_sub'], 'Nao informado')}")
         lines.append(f"Cenario: {_ascii_latin1(comp['economic']['cenario_badge'])}")
         lines.append(f"Recomendacao: {_ascii_latin1(comp['compliance']['recomendacao'])}")
         lines.append("----------------------------------------------------------------------")
@@ -945,7 +1199,7 @@ def generate_company_report_pdf(raw_data: Dict[str, Any]) -> bytes:
     Gera o PDF executivo v3.0 (HTML/CSS-to-PDF com WeasyPrint, Jinja2 e gráficos SVG).
     Cai com resiliência total para ReportLab e gerador PDF puro caso WeasyPrint falhe.
     """
-    report = normalize_report_payload(raw_data)
+    report = business_text(normalize_report_payload(raw_data))
     outcomes_svg = generate_outcomes_simplex_svg(report.get("outcomes"))
 
     is_cenario_b = not report.get("economic", {}).get("is_cenario_a", True)
@@ -1006,14 +1260,14 @@ def generate_comparative_report_pdf(raw_data: Any) -> bytes:
         if not companies_raw:
             companies_raw = [raw_data]
 
-    normalized_companies = [normalize_report_payload(c) for c in companies_raw[:5]]
+    normalized_companies = [business_text(normalize_report_payload(c)) for c in companies_raw[:5]]
     comp_chart_data = [
         {
             "nome": c["company_name"],
-            "score": c["exposure_score"],
+            "score": c["economic"]["risco_sub"],
             "processos": c["total_processes"],
         }
-        for c in normalized_companies
+        for c in normalized_companies if c["economic"]["risco_sub"] is not None
     ]
     comparative_svg = generate_comparative_bars_svg(comp_chart_data)
 

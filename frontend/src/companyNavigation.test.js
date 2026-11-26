@@ -8,6 +8,7 @@ test('abre links diretos e mantém o ID entre abas da empresa', () => {
   assert.equal(companyHash('processes', id), '#/processes/42');
   assert.equal(companyHash('predictions', id), '#/predictions/42');
   assert.equal(companyHash('history', id), '#/history');
+  assert.equal(companyHash('compare', id), '#/compare');
 });
 
 test('link compartilhado aponta para a visão geral da consulta', () => {
@@ -16,9 +17,11 @@ test('link compartilhado aponta para a visão geral da consulta', () => {
   assert.throws(() => companyShareUrl({ href: 'https://example.com/' }, null));
 });
 
-test('rotas antigas funcionam e IDs inválidos não são aceitos', () => {
+test('rotas antigas e novas funcionam e IDs inválidos não são aceitos', () => {
   assert.deepEqual(parseRoute('#/overview'), { page: 'overview', searchId: null });
   assert.deepEqual(parseRoute('#/history/2'), { page: 'history', searchId: null });
+  assert.deepEqual(parseRoute('#/compare'), { page: 'compare', searchId: null });
+  assert.deepEqual(parseRoute('#/compare/99'), { page: 'compare', searchId: null });
   assert.deepEqual(parseRoute('#/invalid'), { page: 'search', searchId: null });
   for (const id of ['0', '-2', 'foo', '12a', '1.5', '9007199254740992', null]) assert.equal(validSearchId(id), null);
 });

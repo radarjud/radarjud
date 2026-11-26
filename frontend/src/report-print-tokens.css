@@ -1,0 +1,18 @@
+/* RadarJus PDF v3 — standalone stylesheet for Jinja2/WeasyPrint. */
+:root{--rj-ink:#17283a;--rj-primary:#245a81;--rj-navy:#142335;--rj-accent:#674b3c;--rj-muted:#657586;--rj-paper:#ffffff;--rj-canvas:#f8f7f5;--rj-border:#eceff0;--rj-radius:15px;--rj-shadow:0 2px 12px #15243504;--rj-font:Inter,system-ui,Arial,sans-serif;--rj-a-bg:#e2f7ed;--rj-a-text:#1e7e48;--rj-b-bg:#fde8e8;--rj-b-text:#b82e2e;--rj-tst-bg:#e8f0f6;--rj-tst-text:#245a81}
+@page{size:A4 portrait;margin:15mm}
+.report-print{font-family:var(--rj-font);font-size:10pt;line-height:1.5;color:#17283a;background:#fff;overflow-wrap:break-word}
+.report-print h1{font-size:22pt;color:#245a81;margin:0 0 8pt}.report-print h2{font-size:14pt;margin:12pt 0 6pt;break-after:avoid;page-break-after:avoid}
+.report-print .report-badge{display:inline-block;padding:4pt 8pt;border-radius:10pt;font-size:8pt;font-weight:700}
+.report-print .scenario-a{background:#e2f7ed;color:#1e7e48;border:1px solid #bbf7d0}.report-print .scenario-b{background:#fde8e8;color:#b82e2e;border:1px solid #fecaca}.report-print .tst{background:#e8f0f6;color:#245a81;border:1px solid #d6e5ef}
+/* Table layout is compatible with PDF engines without CSS Grid support. */
+.report-print .report-kpis{display:table;width:100%;table-layout:fixed;border-spacing:4pt;break-inside:avoid;page-break-inside:avoid}
+.report-print .report-kpi{display:table-cell;border:1px solid #eceff0;border-radius:8pt;padding:8pt;vertical-align:top;background:#fff;box-shadow:0 2px 12px #15243504}
+.report-print .report-kpi strong{display:block;color:#245a81;font-size:18pt}.report-print .report-kpi small{color:#657586;font-size:8pt}
+.report-print .report-table{width:100%;border-collapse:collapse;table-layout:fixed}.report-print .report-table th,.report-print .report-table td{padding:6pt;border-bottom:1px solid #eceff0;text-align:left;overflow-wrap:break-word}.report-print .report-table th{background:#f1f4f6;color:#17283a}.report-print thead{display:table-header-group}.report-print tr{break-inside:avoid;page-break-inside:avoid}
+@media print{.report-print{print-color-adjust:exact;-webkit-print-color-adjust:exact}.report-print .report-no-print{display:none!important}}
+.report-print .report-decision{border-left:4pt solid #245a81;padding:12pt;background:#f4f7fa;break-inside:avoid}
+.report-print .report-decision h1{font-size:20pt;line-height:1.2}
+.report-print .report-primary-risk{font-size:26pt;font-weight:800;color:#245a81}
+.report-print .report-prescriptions{font-size:11pt;font-weight:700;line-height:1.4}
+.report-print .report-more{font-size:8pt;color:#526477}

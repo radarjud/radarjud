@@ -63,6 +63,11 @@ def create_app(config_name: str = None) -> Flask:
         from app.routes.api import cnj_proxy
         return cnj_proxy()
 
+    @app.route("/api/searches/<int:company_search_id>/processes", methods=["GET"])
+    def _api_searches_processes(company_search_id: int):
+        from app.routes.api import get_search_processes
+        return get_search_processes(company_search_id=company_search_id)
+
     # Rota raiz informativa
     @app.route("/", methods=["GET"])
     def index():
@@ -81,7 +86,8 @@ def create_app(config_name: str = None) -> Flask:
                 }
             }), 200
 
-    # Cria tabelas no banco de dados se não existirem
+    # Cria tabelas no banco de dados automaticamente no startup (PostgreSQL/SQLite)
+    from app import models as _registered_models  # noqa: F401 - garante registro dos modelos antes de create_all()
     with app.app_context():
         try:
             from app.models.tenant import Tenant  # noqa: F401
@@ -89,6 +95,8 @@ def create_app(config_name: str = None) -> Flask:
             from app.models.company_search import CompanySearch  # noqa: F401
             from app.models.process_record import ProcessRecord  # noqa: F401
             from app.models.CompanyRegistry import CompanyRegistry  # noqa: F401
+            from app.models.monitored_supplier import MonitoredSupplier  # noqa: F401
+            from app.models.public_contract_cache import PublicContractCache  # noqa: F401
             db.create_all()
             if db.engine.dialect.name == "postgresql":
                 with db.engine.connect() as conn:
@@ -99,9 +107,56 @@ def create_app(config_name: str = None) -> Flask:
                     conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS ai_analysis JSON;"))
                     conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS economic_standing JSON;"))
                     conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS ranking_motivos_condenacao JSON;"))
+                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS cnae_codigo VARCHAR(20);"))
+                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS cnae_descricao VARCHAR(255);"))
+                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS condenacoes_subsidiarias_tomadoras_count INTEGER DEFAULT 0;"))
+                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS tomadoras_subsidiarias_pj JSON;"))
+                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS contratos_poder_publico JSON;"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_company_searches_cnae_codigo ON company_searches (cnae_codigo);"))
+                    conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS cnae_codigo VARCHAR(20);"))
+                    conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS cnae_descricao VARCHAR(255);"))
+                    conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS public_contracts JSON;"))
+                    conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS public_contracts_cached_at TIMESTAMP;"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_company_registry_cnae_codigo ON company_registry (cnae_codigo);"))
+                    conn.execute(db.text("CREATE TABLE IF NOT EXISTS public_contracts_cache ("
+                                         "id SERIAL PRIMARY KEY, "
+                                         "cnpj VARCHAR(14) NOT NULL UNIQUE, "
+                                         "data JSON NOT NULL, "
+                                         "cached_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+                                         "ttl_seconds INTEGER NOT NULL DEFAULT 86400"
+                                         ");"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_public_contracts_cache_cnpj ON public_contracts_cache (cnpj);"))
                     conn.execute(db.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS observation VARCHAR(500);"))
+                    conn.execute(db.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS has_subsidiary_liability BOOLEAN DEFAULT FALSE;"))
+                    conn.execute(db.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS subsidiary_contractors_json JSON;"))
                     conn.execute(db.text("ALTER TABLE process_records ALTER COLUMN grau TYPE VARCHAR(50);"))
                     conn.execute(db.text("ALTER TABLE process_records ALTER COLUMN tribunal TYPE VARCHAR(50);"))
+                    conn.execute(db.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS data_distribuicao DATE;"))
+                    conn.execute(db.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS valor_causa NUMERIC(15, 2);"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_data_distribuicao ON process_records (data_distribuicao);"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_tribunal ON process_records (tribunal);"))
+                    conn.execute(db.text("CREATE UNIQUE INDEX IF NOT EXISTS uq_process_records_search_numero ON process_records (company_search_id, numero_processo);"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_tribunal_data ON process_records (company_search_id, tribunal, data_distribuicao);"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_valor ON process_records (company_search_id, valor_causa);"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_outcome ON process_records (company_search_id, sentence_outcome);"))
+                    conn.execute(db.text("CREATE TABLE IF NOT EXISTS monitored_suppliers ("
+                                         "id SERIAL PRIMARY KEY, "
+                                         "tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, "
+                                         "cnpj VARCHAR(20) NOT NULL, "
+                                         "company_name VARCHAR(255) NOT NULL, "
+                                         "last_movements_hash VARCHAR(64), "
+                                         "last_condenacoes_count INTEGER DEFAULT 0, "
+                                         "last_scenario VARCHAR(20) DEFAULT 'CENARIO_A', "
+                                         "last_rfb_status VARCHAR(50) DEFAULT 'ATIVA', "
+                                         "last_tst_count INTEGER DEFAULT 0, "
+                                         "webhook_url VARCHAR(500), "
+                                         "alert_email VARCHAR(255), "
+                                         "active BOOLEAN DEFAULT TRUE, "
+                                         "last_checked_at TIMESTAMP, "
+                                         "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                                         "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"))
+                    conn.execute(db.text("CREATE UNIQUE INDEX IF NOT EXISTS uq_monitored_suppliers_tenant_cnpj ON monitored_suppliers (tenant_id, cnpj);"))
+                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_monitored_suppliers_tenant_active ON monitored_suppliers (tenant_id, active);"))
                     conn.commit()
 
             # Pré-semeia e sincroniza CompanyRegistry com os metadados de grandes corporações para máxima velocidade
@@ -125,13 +180,23 @@ def create_app(config_name: str = None) -> Flask:
                             municipio=meta.get("municipio", "")[:150] or None,
                             uf=meta.get("uf", "")[:2] or None,
                             capital_social=meta_cap,
+                            cnae_codigo=meta.get("cnae_codigo"),
+                            cnae_descricao=meta.get("cnae_descricao"),
                             created_at=now,
                             updated_at=now,
                         )
                         db.session.add(reg)
-                    elif meta_cap > 0.0 and float(existing.capital_social or 0.0) == 0.0:
-                        existing.capital_social = meta_cap
-                        existing.updated_at = now
+                    else:
+                        changed = False
+                        if meta_cap > 0.0 and float(existing.capital_social or 0.0) == 0.0:
+                            existing.capital_social = meta_cap
+                            changed = True
+                        if not existing.cnae_codigo and meta.get("cnae_codigo"):
+                            existing.cnae_codigo = meta["cnae_codigo"]
+                            existing.cnae_descricao = meta.get("cnae_descricao")
+                            changed = True
+                        if changed:
+                            existing.updated_at = now
                 db.session.commit()
             except Exception as e_seed:
                 db.session.rollback()

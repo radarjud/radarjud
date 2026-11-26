@@ -1,26 +1,37 @@
 // Copyright (c) 2026 Equipe RadarJus - Todos os direitos reservados (Lei nº 9.609/1998).
 // Proibida a reprodução, distribuição ou uso comercial sem autorização expressa dos autores.
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  businessText,
+  subsidiaryRisk,
+  translateScanStatus
+} from './businessLabels.js';
+import './prescriptive.css';
+import ProcessFiltersBar from './ProcessFiltersBar.jsx';
+import { EMPTY_FILTERS, validateFilters, processQuery, advancedFiltersConfirmed } from './processFilters.js';
 import {
   Search, LayoutDashboard, FileText, ChartNoAxesCombined, History,
   Menu, X, ArrowRight, RefreshCw, AlertCircle, AlertTriangle, ShieldCheck, ShieldAlert,
   Info, ChevronRight, Building2, TrendingUp, Filter, CheckCircle2,
-  Check, Activity, BarChart3, Radar, Share2, Download, Library
+  Check, Activity, BarChart3, Radar, Share2, Download, Library, ArrowLeftRight
 } from 'lucide-react';
 import { companyHash, companyShareUrl, isCompanyPage, parseRoute, validSearchId } from './companyNavigation.js';
 import { CompanyLogo } from "./CompanyLogo.jsx";
+import { fetchPjePage, runBrowserDeepScan } from './services/pjeBrowserScanner.js';
 import CatalogPage, { normalizeCatalog, onlyDigits } from './CatalogPage.jsx';
+import ComparePage from './ComparePage.jsx';
 
 // Vite encaminha /api ao Flask. Defina VITE_API_BASE_URL se a API estiver em outro host.
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
 const PAGE_LABELS = {
   search: 'Pesquisar empresas', catalog: 'Catálogo de empresas', overview: 'Visão geral', processes: 'Processos',
-  predictions: 'Estimativas', history: 'Histórico',
+  predictions: 'Estimativas', history: 'Histórico', compare: 'Comparar empresas',
 };
 const NAV_ITEMS = [
   { id: 'search', icon: Search }, { id: 'catalog', icon: Library }, { id: 'overview', icon: LayoutDashboard },
   { id: 'processes', icon: FileText }, { id: 'predictions', icon: ChartNoAxesCombined },
+  { id: 'compare', icon: ArrowLeftRight },
   { id: 'history', icon: History },
 ];
 const OUTCOME_LABELS = {
@@ -31,6 +42,7 @@ const OUTCOME_LABELS = {
 };
 const CHART_COLORS = ['#245a81', '#674b3c', '#b79b85', '#8998a7'];
 const formatNumber = (value) => new Intl.NumberFormat('pt-BR').format(Number(value) || 0);
+const formatMoneyBRL = (value) => value == null ? null : new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(Number(value) || 0);
 const formatPercent = (value) => `${Number(value || 0).toLocaleString('pt-BR', { maximumFractionDigits: 1 })}%`;
 const formatProcessNumber = (raw) => {
   if (!raw) return 'Não informado';
@@ -107,19 +119,56 @@ function normalize(raw) {
   const isPrevisaoBloqueada = Boolean(payload.previsao_bloqueada) || (numCondenacoes === 0 && total > 0);
   const effectiveRiskScore = (total === 0 || isPrevisaoBloqueada) ? 0.0 : riskScore;
 
+  const subCount = Number(payload.condenacoes_subsidiarias_tomadoras_count ?? payload.condenacoes_subsidiarias_count ?? 0);
+  const subTomadoras = Array.isArray(payload.tomadoras_subsidiarias_pj) ? payload.tomadoras_subsidiarias_pj : [];
+  const subMsg = payload.mensagem_responsabilidade_subsidiaria || (
+    subCount > 0
+      ? `Histórico de Responsabilidade Subsidiária: ${subCount} processos com condenação subsidiária atribuída a contratantes anteriores`
+      : 'Nenhuma condenação subsidiária de contratante identificada na amostra'
+  );
+
+  const cpObj = isRecord(payload.contratos_poder_publico) ? payload.contratos_poder_publico : {};
+  const cpStatus = String(cpObj.status || 'DISPONIVEL').toUpperCase();
+  const cpTotal = typeof cpObj.total_contratos === 'number' ? cpObj.total_contratos : 0;
+  const cpEsferas = Array.isArray(cpObj.esferas) ? cpObj.esferas : [];
+  const cpOrgaos = Array.isArray(cpObj.orgaos_contratantes) ? cpObj.orgaos_contratantes : [];
+  const cpValorTotal = typeof cpObj.valor_global_total === 'number' ? cpObj.valor_global_total : null;
+  const cpValorFormatado = cpObj.valor_global_formatado || (cpValorTotal != null ? formatMoneyBRL(cpValorTotal) : null);
+  const cpMsg = cpObj.mensagem || (
+    cpStatus === 'INDISPONIVEL'
+      ? 'Base governamental temporariamente indisponível no momento da consulta.'
+      : (cpTotal === 0
+        ? 'Nenhum contrato público localizado nas bases consultadas'
+        : `${cpTotal} contrato(s) público(s) identificado(s) nas bases governamentais`)
+  );
+
   return {
     name: companyName,
     total: total,
     riskScore: effectiveRiskScore,
     overallRiskScore: effectiveRiskScore,
+    subsidiaryLiabilityCount: subCount,
+    subsidiaryContractorsPJ: subTomadoras,
+    subsidiaryMessage: subMsg,
+    publicContractsStatus: cpStatus,
+    publicContractsTotal: cpTotal,
+    publicContractsEsferas: cpEsferas,
+    publicContractsOrgaos: cpOrgaos,
+    publicContractsValorTotal: cpValorTotal,
+    publicContractsValorFormatado: cpValorFormatado,
+    publicContractsMensagem: cpMsg,
     reasons: Array.isArray(payload.ranking_motivos) ? payload.ranking_motivos : [],
     rankingCondenacoes: Array.isArray(payload.ranking_motivos_condenacao) ? payload.ranking_motivos_condenacao : [],
+    condenacaoPorMotivo: Array.isArray(payload.condenacao_por_motivo) ? payload.condenacao_por_motivo : [],
     outcomes: outcomesObj,
     secrecy: isRecord(payload.niveis_sigilo) ? payload.niveis_sigilo : null,
     predictions: Array.isArray(payload.plus_previsao_condenacao) ? payload.plus_previsao_condenacao : [],
     previsaoBloqueada: isPrevisaoBloqueada,
     motivoBloqueioPrevisao: payload.motivo_bloqueio_previsao || (isPrevisaoBloqueada ? 'Previsão de condenação desativada por ausência de passivo condenatório prévio na amostra (presunção de conformidade e integridade probatória - Súmula 331 TST).' : null),
     idoneidadeEconomica: econ,
+    sinaisSolvenciaPublica: payload.sinais_solvencia_publica || econ?.sinais_solvencia_publica || null,
+    subsidiaryRisk: subsidiaryRisk(rawEcon),
+    hasEconomicData: Boolean(rawEcon),
     logo: logo,
     processes: Array.isArray(payload.processos) ? payload.processos
       : Array.isArray(payload.process_records) ? payload.process_records : [],
@@ -132,54 +181,6 @@ function normalize(raw) {
     cacheLevel: payload.cache_level || null,
     isBroadBrand: Boolean(payload.is_broad_brand || payload.isBroadBrand || (companyName && companyName.includes('GRUPO CONSOLIDADO'))),
   };
-}
-
-async function prefetchFromComunicaPjeBrowser(termo) {
-  try {
-    const clean = String(termo || '').trim();
-    if (!clean || clean.length < 2) return [];
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 4000);
-    const cleanDigits = clean.replace(/\D/g, '');
-    const isDoc = cleanDigits.length === 14;
-    const targetUrl = isDoc
-      ? `https://comunicaapi.pje.jus.br/api/v1/comunicacao?numeroDocumento=${cleanDigits}&itensPorPagina=100`
-      : `https://comunicaapi.pje.jus.br/api/v1/comunicacao?nomeParte=${encodeURIComponent(clean)}&itensPorPagina=100`;
-
-    // Arquitetura Anti-Geoblocking:
-    // 1. Tenta Edge Proxy (/api/cnj-proxy) com execução forçada em São Paulo (gru1)
-    // 2. Fallback para fetch direto se proxy indisponível
-    let res = null;
-    try {
-      res = await fetch(`/api/cnj-proxy?target=${encodeURIComponent(targetUrl)}`, {
-        signal: controller.signal,
-        headers: { Accept: 'application/json' },
-      });
-    } catch {
-      res = null;
-    }
-
-    if (!res || !res.ok) {
-      try {
-        res = await fetch(targetUrl, {
-          signal: controller.signal,
-          headers: { Accept: 'application/json' },
-        });
-      } catch {
-        res = null;
-      }
-    }
-
-    clearTimeout(timer);
-    if (!res || !res.ok) return [];
-    const data = await res.json().catch(() => null);
-    if (Array.isArray(data)) return data;
-    if (data && Array.isArray(data.items)) return data.items;
-    if (data && Array.isArray(data.itens)) return data.itens;
-    return [];
-  } catch {
-    return [];
-  }
 }
 
 async function request(path, options = {}) {
@@ -355,7 +356,7 @@ function Overview({ data, navigate, catalogTerm }) {
   const classified = Object.values(outcomes).reduce((sum, value) => sum + Number(value || 0), 0);
   const ai = data?.aiAnalysis;
 
-  const isFastPath = data?.scanStatus === 'PARTIAL_FAST_PATH';
+  const isFastPath = ['PARTIAL_FAST_PATH', 'BROWSER_PENDING', 'SCANNING_BACKGROUND'].includes(data?.scanStatus);
   const isCompleted = data?.scanStatus === 'COMPLETED';
   const tstCount = (data?.processes || []).filter(p => p.is_tst_recurso || p.tribunal === 'tst' || String(p.grau || '').includes('TST')).length;
 
@@ -386,6 +387,7 @@ function Overview({ data, navigate, catalogTerm }) {
               Fast-Path ativo (&lt; 3s) · Varrendo em 2º plano
             </Tag>
           )}
+          {data?.scanStatus === 'BROWSER_PARTIAL' && <Tag type="amber">Varredura parcial encerrada</Tag>}
           {isCompleted && <Tag type="green"><Check size={13} style={{ display: 'inline', marginRight: '4px' }} /> Varredura Completa</Tag>}
           {tstCount > 0 && (
             <Tag type="purple">
@@ -400,187 +402,103 @@ function Overview({ data, navigate, catalogTerm }) {
         </div>
       </div>
 
-      <div className="stats">
-        <Stat
-          label="ÍNDICE DE EXPOSIÇÃO FINANCEIRA"
-          value={hasData && data.riskScore != null ? formatPercent(data.riskScore) : '—'}
-          hint={data?.previsaoBloqueada || data?.riskScore === 0 ? "Ausência de condenações (Risco mitigado)" : "Score geral estimado de impacto subsidiário"}
-          icon={AlertTriangle}
-          tone={data?.riskScore >= 60 ? 'red' : data?.riskScore >= 35 ? 'amber' : 'green'}
-        />
-        <Stat label="EVENTOS IDENTIFICADOS" value={hasData ? formatNumber(data.total) : '—'} hint="Registros localizados nas bases públicas oficiais" icon={FileText} />
-        <Stat label="VETORES DE RISCO" value={hasData ? formatNumber(reasons.length) : '—'} hint="Motivos e ocorrências operacionais" icon={Filter} />
-        <Stat label="DESFECHOS MAPEADOS" value={hasData ? formatNumber(classified) : '—'} hint="Inclui impactos confirmados, acordos e abertos" icon={CheckCircle2} />
-        <Stat label="TRANSPARÊNCIA DE DADOS" value={secrecyEntries.length ? 'Parcial' : 'Indisponível'} hint="Nível de visibilidade pública informado" icon={ShieldAlert} tone="amber" />
-      </div>
+      {hasData && <section className="prescriptive-hero" aria-label="Decisão e prescrição">
+        <div className="prescriptive-decision">
+          <div><div className="eyebrow">RECOMENDAÇÃO DE CONTRATAÇÃO</div>
+          <h2>{businessText(ai?.recomendacao_homologacao || ai?.recomendacao || 'Recomendação não disponível')}</h2>
+          <p>{data.hasEconomicData ? businessText(data.idoneidadeEconomica?.cenario_badge || data.idoneidadeEconomica?.cenario_titulo || '') : 'Dados de solvência indisponíveis'}</p></div>
+          <div className="prescriptive-risk"><small>RISCO SUBSIDIÁRIO</small><strong>{data.subsidiaryRisk == null ? '—' : formatPercent(data.subsidiaryRisk)}</strong><span>Estimativa de risco ao contratante · Súmula 331 TST</span></div>
+        </div>
+        <h3>O que fazer</h3>
+        {Array.isArray(ai?.recomendacoes_compliance) && ai.recomendacoes_compliance.length ? <ul>{ai.recomendacoes_compliance.map((item,i)=><li key={i}>{businessText(item)}</li>)}</ul> : <p>Prescrições ainda não disponibilizadas. Consulte o parecer antes de decidir.</p>}
+      </section>}
+      {/* Condenações por Motivo do Processo (US-18) */}
+      {((Array.isArray(data?.condenacaoPorMotivo) && data.condenacaoPorMotivo.length > 0) ||
+        (Array.isArray(data?.rankingCondenacoes) && data.rankingCondenacoes.length > 0)) && (
+        <Panel
+          title="Condenações por Motivo do Processo"
+          subtitle="Histórico de condenações por assunto e faixa provável de variação"
+        >
+          <div className="table-scroll">
+            <table className="responsive-table">
+              <thead>
+                <tr>
+                  <th>Motivo / Assunto do Processo</th>
+                  <th style={{ textAlign: 'right' }}>Processos Mapeados</th>
+                  <th style={{ textAlign: 'right' }}>Condenações</th>
+                  <th style={{ textAlign: 'right' }}>Taxa de Condenação</th>
+                  <th style={{ textAlign: 'right' }}>Faixa de Variação</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(data.condenacaoPorMotivo?.length ? data.condenacaoPorMotivo : data.rankingCondenacoes).map((item, index) => {
+                  const totalProc = item.total_processos ?? item.total ?? item.count ?? null;
+                  const condenacoes = item.condenacoes ?? item.quantidade_condenacoes ?? item.quantidade ?? 0;
+                  const taxa = item.taxa_condenacao ?? item.taxa_no_motivo ?? item.taxa_condenacao_no_motivo ?? item.taxa_perda_no_motivo ?? null;
+                  const faixa = item.faixa_variacao || "—";
+                  const isBlockedZero = condenacoes === 0;
 
-      {/* Idoneidade Econômica & Risco de Exposição Subsidiária */}
-      {data?.idoneidadeEconomica && (() => {
-        const econ = data.idoneidadeEconomica;
-        const isCenarioA = (econ.cenario_tipo === 'CENARIO_A') || (econ.cenario === 'CENARIO_A') || (econ.cenario_class === 'seguro');
-        const badgePorte = econ.badge_compatibilidade_porte || econ.observacao_porte || econ.capital_social_display?.observacao_porte;
-        const capitalFormatted = econ.capital_social_formatado || econ.valor_formatado || econ.capital_social_display?.valor_formatado || 'R$ 0,00';
-        const situacao = econ.situacao_cadastral || 'ATIVA';
-        const isSituacaoAtiva = situacao === 'ATIVA';
-        const probInsolv = Number(econ.probabilidade_insolvencia ?? econ.probabilidade_insolvencia_pct ?? 0);
-        const riscoCalote = Number(econ.risco_calote_subsidiario ?? econ.risco_calote_subsidiario_pct ?? 0);
-        const cenarioTitulo = econ.cenario_titulo || (isCenarioA ? 'Cenário A: Idoneidade Econômica Robusta • Risco de Transferência de Passivo Mitigado' : 'Cenário B: Risco Crítico de Transferência de Passivo (Alerta Máximo de Retenção)');
-        const cenarioDescricao = econ.cenario_descricao || econ.parecer_sumula_331 || '';
-        const cenarioBadge = econ.cenario_badge || (isCenarioA ? 'Cenário A · Solvência Comprovada' : 'Cenário B · Risco Crítico');
-        const subtituloUnidades = econ.subtitulo_unidades || econ.detalhe_filiais || 'Soma e lastro patrimonial consolidado cobrindo a matriz e todas as filiais ativas (IN RFB 2119/2022).';
+                  return (
+                    <tr key={`${item.motivo}-${index}`}>
+                      <td data-label="Motivo / Assunto" className="full-width">
+                        <b>{item.motivo}</b>
+                      </td>
+                      <td data-label="Processos Mapeados" style={{ textAlign: 'right' }}>
+                        <span>{totalProc == null ? "—" : formatNumber(totalProc)}</span>
+                      </td>
+                      <td data-label="Condenações" style={{ textAlign: 'right' }}>
+                        <span style={{ fontWeight: 600, color: condenacoes > 0 ? '#c34a4a' : '#25865a' }}>
+                          {formatNumber(condenacoes)}
+                        </span>
+                      </td>
+                      <td data-label="Taxa de Condenação" style={{ textAlign: 'right' }}>
+                        <Tag type={taxa == null ? 'gray' : isBlockedZero ? 'green' : taxa >= 60 ? 'red' : taxa >= 35 ? 'amber' : 'green'}>
+                          {taxa == null ? "—" : formatPercent(taxa)}
+                        </Tag>
+                      </td>
+                      <td data-label="Faixa de Variação" style={{ textAlign: 'right' }}>
+                        <span style={{ fontSize: '12px', color: '#556677', fontWeight: 500 }}>
+                          {faixa}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div className="muted-note" style={{ marginTop: '14px' }}>
+            <BarChart3 size={15} /> Taxas por assunto conforme os dados disponíveis. O símbolo — indica informação não disponibilizada.
+          </div>
+        </Panel>
+      )}
 
-        return (
-          <Panel
-            title="Idoneidade Econômica & Risco de Exposição Subsidiária"
-            subtitle="Auditoria de solvência, capital social e risco de transferência de passivo (Súmula 331 TST)"
-            action={
-              <Tag type={isCenarioA ? 'green' : 'red'}>
-                {cenarioBadge}
-              </Tag>
-            }
-          >
-            <div style={{ display: 'grid', gap: '16px' }}>
-              <div
-                style={{
-                  padding: '16px',
-                  borderRadius: '10px',
-                  border: isCenarioA ? '1px solid #bbf7d0' : '1px solid #fecaca',
-                  background: isCenarioA ? '#f0fdf4' : '#fef2f2',
-                  color: isCenarioA ? '#166534' : '#991b1b',
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  flexWrap: 'wrap',
-                  gap: '10px',
-                }}
-              >
-                <div>
-                  <strong style={{ display: 'block', fontSize: '15px', marginBottom: '4px' }}>
-                    {cenarioTitulo}
-                  </strong>
-                  <p style={{ margin: 0, fontSize: '13px', lineHeight: 1.5, opacity: 0.9 }}>
-                    {cenarioDescricao}
-                  </p>
-                </div>
-              </div>
 
-              <div className="econ-grid">
-                <div className="econ-badge econ-capital">
-                  <small style={{ color: '#245a81', fontWeight: 600 }}>
-                    {data?.isBroadBrand || (econ?.unidades_identificadas > 1)
-                      ? 'Capital Social Consolidado (Matriz + Filiais):'
-                      : 'Capital Social Cadastral (Receita Federal):'}
-                  </small>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: '10px', marginTop: '4px', marginBottom: '4px' }}>
-                    <strong style={{ fontSize: '20px', color: '#17283a', lineHeight: 1.2 }}>
-                      {capitalFormatted}
-                    </strong>
-                    {badgePorte && (
-                      <span style={{
-                        fontSize: '11px',
-                        fontWeight: 600,
-                        padding: '3px 8px',
-                        borderRadius: '6px',
-                        background: '#e8f0f6',
-                        color: '#245a81',
-                        border: '1px solid #cdd7df'
-                      }}>
-                        {badgePorte}
-                      </span>
-                    )}
-                  </div>
-                  <small style={{ color: '#68798a', fontSize: '11px' }}>
-                    {subtituloUnidades}
-                  </small>
-                </div>
-
-                <div className="econ-badge">
-                  <small style={{ color: '#245a81', fontWeight: 600 }}>Situação Cadastral RFB:</small>
-                  <strong style={{ fontSize: '16px', color: isSituacaoAtiva ? '#25865a' : '#c34a4a', marginTop: '4px' }}>
-                    {situacao}
-                  </strong>
-                  <small style={{ color: '#68798a', fontSize: '11px' }}>
-                    {isSituacaoAtiva ? 'Sem bloqueios cadastrais' : 'Restrição cadastral na RFB'}
-                  </small>
-                </div>
-
-                <div className="econ-badge">
-                  <small style={{ color: '#245a81', fontWeight: 600 }}>Probabilidade de Insolvência:</small>
-                  <strong style={{ fontSize: '16px', color: probInsolv >= 30 ? '#c34a4a' : probInsolv >= 15 ? '#b67b23' : '#25865a', marginTop: '4px' }}>
-                    {formatPercent(probInsolv)}
-                  </strong>
-                  <small style={{ color: '#68798a', fontSize: '11px' }}>
-                    Modelo atuarial de solvência
-                  </small>
-                </div>
-
-                <div className="econ-badge">
-                  <small style={{ color: '#245a81', fontWeight: 600 }}>Risco de Exposição Subsidiária:</small>
-                  <strong style={{ fontSize: '16px', color: riscoCalote >= 20 ? '#c34a4a' : riscoCalote >= 10 ? '#b67b23' : '#25865a', marginTop: '4px' }}>
-                    {formatPercent(riscoCalote)}
-                  </strong>
-                  <small style={{ color: '#68798a', fontSize: '11px' }}>
-                    Súmula 331 TST / Impacto ao Contratante
-                  </small>
-                </div>
-
-                <div className="econ-badge">
-                  <small style={{ color: '#245a81', fontWeight: 600 }}>Sanções e Débitos Federais:</small>
-                  <strong style={{ fontSize: '15px', color: (econ.possui_sancoes_cgu || econ.possui_divida_ativa) ? '#c34a4a' : '#25865a', marginTop: '4px' }}>
-                    {(econ.possui_sancoes_cgu || econ.possui_divida_ativa) ? 'Constam Apontamentos' : 'Nada Consta'}
-                  </strong>
-                  <small style={{ color: '#68798a', fontSize: '11px' }}>
-                    CEIS/CNEP/CEPIM &amp; PGFN
-                  </small>
-                </div>
-              </div>
-            </div>
-          </Panel>
-        );
-      })()}
-
+      {hasData && <Panel title="Diligência complementar" subtitle="Informações para verificar antes da contratação">
+        {data.sinaisSolvenciaPublica?.resumo_solvencia ? (
+          <p><strong>Solvência e Certidões:</strong> {businessText(data.sinaisSolvenciaPublica.resumo_solvencia)}</p>
+        ) : (
+          <p>Histórico de responsabilidade subsidiária, contratos públicos e alertas de PEP: dados específicos não disponibilizados nesta consulta.</p>
+        )}
+        {data.sinaisSolvenciaPublica?.orientacao_homologacao && (
+          <p style={{ color: '#245a81', fontWeight: 600 }}>
+            📌 Orientação de Homologação: {businessText(data.sinaisSolvenciaPublica.orientacao_homologacao)}
+          </p>
+        )}
+        {data.hasEconomicData && <p>Restrições federais: {data.idoneidadeEconomica.possui_sancoes_cgu || data.idoneidadeEconomica.possui_divida_ativa ? 'Apontamentos informados' : 'Consulte as bases oficiais para confirmação'}.</p>}
+      </Panel>}
       {/* Parecer do Consultor de Inteligência Artificial (Agente ADK radarjusAgent) */}
       {ai && (
         <Panel
-          title="Diagnóstico Executivo & Compliance (Agente ADK · IA)"
-          subtitle={`Parecer técnico gerado via ${ai.modelo_utilizado || 'IA Preditiva'}${ai.orquestrador ? ` · ${ai.orquestrador}` : ''}`}
-          action={
-            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
-              {ai.recomendacao_homologacao && (
-                <Tag
-                  type={
-                    ai.recomendacao_homologacao.includes('SEM RESTRIÇÕES') ||
-                    ai.recomendacao_homologacao.includes('APROVAR') ||
-                    ai.recomendacao_homologacao.includes('MITIGADO')
-                      ? 'green'
-                      : ai.recomendacao_homologacao.includes('RETENÇÃO')
-                        ? 'amber'
-                        : 'red'
-                  }
-                >
-                  Súmula 331 TST: {ai.recomendacao_homologacao}
-                </Tag>
-              )}
-              <Tag type={ai.perfil_risco_consolidado?.includes('Baixo') ? 'green' : ai.perfil_risco_consolidado?.includes('Moderado') ? 'amber' : 'red'}>
-                Risco: {ai.perfil_risco_consolidado || 'Geral'}
-              </Tag>
-            </div>
-          }
+          title="Resumo executivo da IA"
+          subtitle="Síntese para compras e compliance"
         >
           <div style={{ display: 'grid', gap: '16px' }}>
             <p style={{ margin: 0, fontSize: '14px', lineHeight: '1.7', color: '#273b4e' }}>
-              {ai.resumo_executivo || ai.parecer_governanca}
+              {businessText(ai.resumo_executivo || ai.parecer_governanca)}
             </p>
             {ai.taxa_historica_vitoria_empresa_pct != null && (
               <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap', padding: '12px 16px', background: '#f5f8fa', borderRadius: '10px' }}>
-                {ai.taxa_historica_condenacao_pct != null && (
-                  <div>
-                    <small style={{ color: '#68798a', display: 'block' }}>Taxa Histórica de Impactos Confirmados:</small>
-                    <strong style={{ fontSize: '18px', color: ai.taxa_historica_condenacao_pct >= 60 ? '#c34a4a' : ai.taxa_historica_condenacao_pct >= 35 ? '#b67b23' : '#25865a' }}>
-                      {formatPercent(ai.taxa_historica_condenacao_pct)}
-                    </strong>
-                  </div>
-                )}
                 <div>
                   <small style={{ color: '#68798a', display: 'block' }}>Taxa Histórica de Risco Mitigado (Favorável):</small>
                   <strong style={{ fontSize: '18px', color: '#25865a' }}>{formatPercent(ai.taxa_historica_vitoria_empresa_pct)}</strong>
@@ -598,17 +516,7 @@ function Overview({ data, navigate, catalogTerm }) {
                 <b style={{ display: 'block', fontSize: '13px', marginBottom: '6px', color: '#b67b23' }}>Alertas Súmula 331 do TST (Agente ADK):</b>
                 <ul style={{ margin: 0, paddingLeft: '20px', fontSize: '12px', lineHeight: '1.6', color: '#556677' }}>
                   {ai.alertas_sumula_331.map((alerta, i) => (
-                    <li key={i}>{alerta}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {Array.isArray(ai.recomendacoes_compliance) && ai.recomendacoes_compliance.length > 0 && (
-              <div>
-                <b style={{ display: 'block', fontSize: '13px', marginBottom: '8px', color: '#245a81' }}>Recomendações Preventivas de Governança:</b>
-                <ul style={{ margin: 0, paddingLeft: '20px', fontSize: '12px', lineHeight: '1.6', color: '#556677' }}>
-                  {ai.recomendacoes_compliance.map((rec, i) => (
-                    <li key={i}>{rec}</li>
+                    <li key={i}>{businessText(alerta)}</li>
                   ))}
                 </ul>
               </div>
@@ -617,35 +525,12 @@ function Overview({ data, navigate, catalogTerm }) {
         </Panel>
       )}
 
-      {/* Ranking de Vetores Principais de Exposição */}
-      {Array.isArray(data?.rankingCondenacoes) && data.rankingCondenacoes.length > 0 && (
-        <Panel
-          title="Ranking de Vetores Principais de Exposição"
-          subtitle="Assuntos com histórico confirmado de desembolso financeiro que calibram o motor preditivo"
-        >
-          <div className="bars">
-            {data.rankingCondenacoes.slice(0, 6).map((item, index) => {
-              const barWidth = Math.max(8, item.taxa_no_motivo || item.taxa_condenacao_no_motivo || item.percentual || 0);
-              const labelDireita = item.label_direita || `${item.condenacoes || item.quantidade_condenacoes || item.quantidade || 0} condenações (${item.taxa_no_motivo || item.taxa_condenacao_no_motivo || item.taxa_perda_no_motivo || 0}% de perda no motivo)`;
-              return (
-                <div className="bar-item" key={`${item.motivo}-${index}`}>
-                  <div className="bar-top">
-                    <span title={item.motivo} style={{ fontWeight: 600 }}>{item.motivo}</span>
-                    <b style={{ color: '#c34a4a' }}>{labelDireita}</b>
-                  </div>
-                  <div className="track">
-                    <div style={{ width: `${Math.min(100, barWidth)}%`, background: '#c34a4a' }} />
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-          <div className="muted-note" style={{ marginTop: '14px' }}>
-            <BarChart3 size={15} /> Calibragem bayesiana contínua: os temas acima possuem desfechos confirmados que elevam o prior beta do modelo preditivo.
-          </div>
-        </Panel>
-      )}
-
+      {hasData && <div className="prescriptive-volume">
+        <Stat label="PROCESSOS ANALISADOS" value={formatNumber(data.total)} icon={FileText}/>
+        {Object.entries(OUTCOME_LABELS).map(([key,label])=><Stat key={key} label={label} value={formatNumber(outcomes[key])} icon={Activity}/>)}
+        <Stat label="VETORES DE RISCO" value={formatNumber(reasons.length)} icon={Filter}/>
+        <Stat label="PROCESSOS NO TST" value={formatNumber(tstCount)} icon={TrendingUp}/>
+      </div>}
       <div className="two-col">
         <Panel title="Vetores mais recorrentes" subtitle="Frequência entre os registros identificados" action={<button className="text-button" onClick={() => navigate('processes')}>Ver processos <ArrowRight size={15} /></button>}>
           {reasons.length ? (
@@ -713,14 +598,188 @@ function Overview({ data, navigate, catalogTerm }) {
           </div>
         </Panel>
       </div>
+      {/* Idoneidade Econômica & Risco de Exposição Subsidiária */}
+      {data?.hasEconomicData && (() => {
+        const econ = data.idoneidadeEconomica;
+        const sinais = data.sinaisSolvenciaPublica || econ?.sinais_solvencia_publica || {};
+        const isCenarioA = (econ.cenario_tipo === 'CENARIO_A') || (econ.cenario === 'CENARIO_A') || (econ.cenario_class === 'seguro');
+        const badgePorte = econ.badge_compatibilidade_porte || econ.observacao_porte || econ.capital_social_display?.observacao_porte;
+        const capitalFormatted = econ.capital_social_formatado || econ.valor_formatado || econ.capital_social_display?.valor_formatado || 'R$ 0,00';
+        const situacao = econ.situacao_cadastral || 'Não informado';
+        const isSituacaoAtiva = situacao === 'ATIVA';
+        const probInsolv = econ.probabilidade_insolvencia ?? econ.probabilidade_insolvencia_pct;
+        const riscoCalote = Number(econ.risco_calote_subsidiario ?? econ.risco_calote_subsidiario_pct ?? 0);
+        const cenarioTitulo = econ.cenario_titulo || (isCenarioA ? 'Cenário A: Idoneidade Econômica Robusta • Risco de Transferência de Passivo Mitigado' : 'Cenário B: Risco Crítico de Transferência de Passivo (Alerta Máximo de Retenção)');
+        const cenarioDescricao = econ.cenario_descricao || econ.parecer_sumula_331 || '';
+        const cenarioBadge = econ.cenario_badge || (isCenarioA ? 'Cenário A · Solvência Comprovada' : 'Cenário B · Risco Crítico');
+        const subtituloUnidades = econ.subtitulo_unidades || econ.detalhe_filiais || 'Soma e lastro patrimonial consolidado cobrindo a matriz e todas as filiais ativas (IN RFB 2119/2022).';
+
+        return (
+          <details className="prescriptive-more"><summary>Mais informações</summary>
+            <div style={{ display: 'grid', gap: '16px' }}>
+              <div
+                style={{
+                  padding: '16px',
+                  borderRadius: '10px',
+                  border: isCenarioA ? '1px solid #bbf7d0' : '1px solid #fecaca',
+                  background: isCenarioA ? '#f0fdf4' : '#fef2f2',
+                  color: isCenarioA ? '#166534' : '#991b1b',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                  gap: '10px',
+                }}
+              >
+                <div>
+                  <strong style={{ display: 'block', fontSize: '15px', marginBottom: '4px' }}>
+                    {businessText(cenarioTitulo)}
+                  </strong>
+                  <p style={{ margin: 0, fontSize: '13px', lineHeight: 1.5, opacity: 0.9 }}>
+                    {businessText(cenarioDescricao)}
+                  </p>
+                </div>
+              </div>
+
+              <div className="econ-grid">
+                <div className="econ-badge econ-capital">
+                  <small style={{ color: '#245a81', fontWeight: 600 }}>
+                    {data?.isBroadBrand || (econ?.unidades_identificadas > 1)
+                      ? 'Capital Social Consolidado (Matriz + Filiais):'
+                      : 'Capital Social Cadastral (Receita Federal):'}
+                  </small>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: '10px', marginTop: '4px', marginBottom: '4px' }}>
+                    <strong style={{ fontSize: '20px', color: '#17283a', lineHeight: 1.2 }}>
+                      {capitalFormatted}
+                    </strong>
+                    {badgePorte && (
+                      <span style={{
+                        fontSize: '11px',
+                        fontWeight: 600,
+                        padding: '3px 8px',
+                        borderRadius: '6px',
+                        background: '#e8f0f6',
+                        color: '#245a81',
+                        border: '1px solid #cdd7df'
+                      }}>
+                        {badgePorte}
+                      </span>
+                    )}
+                  </div>
+                  <small style={{ color: '#68798a', fontSize: '11px' }}>
+                    {subtituloUnidades}
+                  </small>
+                </div>
+
+                <div className="econ-badge">
+                  <small style={{ color: '#245a81', fontWeight: 600 }}>Situação Cadastral RFB:</small>
+                  <strong style={{ fontSize: '16px', color: isSituacaoAtiva ? '#25865a' : '#c34a4a', marginTop: '4px' }}>
+                    {situacao}
+                  </strong>
+                  <small style={{ color: '#68798a', fontSize: '11px' }}>
+                    {isSituacaoAtiva ? 'Sem bloqueios cadastrais' : 'Restrição cadastral na RFB'}
+                  </small>
+                </div>
+
+                <div className="econ-badge">
+                  <small style={{ color: '#245a81', fontWeight: 600 }}>Probabilidade de Insolvência:</small>
+                  <strong style={{ fontSize: '16px', color: probInsolv >= 30 ? '#c34a4a' : probInsolv >= 15 ? '#b67b23' : '#25865a', marginTop: '4px' }}>
+                    {probInsolv == null ? "Não informado" : formatPercent(probInsolv)}
+                  </strong>
+                  <small style={{ color: '#68798a', fontSize: '11px' }}>
+                    Estimativa de solvência
+                  </small>
+                </div>
+
+                <div className="econ-badge">
+                  <small style={{ color: '#245a81', fontWeight: 600 }}>Sanções e Débitos Federais:</small>
+                  <strong style={{ fontSize: '15px', color: (econ.possui_sancoes_cgu || econ.possui_divida_ativa) ? '#c34a4a' : '#25865a', marginTop: '4px' }}>
+                    {(econ.possui_sancoes_cgu || econ.possui_divida_ativa) ? 'Constam Apontamentos' : (econ.possui_sancoes_cgu === false && econ.possui_divida_ativa === false ? 'Nada Consta informado' : 'Não informado')}
+                  </strong>
+                  <small style={{ color: '#68798a', fontSize: '11px' }}>
+                    CEIS/CNEP/CEPIM &amp; PGFN
+                  </small>
+                </div>
+              </div>
+
+              {/* Sinais Públicos de Solvência e Certidões (US-22) */}
+              {Array.isArray(sinais?.fontes_consultadas) && sinais.fontes_consultadas.length > 0 && (
+                <div style={{ marginTop: '12px', background: '#f8fafc', padding: '14px', borderRadius: '8px', border: '1px solid #e2e8f0' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap', gap: '6px' }}>
+                    <strong style={{ fontSize: '13px', color: '#1e293b' }}>
+                      Fontes e Certidões Públicas Verificadas
+                    </strong>
+                    <span style={{ fontSize: '12px', color: '#475569' }}>
+                      Demonstrações Contábeis: <b>{sinais.demonstracao_contabil_status || 'Demonstração contábil pública indisponível'}</b>
+                    </span>
+                  </div>
+                  <div style={{ display: 'grid', gap: '8px' }}>
+                    {sinais.fontes_consultadas.map((f, idx) => (
+                      <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px', padding: '8px 10px', background: '#fff', borderRadius: '6px', border: '1px solid #edf2f7', flexWrap: 'wrap', gap: '8px' }}>
+                        <span style={{ color: '#334155' }}>
+                          <strong>{f.fonte}:</strong> {f.detalhe}
+                        </span>
+                        <span style={{
+                          fontWeight: 600,
+                          padding: '2px 8px',
+                          borderRadius: '4px',
+                          fontSize: '11px',
+                          background: f.status === 'Regular' ? '#dcfce7' : f.status === 'Restrição identificada' ? '#fee2e2' : '#f1f5f9',
+                          color: f.status === 'Regular' ? '#166534' : f.status === 'Restrição identificada' ? '#991b1b' : '#475569',
+                        }}>
+                          {f.status}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          <p>Status da varredura: {translateScanStatus(data.scanStatus)} · Desfechos mapeados: {formatNumber(classified)} · Transparência: {secrecyEntries.length ? "Parcial" : "Indisponível"}</p><p>Estimativa baseada no histórico e porte; faixa provável de variação (90% de confiança) quando disponível.</p></details>
+        );
+      })()}
+
     </div>
   );
 }
 
 function Processes({ data }) {
-  const [filter, setFilter] = useState('');
-  const processes = data?.processes || [];
-  const list = processes.filter((process) => JSON.stringify(process).toLowerCase().includes(filter.toLowerCase()));
+  return <ProcessResults key={data?.searchId ?? 'none'} data={data} />;
+}
+
+function ProcessResults({ data }) {
+  const [filters, setFilters] = useState({...EMPTY_FILTERS});
+  const [page, setPage] = useState(1);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const validation = validateFilters(filters);
+  const searchId = validSearchId(data?.searchId);
+  const query = processQuery(filters, page);
+  const resultKey = `${searchId}:${query}:${data?.total}`;
+  const current = result?.key === resultKey ? result.body : null;
+  const list = current?.processes || [];
+  useEffect(() => {
+    if (!searchId || validation) return;
+    const controller = new AbortController();
+    setError('');
+    setLoading(true);
+    const timer = setTimeout(async () => {
+      try {
+        const body = await request(`/searches/${searchId}/processes?${query}`, {signal:controller.signal});
+        if (controller.signal.aborted) return;
+        if (!advancedFiltersConfirmed(filters, body)) throw new Error('A API ainda não confirmou os filtros de período/valor (US-08).');
+        if (!Array.isArray(body.processes) || !Number.isFinite(body.total)) throw new Error('Resposta de listagem inválida.');
+        setResult({key:resultKey,body});
+      } catch (err) {
+        if (!controller.signal.aborted) setError(err.message || 'Falha ao listar processos.');
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    }, 300);
+    return () => {clearTimeout(timer);controller.abort();};
+  }, [resultKey, validation]);
+  const updateFilters = next => {setFilters(next);setPage(1);setError('');};
   return (
     <div className="stack">
       <div className="section-intro">
@@ -731,17 +790,18 @@ function Processes({ data }) {
         </div>
       </div>
       <Panel title="Registros individuais" subtitle="Lista de processos judiciais vinculados à empresa">
-        <div className="filter-row">
-          <Search size={18} />
-          <input
-            value={filter}
-            onChange={(event) => setFilter(event.target.value)}
-            placeholder="Filtrar por número, assunto, desfecho ou observação..."
-            aria-label="Filtrar processos"
-            disabled={!processes.length}
-          />
-        </div>
-        {processes.length ? (
+        <ProcessFiltersBar filters={filters} onChange={updateFilters} disabled={!searchId} error={validation}/>
+        {searchId && !validation && !current && !error && <p role="status">Consultando processos…</p>}
+        {!validation && error && <p role="alert" className="process-filter-error">{error}</p>}
+        {current && !validation && <div className="process-pagination" aria-live="polite">
+          <span>Exibindo {list.length} de {current.total} processos{data?.total != null && current.total !== data.total ? ` (${data.total} na consulta)` : ''}</span>
+          <div className="process-pagination-controls">
+            <button className="secondary" disabled={page<=1 || loading} onClick={()=>setPage(p=>p-1)}>Anterior</button>
+            <span>Página {page} de {current.total_pages || 1}</span>
+            <button className="secondary" disabled={page >= (current.total_pages || 1) || loading} onClick={()=>setPage(p=>p+1)}>Próxima</button>
+          </div>
+        </div>}
+        {current && !validation ? (
           <div className="table-scroll">
             <table className="responsive-table">
               <thead>
@@ -759,7 +819,7 @@ function Processes({ data }) {
                     <td data-label="Processo" className="mono full-width">
                       <div className="process-cell-content">
                         <span className="process-number-text">{formatProcessNumber(process.numero_processo || process.process_number)}</span>
-                        {(process.is_tst_recurso || process.tribunal === 'tst' || String(process.grau || '').includes('TST')) && (
+                        {(process.is_tst_recurso || String(process.tribunal || '').toUpperCase() === 'TST' || String(process.grau || '').includes('TST')) && (
                           <Tag type="purple">Instância Superior TST</Tag>
                         )}
                       </div>
@@ -773,9 +833,9 @@ function Processes({ data }) {
                       </Tag>
                     </td>
                     <td data-label="Segredo de Justiça">
-                      {process.secrecy_level != null ? (
-                        <Tag type={Number(process.secrecy_level) > 0 ? 'amber' : 'gray'}>
-                          Nível {process.secrecy_level}
+                      {(process.secrecy_level ?? process.nivel_sigilo) != null ? (
+                        <Tag type={Number(process.secrecy_level ?? process.nivel_sigilo) > 0 ? 'amber' : 'gray'}>
+                          Nível {process.secrecy_level ?? process.nivel_sigilo}
                         </Tag>
                       ) : '—'}
                     </td>
@@ -785,7 +845,7 @@ function Processes({ data }) {
                           Assunto identificado via publicação PJe
                         </span>
                       ) : (
-                        <span style={{ color: '#8899a6', fontSize: '11px' }}>Metadados TPU oficiais</span>
+                        <span style={{ color: '#8899a6', fontSize: '11px' }}>{process.observation || (process.inferred_from_djen_text === false ? 'Metadados TPU oficiais' : 'Não informado')}</span>
                       )}
                     </td>
                   </tr>
@@ -794,9 +854,9 @@ function Processes({ data }) {
             </table>
             {!list.length && <Empty title="Nenhum resultado para o filtro" description="Experimente outro termo." />}
           </div>
-        ) : (
+        ) : !searchId ? (
           <Empty icon={FileText} title="Nenhum processo disponível" description={data ? 'A API não forneceu registros individuais nesta consulta.' : 'A lista será preenchida quando uma pesquisa retornar processos individuais.'} />
-        )}
+        ) : null}
       </Panel>
       <div className="info-banner">
         <Info size={19} /> Processos rotulados com "Assunto identificado via publicação PJe" tiveram seu tema extraído diretamente do texto da publicação quando os dados oficiais registravam apenas "Outros Assuntos".
@@ -813,20 +873,20 @@ function Predictions({ data }) {
         <div>
           <div className="eyebrow">EMPRESA / ESTIMATIVAS</div>
           <h1>Previsão de Desfecho nos Processos Abertos</h1>
-          <p>{data ? `Distribuição posterior Dirichlet-Multinomial (Vitória, Acordo e Condenação) com Intervalo de Credibilidade 90% (${data.name}).` : 'Aguardando dados de uma consulta.'}</p>
+          <p>{data ? `Estimativa baseada no histórico (Vitória, Acordo e Condenação), com faixa provável de variação (90% de confiança) (${data.name}).` : 'Aguardando dados de uma consulta.'}</p>
         </div>
-        <Tag type="blue">Dirichlet-Multinomial · IC 90% Beta</Tag>
+        <Tag type="blue">Estimativa baseada no histórico</Tag>
       </div>
 
       <div className="info-banner warning">
         <Activity size={20} />
         <div>
-          <b>Modelo Conjugado Dirichlet-Multinomial &amp; Intervalo de Credibilidade Beta (90%)</b>
-          <p>Separa explicitamente a probabilidade de Improcedência (risco mitigado), Acordo e Condenação (impacto confirmado) com shrinkage Empirical Bayes, ajuste de perícia em escala logit e projeção de impactos esperados na carteira aberta.</p>
+          <b>Estimativa baseada no histórico e faixa provável de variação (90% de confiança)</b>
+          <p>Estima os possíveis desfechos dos processos abertos com base no histórico disponível e na incerteza da amostra.</p>
         </div>
       </div>
 
-      <Panel title="Probabilidade Posterior nos Processos Abertos" subtitle="Distribuição tripartida e Intervalo de Credibilidade de 90% por motivo">
+      <Panel title="Estimativa de desfechos nos processos abertos" subtitle="Faixa provável de variação (90% de confiança) por motivo">
         {predictions.length ? (
           <div className="table-scroll">
             <table className="responsive-table">
@@ -836,7 +896,7 @@ function Predictions({ data }) {
                   <th>Vitória (Improcedência)</th>
                   <th>Acordo</th>
                   <th>Condenação</th>
-                  <th>IC 90% (Condenação)</th>
+                  <th>Faixa provável (90% de confiança)</th>
                   <th>Abertos (Cond. Esperadas)</th>
                   <th>Diagnóstico</th>
                 </tr>
@@ -869,7 +929,7 @@ function Predictions({ data }) {
                           {formatPercent(probCond)}
                         </span>
                       </td>
-                      <td data-label="IC 90% (Condenação)">
+                      <td data-label="Faixa provável (90% de confiança)">
                         {hasIC ? (
                           <span style={{ fontSize: '12px', color: '#556677' }}>
                             [{formatPercent(prediction.ic_90_inferior_pct)} – {formatPercent(prediction.ic_90_superior_pct)}]
@@ -891,7 +951,7 @@ function Predictions({ data }) {
                       </td>
                       <td data-label="Diagnóstico" className="full-width">
                         <Tag type={isHighWin ? 'green' : isMidWin ? 'amber' : 'red'}>
-                          {prediction.diagnostico_chance_vitoria || (isHighWin ? 'Alta probabilidade de êxito' : isMidWin ? 'Risco equilibrado' : 'Alto risco de condenação')}
+                          {businessText(prediction.diagnostico_chance_vitoria) || (isHighWin ? 'Alta probabilidade de êxito' : isMidWin ? 'Risco equilibrado' : 'Alto risco de condenação')}
                         </Tag>
                       </td>
                     </tr>
@@ -925,10 +985,6 @@ function Predictions({ data }) {
             </p>
             <div style={{ display: 'flex', justifyContent: 'center', gap: '16px', flexWrap: 'wrap', marginTop: '16px' }}>
               <div style={{ padding: '14px 24px', background: '#f8fafb', border: '1px solid #e1e7ec', borderRadius: '10px' }}>
-                <small style={{ display: 'block', color: '#68798a', fontSize: '11px', marginBottom: '4px' }}>Probabilidade de Condenação:</small>
-                <strong style={{ fontSize: '22px', color: '#25865a' }}>0,0%</strong>
-              </div>
-              <div style={{ padding: '14px 24px', background: '#f8fafb', border: '1px solid #e1e7ec', borderRadius: '10px' }}>
                 <small style={{ display: 'block', color: '#68798a', fontSize: '11px', marginBottom: '4px' }}>Impacto Subsidiário Estimado:</small>
                 <strong style={{ fontSize: '22px', color: '#245a81' }}>Risco Mitigado (0,0%)</strong>
               </div>
@@ -941,15 +997,15 @@ function Predictions({ data }) {
         <div className="explain-grid">
           <div>
             <b>Vitória vs. Acordo vs. Condenação</b>
-            <p>Acordos não são contabilizados como vitória da empresa. As três probabilidades posteriores somam 100% em cada motivo.</p>
+            <p>Acordos não são contabilizados como vitória da empresa. As três probabilidades estimadas somam 100% em cada motivo.</p>
           </div>
           <div>
-            <b>Intervalo de Credibilidade Beta (IC 90%)</b>
-            <p>Mede a incerteza real da amostra [p5, p95] e aplica desconto por censura à direita quando há muitos processos em aberto.</p>
+            <b>Faixa provável de variação (90% de confiança)</b>
+            <p>Expressa a incerteza da estimativa considerando o histórico e os processos ainda em aberto.</p>
           </div>
           <div>
             <b>Impactos Esperados nos Abertos</b>
-            <p>Projeta o passivo esperado multiplicando o volume de processos abertos pela probabilidade posterior de impacto financeiro do motivo.</p>
+            <p>Projeta o passivo esperado multiplicando o volume de processos abertos pela probabilidade estimada de impacto financeiro do motivo.</p>
           </div>
         </div>
       </Panel>
@@ -1030,6 +1086,7 @@ function CompanyShareActions({ data }) {
         desfechos_sentencas: data.outcomes || {},
         ranking_motivos: data.reasons || [],
         ranking_motivos_condenacao: data.rankingCondenacoes || [],
+        condenacao_por_motivo: data.condenacaoPorMotivo || [],
         plus_previsao_condenacao: data.predictions || [],
         idoneidade_economica: data.idoneidadeEconomica || {},
         ai_analysis: data.aiAnalysis || {},
@@ -1115,6 +1172,16 @@ export default function App() {
   const visibleData = needsSharedData ? null : data;
   const [catalog, setCatalog] = useState({ term: '', items: [], busy: false, error: '', unavailable: false, suggestion: '' });
   const [analyzing, setAnalyzing] = useState('');
+  const activeSearch = useRef(null);
+  const [scanProgress, setScanProgress] = useState(null);
+  function cancelSearch() {
+    activeSearch.current?.abort();
+    activeSearch.current = null;
+    setScanProgress(null);
+    setBusy(false);
+    setAnalyzing('');
+  }
+  useEffect(() => () => activeSearch.current?.abort(), []);
 
   function navigate(destination, id = searchId ?? data?.searchId) {
     if (!Object.hasOwn(PAGE_LABELS, destination)) return;
@@ -1124,7 +1191,11 @@ export default function App() {
   }
 
   useEffect(() => {
-    const syncHash = () => setRoute(parseRoute(window.location.hash));
+    const syncHash = () => {
+      const next = parseRoute(window.location.hash);
+      if (activeSearch.current?.searchId && next.searchId && next.searchId !== activeSearch.current.searchId) cancelSearch();
+      setRoute(next);
+    };
     window.addEventListener('hashchange', syncHash);
     return () => window.removeEventListener('hashchange', syncHash);
   }, []);
@@ -1151,12 +1222,12 @@ export default function App() {
 
   // Polling automático para atualizar tela quando o Deep Scan em segundo plano finalizar
   useEffect(() => {
-    if (!data?.searchId || !['PARTIAL_FAST_PATH', 'SCANNING_BACKGROUND'].includes(data?.scanStatus)) return;
+    if (scanProgress?.running || !data?.searchId || !['PARTIAL_FAST_PATH', 'SCANNING_BACKGROUND', 'BROWSER_PENDING'].includes(data?.scanStatus)) return;
     let active = true;
     const intervalId = setInterval(async () => {
       try {
         const statusRes = await request(`/search_status/${data.searchId}`);
-        if (active && statusRes?.is_completed && statusRes.data) {
+        if (active && (statusRes?.is_terminal || statusRes?.is_completed) && statusRes.data) {
           const updated = normalize(statusRes.data);
           if (updated) {
             setData((prev) => validSearchId(prev?.searchId) !== validSearchId(data.searchId) ? prev : ({
@@ -1166,6 +1237,9 @@ export default function App() {
               rankingCondenacoes: (updated.rankingCondenacoes && updated.rankingCondenacoes.length > 0)
                 ? updated.rankingCondenacoes
                 : prev?.rankingCondenacoes || [],
+              condenacaoPorMotivo: (updated.condenacaoPorMotivo && updated.condenacaoPorMotivo.length > 0)
+                ? updated.condenacaoPorMotivo
+                : prev?.condenacaoPorMotivo || [],
             }));
           }
           clearInterval(intervalId);
@@ -1176,39 +1250,75 @@ export default function App() {
     }, 3000);
 
     return () => { active = false; clearInterval(intervalId); };
-  }, [data?.searchId, data?.scanStatus]);
+  }, [data?.searchId, data?.scanStatus, scanProgress?.running]);
 
-  async function search(term = query) {
+  async function search(term = query, legalName = null) {
     const text = String(term || '').trim();
     if (text.length < 2) return;
+    activeSearch.current?.abort();
+    const controller = new AbortController();
+    activeSearch.current = controller;
+    const { signal } = controller;
+    const current = () => activeSearch.current === controller && !signal.aborted;
+    setScanProgress(null);
     setBusy(true);
     setError('');
     try {
-      // Fallback silencioso: prefetch transparente via browser contra bloqueios de geoblocking nos EUA
-      let prefetched = [];
-      try {
-        prefetched = await prefetchFromComunicaPjeBrowser(text);
-      } catch {
-        prefetched = [];
+      const cnpj = onlyDigits(text).length === 14 ? onlyDigits(text) : null;
+      // O endpoint público pesquisa pelo nome da parte. Para CNPJ, resolve o nome
+      // cadastral antes de consultar o PJe, sem trocar o CNPJ enviado ao backend.
+      let pjeTerm = cnpj ? legalName : text;
+      if (cnpj && !pjeTerm) {
+        try {
+          const registration = await fetch(`https://brasilapi.com.br/api/cnpj/v1/${cnpj}`, {
+            signal: AbortSignal.any([signal, AbortSignal.timeout(3000)]),
+          });
+          if (registration.ok) pjeTerm = (await registration.json()).razao_social;
+        } catch { /* sem nome: mantém o fallback original do servidor */ }
       }
-
-      const payload = { company_name: text };
-      if (Array.isArray(prefetched) && prefetched.length > 0) {
-        payload.client_prefetched_items = prefetched;
-      }
-
+      const first = pjeTerm && !signal.aborted
+        ? await fetchPjePage(pjeTerm, cnpj, 1, signal, 4000).catch(() => ({ items: [], count: null }))
+        : { items: [], count: null };
+      if (!current()) return;
+      const payload = { company_name: text, browser_deep_scan: true,
+        browser_query_term: pjeTerm, browser_page1_count: first.count };
+      if (first.items.length) payload.client_prefetched_items = first.items;
       const result = await request('/search-company', {
-        method: 'POST',
-        body: JSON.stringify(payload),
+        method: 'POST', signal, body: JSON.stringify(payload),
       });
+      if (!current()) return;
       const normalized = normalize(result);
       if (!normalized) throw new Error('A API não retornou dados de empresa válidos.');
+      controller.searchId = validSearchId(normalized.searchId);
       setData(normalized);
       navigate('overview', normalized.searchId);
-    } catch (failure) {
-      setError(failure.message || 'Não foi possível pesquisar a empresa.');
-    } finally {
       setBusy(false);
+      setAnalyzing('');
+      if (!validSearchId(normalized.searchId) || normalized.scanStatus !== 'BROWSER_PENDING') return;
+      setScanProgress({ running: true, message: `Consolidando varredura: ${first.items.length}/${Math.min(first.count, 1000)} comunicações...` });
+      try {
+        const scan = await runBrowserDeepScan(pjeTerm, cnpj, first.count, progress => {
+          if (current()) setScanProgress({ running: true, message: `Consolidando varredura: ${progress.received}/${progress.total} comunicações...` });
+        }, { signal, page1Items: first.items });
+        if (!current()) return;
+        {
+          await request('/ingest-deep-scan', {
+            method: 'POST', signal, body: JSON.stringify({ search_id: Number(normalized.searchId), items: scan.items, browser_scan_finished: true, is_final_batch: scan.failedPages.length === 0 && scan.received >= first.count && first.count <= 1000 }),
+          });
+          if (!current()) return;
+          const updated = normalize(await request(`/history/${normalized.searchId}`, { signal }));
+          if (current() && validSearchId(updated?.searchId) === validSearchId(normalized.searchId)) {
+            setData(prev => validSearchId(prev?.searchId) === validSearchId(normalized.searchId) ? updated : prev);
+          }
+        }
+        if (current()) setScanProgress({ running: false, message: scan.failedPages.length || (first.count <= 1000 && scan.received < first.count) ? 'Varredura parcial: nem todas as comunicações foram coletadas.' : first.count > 1000 ? 'Varredura limitada às primeiras 10 páginas.' : 'Varredura do navegador concluída.' });
+      } catch {
+        if (current()) setScanProgress({ running: false, message: 'Não foi possível consolidar toda a varredura. Os resultados iniciais foram preservados.' });
+      }
+    } catch (failure) {
+      if (current()) setError(failure.message || 'Não foi possível pesquisar a empresa.');
+    } finally {
+      if (current()) { setBusy(false); setAnalyzing(''); }
     }
   }
 
@@ -1220,6 +1330,7 @@ export default function App() {
       search(onlyDigits(text));
       return;
     }
+    cancelSearch();
     navigate('catalog');
     loadCatalog(text);
   }
@@ -1246,15 +1357,13 @@ export default function App() {
   async function analyzeCatalogItem(item) {
     setAnalyzing(item.cnpj);
     // Envia o CNPJ (não a razão social): é ele que isola a empresa escolhida no backend.
-    await search(item.cnpj);
-    setAnalyzing('');
+    await search(item.cnpj, item.razao);
   }
 
   // Marca inteira (modo BROAD_BRAND): consolida todas as empresas e filiais do nome pesquisado.
   async function analyzeGroup() {
     setAnalyzing('GROUP');
     await search(catalog.term);
-    setAnalyzing('');
   }
 
   async function loadHistory() {
@@ -1271,6 +1380,7 @@ export default function App() {
   }
 
   async function openHistory(id) {
+    cancelSearch();
     setHistoryBusy(true);
     setHistoryError('');
     try {
@@ -1288,7 +1398,7 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (page === 'history') loadHistory();
+    if (page === 'history' || page === 'compare') loadHistory();
   }, [page]);
 
   return (
@@ -1324,11 +1434,20 @@ export default function App() {
             ) : <div className="loading" role="status"><RefreshCw className="spin" /> Carregando consulta compartilhada...</div>
           )}
           {isCompanyPage(page) && !needsSharedData && <>
+            {scanProgress && <p role="status" className="company-share-message">{scanProgress.message}</p>}
             {visibleData && <CompanyShareActions key={visibleData.searchId ?? visibleData.name} data={visibleData} />}
             {page === 'overview' && <Overview data={visibleData} navigate={navigate} catalogTerm={catalog.term} />}
             {page === 'processes' && <Processes data={visibleData} />}
             {page === 'predictions' && <Predictions data={visibleData} />}
           </>}
+          {page === 'compare' && (
+            <ComparePage
+              request={request}
+              history={history}
+              currentCompany={visibleData}
+              navigate={navigate}
+            />
+          )}
           {page === 'history' && <HistoryPage history={history} busy={historyBusy} error={historyError} onOpen={openHistory} onReload={loadHistory} />}
         </main>
         <footer className="footer">RadarJus · Inteligência Preditiva</footer>

@@ -1,501 +1,142 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-  <meta charset="UTF-8">
-  <title>Relatório Executivo de Risco — {{ report.company_name }}</title>
-  <style>
-    @page {
-      size: A4 portrait;
-      margin: 14mm 15mm 16mm 15mm;
-      @bottom-left {
-        content: "RadarJus LegalTech • Relatório Executivo de Risco & Solvência";
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-        font-size: 7.5pt;
-        color: #94a3b8;
-      }
-      @bottom-right {
-        content: "Página " counter(page) " de " counter(pages);
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-        font-size: 7.5pt;
-        color: #64748b;
-        font-weight: 600;
-      }
-    }
-
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-    }
-
-    body {
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-      color: #17283a;
-      background: #ffffff;
-      font-size: 9.5pt;
-      line-height: 1.45;
-      -webkit-font-smoothing: antialiased;
-    }
-
-    .header-bar {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      border-bottom: 2px solid #142335;
-      padding-bottom: 9px;
-      margin-bottom: 12px;
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .brand-title {
-      font-size: 15pt;
-      font-weight: 800;
-      letter-spacing: -0.5px;
-      color: #142335;
-    }
-
-    .brand-title span {
-      color: #245a81;
-    }
-
-    .brand-sub {
-      font-size: 7.5pt;
-      color: #64748b;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.8px;
-    }
-
-    .header-meta {
-      text-align: right;
-      font-size: 7.5pt;
-      color: #64748b;
-      line-height: 1.35;
-    }
-
-    .header-meta strong {
-      color: #17283a;
-    }
-
-    .company-banner {
-      background: #f8fafc;
-      border: 1px solid #e2e8f0;
-      border-left: 5px solid #245a81;
-      border-radius: 6px;
-      padding: 10px 14px;
-      margin-bottom: 12px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .company-info h1 {
-      font-size: 12pt;
-      font-weight: 800;
-      color: #0f172a;
-      letter-spacing: -0.3px;
-      margin-bottom: 2px;
-    }
-
-    .company-info p {
-      font-size: 8pt;
-      color: #475569;
-    }
-
-    .tag-badge {
-      display: inline-block;
-      padding: 4px 9px;
-      border-radius: 12px;
-      font-size: 7.5pt;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.4px;
-      white-space: nowrap;
-    }
-
-    .tag-cenario-a {
-      background: #ecfdf5;
-      color: #065f46;
-      border: 1px solid #a7f3d0;
-    }
-
-    .tag-cenario-b {
-      background: #fef2f2;
-      color: #991b1b;
-      border: 1px solid #fecaca;
-    }
-
-    .grid-kpis {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 12px;
-    }
-
-    .kpi-card {
-      flex: 1;
-      background: #ffffff;
-      border: 1px solid #e2e8f0;
-      border-radius: 6px;
-      padding: 8px 10px;
-    }
-
-    .kpi-label {
-      font-size: 6.8pt;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      color: #64748b;
-      margin-bottom: 4px;
-    }
-
-    .kpi-value {
-      font-size: 13pt;
-      font-weight: 800;
-      color: #1e293b;
-      line-height: 1.1;
-    }
-
-    .kpi-value.blue { color: #245a81; }
-    .kpi-value.green { color: #16a34a; }
-    .kpi-value.amber { color: #d97706; }
-    .kpi-value.red { color: #dc2626; }
-
-    .kpi-sub {
-      font-size: 6.8pt;
-      color: #94a3b8;
-      margin-top: 3px;
-    }
-
-    .section-card {
-      background: #ffffff;
-      border: 1px solid #e2e8f0;
-      border-radius: 6px;
-      padding: 10px 12px;
-      margin-bottom: 11px;
-      page-break-inside: avoid;
-      break-inside: avoid;
-    }
-
-    .section-title {
-      font-size: 8.5pt;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.6px;
-      color: #1e293b;
-      margin-bottom: 8px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .section-title::before {
-      content: "";
-      display: inline-block;
-      width: 3px;
-      height: 10pt;
-      background: #245a81;
-      border-radius: 2px;
-    }
-
-    .econ-grid {
-      display: flex;
-      gap: 12px;
-      font-size: 8pt;
-    }
-
-    .econ-col {
-      flex: 1;
-    }
-
-    .econ-row {
-      display: flex;
-      justify-content: space-between;
-      padding: 3px 0;
-      border-bottom: 1px dotted #e2e8f0;
-    }
-
-    .econ-row:last-child {
-      border-bottom: none;
-    }
-
-    .econ-row span {
-      color: #64748b;
-    }
-
-    .econ-row strong {
-      color: #0f172a;
-      font-weight: 600;
-    }
-
-    .chart-container {
-      margin: 4px 0 2px 0;
-    }
-
-    .table-ranking {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 7.8pt;
-      margin-top: 4px;
-    }
-
-    .table-ranking th {
-      background: #f1f5f9;
-      color: #475569;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.4px;
-      font-size: 6.8pt;
-      padding: 5px 7px;
-      text-align: left;
-      border-bottom: 1px solid #cbd5e1;
-    }
-
-    .table-ranking td {
-      padding: 4px 7px;
-      border-bottom: 1px solid #f1f5f9;
-      color: #334155;
-    }
-
-    .table-ranking tr:last-child td {
-      border-bottom: none;
-    }
-
-    .table-ranking .text-right {
-      text-align: right;
-    }
-
-    .compliance-box {
-      background: #f8fafc;
-      border: 1px solid #cbd5e1;
-      border-radius: 6px;
-      padding: 9px 12px;
-      margin-top: 6px;
-    }
-
-    .compliance-headline {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 6px;
-    }
-
-    .compliance-headline strong {
-      font-size: 9pt;
-      color: #0f172a;
-    }
-
-    .compliance-text {
-      font-size: 7.8pt;
-      color: #334155;
-      line-height: 1.45;
-      margin-bottom: 6px;
-    }
-
-    .compliance-list {
-      list-style-type: none;
-      padding-left: 0;
-      font-size: 7.5pt;
-      color: #475569;
-    }
-
-    .compliance-list li {
-      margin-bottom: 3px;
-      padding-left: 10px;
-      position: relative;
-    }
-
-    .compliance-list li::before {
-      content: "•";
-      position: absolute;
-      left: 0;
-      color: #245a81;
-      font-weight: bold;
-    }
-  </style>
+<meta charset="UTF-8">
+<title>RadarJus - {{ report.company_name }}</title>
+<style>
+@page { size: A4; margin: 12mm 10mm 14mm; }
+* { box-sizing: border-box; }
+body { margin: 0; font-family: Arial, 'Liberation Sans', sans-serif; font-size: 9pt; line-height: 1.4; color: #243447; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.header { background: #17283a; color: white; margin-bottom: 8pt; }
+.header td { padding: 12pt; vertical-align: middle; }
+.header-title { font-size: 15pt; line-height: 1.25; font-weight: bold; overflow-wrap: break-word; }
+.header-meta { font-size: 8.5pt; line-height: 1.4; color: #d7e4f0; }
+.kpis td { background: #f4f7fa; border: .6pt solid #d6e0ea; padding: 8pt; vertical-align: top; }
+.kpi-label { font-size: 7.5pt; font-weight: bold; color: #526477; line-height: 1.3; min-height: 21pt; }
+.kpi-value { font-size: 14pt; font-weight: bold; line-height: 1.25; margin: 3pt 0 4pt; color: #17283a; overflow-wrap: break-word; }
+.kpi-value.small { font-size: 10pt; }
+.kpi-detail { font-size: 8pt; line-height: 1.35; color: #526477; }
+.num { white-space: nowrap; }
+h2 { font-size: 11pt; line-height: 1.3; color: #17283a; margin: 15pt 0 5pt; break-after: avoid; }
+.scenario { border: .9pt solid #25865a; background: #eaf7f0; padding: 8pt 10pt; margin-bottom: 6pt; }
+.scenario strong { color: #1b6945; }
+.scenario.danger { border-color: #c34a4a; background: #fdf0f0; }
+.scenario.danger strong { color: #a33333; }
+.scenario p { margin: 3pt 0 0; }
+.econ td { border: .6pt solid #d6e0ea; vertical-align: top; padding: 8pt 9pt; }
+.econ-label { font-weight: bold; color: #245a81; font-size: 8pt; }
+.econ-value { font-weight: bold; color: #17283a; font-size: 11pt; line-height: 1.3; margin: 3pt 0; }
+.detail { font-size: 8pt; color: #526477; line-height: 1.4; }
+.ranking th, .ranking td { border: .5pt solid #d6e0ea; padding: 5pt 6pt; vertical-align: top; }
+.ranking th { text-align: left; font-size: 8pt; background: #f4f7fa; color: #526477; }
+.ranking tr { break-inside: avoid; }
+.ranking thead { display: table-header-group; }
+.comp-header td { border: .6pt solid #d6e0ea; padding: 7pt; background: #f4f7fa; vertical-align: top; }
+.comp-intro { break-inside: avoid; }
+p { orphans: 3; widows: 3; margin: 6pt 0; }
+li { break-inside: avoid; margin-bottom: 2pt; }
+ul { margin: 4pt 0 8pt; padding-left: 15pt; }
+.sources { margin-top: 10pt; font-size: 8pt; color: #526477; break-inside: avoid; }
+.header, .kpis, .scenario, .econ tr { break-inside: avoid; }
+.chart-block { break-inside: avoid; page-break-inside: avoid; }
+.chart-frame { border: .6pt solid #d6e0ea; padding: 8pt 10pt; }
+.chart-frame svg { display: block; width: 100%; height: auto; }
+ .decision{border:1pt solid #245a81;border-left:4pt solid #245a81;padding:12pt;background:#f4f7fa;break-inside:avoid}.decision h1{font-size:20pt;line-height:1.2;color:#17283a;margin:5pt 0}.eyebrow,.risk-label{font-size:8pt;font-weight:bold;color:#526477}.risk-value{font-size:26pt;font-weight:bold;color:#245a81;line-height:1.2}.actions{font-size:11pt;font-weight:bold;line-height:1.4}.actions li{margin:4pt 0} </style>
 </head>
 <body>
-
-  <!-- Topo Institucional -->
-  <div class="header-bar">
-    <div class="brand">
-      <div>
-        <div class="brand-title">Radar<span>Jus</span></div>
-        <div class="brand-sub">Diagnóstico de Passivo & Solvência Trabalhista</div>
-      </div>
-    </div>
-    <div class="header-meta">
-      <div><strong>Emissão:</strong> {{ report.generated_at }}</div>
-      <div><strong>Documento:</strong> Relatório Executivo v3.0</div>
-      <div><strong>Status:</strong> {{ report.scan_status }}</div>
-    </div>
-  </div>
-
-  <!-- Identificação da Empresa -->
-  <div class="company-banner">
-    <div class="company-info">
-      <h1>{{ report.company_name }}</h1>
-      <p>CNPJ Matriz / Consolidado: <strong>{{ report.cnpj_formatted }}</strong></p>
-    </div>
-    <div>
-      {% if report.economic.is_cenario_a %}
-        <span class="tag-badge tag-cenario-a">{{ report.economic.cenario_badge }}</span>
-      {% else %}
-        <span class="tag-badge tag-cenario-b">{{ report.economic.cenario_badge }}</span>
-      {% endif %}
-    </div>
-  </div>
-
-  <!-- Métricas Principais (KPIs) -->
-  <div class="grid-kpis">
-    <div class="kpi-card">
-      <div class="kpi-label">Índice de Exposição</div>
-      <div class="kpi-value blue">{{ "%.1f"|format(report.exposure_score) }}%</div>
-      <div class="kpi-sub">Risco global ponderado</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-label">Processos Mapeados</div>
-      <div class="kpi-value">{{ report.total_processes }}</div>
-      <div class="kpi-sub">100% da base DataJud</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-label">Prob. Condenação</div>
-      {% if report.prob_condenacao %}
-        <div class="kpi-value amber">{{ "%.1f"|format(report.prob_condenacao) }}%</div>
-      {% else %}
-        <div class="kpi-value amber">N/D</div>
-      {% endif %}
-      <div class="kpi-sub">Taxa histórica bruta</div>
-    </div>
-    <div class="kpi-card">
-      <div class="kpi-label">Confiança Bayesiana</div>
-      <div class="kpi-value green">{{ report.conf_label }}</div>
-      <div class="kpi-sub">{{ report.conf_detail }}</div>
-    </div>
-  </div>
-
-  <!-- Seção 1: Idoneidade Econômica & Solvência -->
-  <div class="section-card">
-    <div class="section-title">Idoneidade Econômica & Solvência Empresarial</div>
-    <div class="econ-grid">
-      <div class="econ-col">
-        <div class="econ-row">
-          <span>Capital Social:</span>
-          <strong>{{ report.economic.capital_fmt }}</strong>
-        </div>
-        <div class="econ-row">
-          <span>Compatibilidade de Porte:</span>
-          <strong>{{ report.economic.badge_porte }}</strong>
-        </div>
-        <div class="econ-row">
-          <span>Situação Cadastral RFB:</span>
-          <strong>{{ report.economic.situacao_rfb }}</strong>
-        </div>
-      </div>
-      <div class="econ-col">
-        <div class="econ-row">
-          <span>Risco Calote Subsidiário:</span>
-          <strong>
-            {% if report.economic.risco_sub is not none %}
-              {{ "%.1f"|format(report.economic.risco_sub) }}%
-            {% else %}
-              0,0%
-            {% endif %}
-          </strong>
-        </div>
-        <div class="econ-row">
-          <span>Prob. Insolvência:</span>
-          <strong>
-            {% if report.economic.prob_insolv is not none %}
-              {{ "%.1f"|format(report.economic.prob_insolv) }}%
-            {% else %}
-              0,0%
-            {% endif %}
-          </strong>
-        </div>
-        <div class="econ-row">
-          <span>Restrições Federais (CGU/PGFN):</span>
-          <strong>{{ report.economic.sancoes_texto }}</strong>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Seção 2: Desfechos Processuais (Simplex 100%) -->
-  <div class="section-card">
-    <div class="section-title">Distribuição Estatística de Desfechos (Simplex 100%)</div>
-    <div class="chart-container">
-      {{ outcomes_svg | safe }}
-    </div>
-  </div>
-
-  <!-- Seção 3: Comparativo de Risco Bayesiano vs. Súmula 331 TST -->
-  <div class="section-card">
-    <div class="section-title">Inferência Bayesiana vs. Risco Subsidiário (Súmula 331 TST)</div>
-    <div class="chart-container">
-      {{ bayes_svg | safe }}
-    </div>
-  </div>
-
-  <!-- Seção 4: Ranking TPU de Motivos de Condenação -->
-  <div class="section-card">
-    <div class="section-title">Principais Motivos de Condenação (Tabelas Processuais Unificadas - TPU)</div>
-    {% if report.ranking_condenacoes %}
-      <table class="table-ranking">
-        <thead>
-          <tr>
-            <th style="width: 60%;">Assunto / Motivo TPU</th>
-            <th class="text-right" style="width: 20%;">Condenações</th>
-            <th class="text-right" style="width: 20%;">Taxa Histórica</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for item in report.ranking_condenacoes[:5] %}
-            <tr>
-              <td><strong>{{ item.motivo }}</strong></td>
-              <td class="text-right">{{ item.quantidade }}</td>
-              <td class="text-right">
-                {% if item.percentual is not none %}
-                  {{ "%.1f"|format(item.percentual) }}%
-                {% else %}
-                  -
-                {% endif %}
-              </td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    {% else %}
-      <p style="font-size: 7.8pt; color: #64748b; font-style: italic; margin-top: 4px;">
-        Nenhum registro de condenação específico mapeado nas sentenças julgadas.
-      </p>
-    {% endif %}
-  </div>
-
-  <!-- Seção 5: Parecer Executivo de Compliance & Súmula 331 -->
-  <div class="section-card">
-    <div class="section-title">Parecer Executivo de Governança & Compliance</div>
-    <div class="compliance-box">
-      <div class="compliance-headline">
-        <strong>Recomendação: {{ report.compliance.recomendacao }}</strong>
-        <span class="tag-badge {% if 'HOMOLOGAR' in report.compliance.recomendacao %}tag-cenario-a{% else %}tag-cenario-b{% endif %}">
-          Perfil: {{ report.compliance.perfil_risco }}
-        </span>
-      </div>
-      <p class="compliance-text">{{ report.compliance.resumo_executivo }}</p>
-      {% if report.compliance.recomendacoes %}
-        <ul class="compliance-list">
-          {% for rec in report.compliance.recomendacoes %}
-            <li>{{ rec }}</li>
-          {% endfor %}
-        </ul>
-      {% endif %}
-    </div>
-  </div>
-
-</body>
-</html>
+{% set econ = report.economic %}
+{% set out = report.outcomes %}
+{% set comp = report.compliance %}
+{% macro pct(value) -%}{% if value is none or value == '' %}—{% else %}{{ ('%.1f'|format(value|float)).replace('.', ',') }}%{% endif %}{%- endmacro %}
+{% macro scan_label(status) -%}
+{{ {'COMPLETED':'Concluída','PARTIAL_FAST_PATH':'Em andamento','SCANNING_BACKGROUND':'Varredura em segundo plano','BROWSER_PENDING':'Aguardando varredura','BROWSER_PARTIAL':'Parcialmente concluída','PROCESSING':'Processando','PENDING':'Pendente','FAILED':'Falha na varredura'}.get(status, 'Não informado') }}
+{%- endmacro %}
+<table class="header"><colgroup><col style="width:63%"><col style="width:37%"></colgroup><tr>
+<td class="header-title">RADARJUS v2.0 · INTELIGÊNCIA PREDITIVA &amp; COMPLIANCE<br>{{ report.company_name }}</td>
+<td class="header-meta"><strong>CNPJ Matriz:</strong> {{ report.cnpj_formatted }}<br><strong>Emissão:</strong> {{ report.generated_at }}<br><strong>Status:</strong> {{ scan_label(report.scan_status) }}</td>
+</tr></table>
+<section class="decision"><div class="eyebrow">RECOMENDAÇÃO DE CONTRATAÇÃO</div><h1>{{ comp.recomendacao }}</h1><p>{{ econ.cenario_badge }}</p><div class="risk-label">RISCO SUBSIDIÁRIO</div><div class="risk-value">{{ pct(econ.risco_sub) }}</div><p>Estimativa de risco ao contratante · Súmula 331 TST</p><h2>O que fazer</h2>{% if comp.recomendacoes %}<ul class="actions">{% for item in comp.recomendacoes %}<li>{{ item }}</li>{% endfor %}</ul>{% else %}<p>Prescrições não disponibilizadas.</p>{% endif %}</section>
+{% if report.condenacao_por_motivo %}
+<h2>Condenações por motivo do processo</h2>
+<table class="ranking"><colgroup><col style="width:36%"><col style="width:15%"><col style="width:15%"><col style="width:13%"><col style="width:21%"></colgroup>
+<thead><tr><th>Motivo / Assunto</th><th>Processos</th><th>Condenações</th><th>Taxa</th><th>Faixa de variação</th></tr></thead>
+<tbody>{% for item in report.condenacao_por_motivo %}
+<tr><td>{{ item.motivo }}</td><td>{{ item.total_processos }}</td><td>{{ item.condenacoes }}</td><td class="num" style="color:{{ '#a33333' if item.taxa_condenacao >= 60 else '#b45309' if item.taxa_condenacao >= 35 else '#166534' }}">{{ pct(item.taxa_condenacao) }}</td><td>{{ item.faixa_variacao }}</td></tr>
+{% endfor %}</tbody></table>
+{% else %}
+{% set ranking = report.ranking_condenacoes or report.ranking_motivos %}
+<h2>{{ 'Condenações por motivo' if report.ranking_condenacoes else 'Principais Vetores de Risco Processual' }}</h2>
+{% if ranking %}<table class="ranking"><colgroup><col style="width:7%"><col style="width:65%"><col style="width:14%"><col style="width:14%"></colgroup>
+<thead><tr><th>#</th><th>Motivo / Vetor Identificado</th><th>Ocorrências</th><th>Taxa por motivo</th></tr></thead>
+<tbody>{% for item in ranking %}<tr><td>{{ loop.index }}</td><td>{{ item.motivo }}</td><td class="num">{{ item.quantidade }}</td><td class="num">{{ pct(item.taxa_no_motivo) if report.ranking_condenacoes and item.taxa_no_motivo is defined and item.taxa_no_motivo is not none else '—' }}</td></tr>{% endfor %}</tbody></table>
+{% else %}<p>Nenhuma condenação ou vetor de risco recorrente mapeado para esta empresa.</p>{% endif %}
+{% endif %}
+<<<<<<< HEAD
+<h2>Diligência complementar</h2>{% if comp.alertas_331 %}<ul>{% for item in comp.alertas_331 %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}{% if econ.sinais_solvencia_publica and econ.sinais_solvencia_publica.resumo_solvencia %}<p><strong>Solvência e Certidões Públicas:</strong> {{ econ.sinais_solvencia_publica.resumo_solvencia }}</p>{% if econ.sinais_solvencia_publica.orientacao_homologacao %}<p><strong>Orientação de Homologação:</strong> {{ econ.sinais_solvencia_publica.orientacao_homologacao }}</p>{% endif %}{% else %}<p>Histórico de responsabilidade subsidiária, contratos públicos e alertas de PEP: dados específicos não disponibilizados nesta consulta.</p>{% endif %}<h2>Resumo executivo</h2><p>{{ comp.resumo_executivo }}</p><h2>Resumo dos processos analisados</h2><table class="kpis"><tr>{% for label,value in [('Processos',report.total_processes),('Condenações',out.condenacoes),('Acordos',out.acordos),('Improcedentes',out.improcedentes),('Em aberto',out.em_aberto)] %}<td><div class="kpi-label">{{ label }}</div><div class="kpi-value num">{{ value }}</div></td>{% endfor %}</tr></table>{% if outcomes_svg %}<section class="chart-block"><h2>Distribuição de desfechos</h2><div class="chart-frame">{{ outcomes_svg | safe }}</div></section>{% endif %}<h2>Mais informações</h2><table class="econ"><colgroup><col style="width:54%"><col style="width:46%"></colgroup><tr>
+=======
+<h2>Diligência complementar</h2>
+{% if comp.condenacoes_subsidiarias_tomadoras_count and comp.condenacoes_subsidiarias_tomadoras_count > 0 %}
+<div class="subsidiary-card" style="background:#fef7ea; border-left:4px solid #b67b23; padding:8px 12px; margin-bottom:10px; border-radius:4px;">
+  <strong style="color:#b67b23; font-size:12px;">Histórico de Responsabilidade Subsidiária: {{ comp.condenacoes_subsidiarias_tomadoras_count }} processos com condenação subsidiária atribuída a contratantes anteriores</strong>
+  {% if comp.tomadoras_subsidiarias_pj %}
+  <p style="margin:4px 0 0; font-size:11px; color:#445566;">
+    <strong>Contratantes / Tomadoras PJ identificadas:</strong> {{ comp.tomadoras_subsidiarias_pj | join(', ') }}
+  </p>
+  {% endif %}
+</div>
+{% else %}
+<div class="subsidiary-card" style="background:#f0f9f4; border-left:4px solid #25865a; padding:8px 12px; margin-bottom:10px; border-radius:4px;">
+  <span style="color:#25865a; font-size:11px; font-weight:600;">Nenhuma condenação subsidiária de contratante identificada na amostra</span>
+</div>
+{% endif %}
+{% if comp.alertas_331 %}<ul>{% for item in comp.alertas_331 %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
+{% set cp = report.contratos_poder_publico or {} %}
+{% if cp.status == 'INDISPONIVEL' %}
+<div class="public-contracts-card" style="break-inside: avoid; background:#f8fafc; border-left:4px solid #64748b; padding:8px 12px; margin-bottom:10px; border-radius:4px;">
+  <span style="color:#475569; font-size:11px;">Base governamental temporariamente indisponível no momento da consulta.</span>
+</div>
+{% elif cp.total_contratos and cp.total_contratos > 0 %}
+<div class="public-contracts-card" style="break-inside: avoid; background:#f0f7fc; border-left:4px solid #1a56db; padding:8px 12px; margin-bottom:10px; border-radius:4px;">
+  <strong style="color:#1a56db; font-size:12px;">Contratos com o Poder Público: {{ cp.total_contratos }} contrato(s) localizado(s)</strong>
+  {% if cp.valor_global_formatado %}
+  <span style="font-size:11px; color:#17283a; font-weight:600; margin-left:6px;">(Valor Global: {{ cp.valor_global_formatado }})</span>
+  {% endif %}
+  {% if cp.esferas %}
+  <p style="margin:4px 0 0; font-size:11px; color:#334155;">
+    <strong>Esferas:</strong> {{ cp.esferas | join(', ') }}
+  </p>
+  {% endif %}
+  {% if cp.orgaos_contratantes %}
+  <p style="margin:3px 0 0; font-size:11px; color:#445566;">
+    <strong>Órgãos Contratantes:</strong> {{ cp.orgaos_contratantes | join(', ') }}
+  </p>
+  {% endif %}
+</div>
+{% else %}
+<div class="public-contracts-card" style="break-inside: avoid; background:#f0f9f4; border-left:4px solid #25865a; padding:8px 12px; margin-bottom:10px; border-radius:4px;">
+  <span style="color:#25865a; font-size:11px; font-weight:600;">Nenhum contrato público localizado nas bases consultadas</span>
+</div>
+{% endif %}
+<h2>Resumo executivo</h2><p>{{ comp.resumo_executivo }}</p><h2>Resumo dos processos analisados</h2><table class="kpis"><tr>{% for label,value in [('Processos',report.total_processes),('Condenações',out.condenacoes),('Acordos',out.acordos),('Improcedentes',out.improcedentes),('Em aberto',out.em_aberto)] %}<td><div class="kpi-label">{{ label }}</div><div class="kpi-value num">{{ value }}</div></td>{% endfor %}</tr></table>{% if outcomes_svg %}<section class="chart-block"><h2>Distribuição de desfechos</h2><div class="chart-frame">{{ outcomes_svg | safe }}</div></section>{% endif %}<h2>Mais informações</h2><table class="econ"><colgroup><col style="width:54%"><col style="width:46%"></colgroup><tr>
+>>>>>>> ef49f8a00ed57bf052dd843c995348cebbe39c92
+<td><div class="econ-label">CAPITAL SOCIAL DECLARATÓRIO</div><div class="econ-value num">{{ econ.capital_fmt }}</div><div class="detail">{{ econ.badge_porte }}<br>{{ econ.subtitulo_unidades }}</div></td>
+<td><div class="econ-label">SITUAÇÃO CADASTRAL RFB</div><div class="econ-value" style="color:{{ '#25865a' if econ.situacao_rfb == 'ATIVA' else '#c34a4a' }}">{{ econ.situacao_rfb }}</div><div class="detail">Sanções/Débitos: {{ econ.sancoes_texto }}</div></td>
+</tr><tr>
+<td><div class="econ-label">PROBABILIDADE DE INSOLVÊNCIA</div><div class="econ-value num">{{ pct(econ.prob_insolv) }}</div><div class="detail">Estimativa de solvência</div></td>
+<td><div class="econ-label">STATUS DA VARREDURA</div><div class="econ-value">{{ scan_label(report.scan_status) }}</div><div class="detail">Confiança da estimativa: {{ report.conf_label }}</div></td>
+</tr></table>
+{% if econ.fontes_consultadas %}
+<table class="ranking" style="margin-top:8pt;"><colgroup><col style="width:36%"><col style="width:24%"><col style="width:40%"></colgroup>
+<thead><tr><th>Fonte / Certidão Verificada</th><th>Status Canônico</th><th>Detalhamento Oficial</th></tr></thead>
+<tbody>{% for f in econ.fontes_consultadas %}
+<tr>
+<td><strong>{{ f.fonte }}</strong></td>
+<td style="font-weight:bold;color:{{ '#25865a' if f.status == 'Regular' else '#c34a4a' if f.status == 'Restrição identificada' else '#526477' }}">{{ f.status }}</td>
+<td style="font-size:7.5pt;">{{ f.detalhe }}</td>
+</tr>
+{% endfor %}</tbody></table>
+<p class="detail" style="margin-top:4pt;"><strong>Demonstrações Contábeis:</strong> {{ econ.demonstracao_contabil_status or 'Demonstração contábil pública indisponível' }}.</p>
+{% endif %}
+<p class="detail">Estimativa baseada no histórico e porte. Faixa provável de variação (90% de confiança), quando disponível.</p><p class="sources">Fontes Oficiais Consultadas: Comunica PJe (CNJ), DataJud (CNJ), Receita Federal do Brasil, CGU (CEIS/CNEP) e PGFN. Relatório gerado automaticamente pelo RadarJus v2.0 (Estimativa baseada no histórico + Auditoria de Solvência).</p>
+</body></html>

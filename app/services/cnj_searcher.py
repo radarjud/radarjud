@@ -3,6 +3,8 @@
 
 import os
 import re
+import datetime
+from decimal import Decimal, InvalidOperation
 import unicodedata
 import logging
 from collections import defaultdict
@@ -30,6 +32,234 @@ TJ_MAP = {
     25: "tjse", 26: "tjsp", 27: "tjto"
 }
 
+
+def parse_iso_date(raw: Any, text_fallback: str = "") -> Optional[datetime.date]:
+    """
+    Extrai e valida datas de distribuição judicial (ISO, YYYYMMDD ou BR DD/MM/YYYY).
+    Valida rigorosamente o calendário (meses de 1 a 12, dias de 1 a 28..31, anos bissextos).
+    Datas inválidas (ex: 32/13/2024, 2024-02-31) retornam None de forma segura.
+    Se raw estiver ausente ou inválido, busca padrões textuais em text_fallback.
+    """
+    if isinstance(raw, datetime.datetime):
+        return raw.date()
+    if isinstance(raw, datetime.date):
+        return raw
+
+    def _try_parse_date_str(s: str) -> Optional[datetime.date]:
+        if not s:
+            return None
+        s = str(s).strip()
+        # Se contiver timestamp com 'T' ou espaço
+        if "T" in s:
+            s = s.split("T")[0]
+        elif " " in s:
+            s = s.split(" ")[0]
+        s = s.strip()
+
+        # 1. Padrão ISO YYYY-MM-DD
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+            try:
+                dt = datetime.datetime.strptime(s, "%Y-%m-%d").date()
+                if 1900 <= dt.year <= 2100:
+                    return dt
+            except ValueError:
+                return None
+
+        # 2. Padrão Brasileiro DD/MM/YYYY
+        if re.match(r"^\d{2}/\d{2}/\d{4}$", s):
+            try:
+                dt = datetime.datetime.strptime(s, "%d/%m/%Y").date()
+                if 1900 <= dt.year <= 2100:
+                    return dt
+            except ValueError:
+                return None
+
+        # 3. Padrão Compacto YYYYMMDD
+        if re.match(r"^\d{8}$", s):
+            try:
+                dt = datetime.datetime.strptime(s, "%Y%m%d").date()
+                if 1900 <= dt.year <= 2100:
+                    return dt
+            except ValueError:
+                return None
+
+        return None
+
+    if raw is not None:
+        parsed = _try_parse_date_str(str(raw))
+        if parsed:
+            return parsed
+
+    # Fallback em texto de publicações
+    if text_fallback:
+        patterns = [
+            r"(?:distribu[ií]d[oa]|ajuizad[oa]|ajuizamento|distribui[cç][aã]o)\s*(?:no\s+dia|em|:)?\s*(\d{2}/\d{2}/\d{4})",
+            r"(?:data\s+de\s+ajuizamento|data\s+da\s+distribui[cç][aã]o)\s*(?:em|:)?\s*(\d{2}/\d{2}/\d{4})",
+            r"(?:termo\s+de\s+distribui[cç][aã]o)\s*(?:no\s+dia|em|:)?\s*(\d{2}/\d{2}/\d{4})",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text_fallback, re.IGNORECASE)
+            if m:
+                parsed = _try_parse_date_str(m.group(1))
+                if parsed:
+                    return parsed
+
+    return None
+
+
+def parse_currency_value(raw: Any, text_fallback: str = "") -> Optional[Decimal]:
+    """
+    Normaliza valores da causa para Decimal(15, 2).
+    Suporta:
+      - Números numéricos (int, float, Decimal)
+      - Strings com notação BR ('R$ 45.000,00', '1.250.300,75')
+      - Strings com notação internacional ('45000.00', '1250300.75')
+      - Fallback em regex textual em publicações ('dá-se à causa o valor de R$ 50.000,00')
+    Valores nulos, negativos ou zerados retornam None.
+    """
+    def _to_decimal(val_str: str) -> Optional[Decimal]:
+        if not val_str:
+            return None
+        val_str = str(val_str).strip()
+        if val_str.startswith("-") or " - " in val_str or "(" in val_str:
+            return None
+        cleaned = re.sub(r"[^\d,\.]", "", val_str).strip()
+        if not cleaned:
+            return None
+
+        # Se houver ponto e vírgula (ex: 1.250.300,75)
+        if "." in cleaned and "," in cleaned:
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        elif "," in cleaned:
+            # Apenas vírgula (ex: 45000,00 ou 1,25)
+            cleaned = cleaned.replace(",", ".")
+        elif "." in cleaned:
+            # Ex: 45.000 (milhar) ou 45000.00 (decimal)
+            parts = cleaned.split(".")
+            if len(parts) > 2:
+                # Múltiplos pontos de milhar: 1.250.300
+                cleaned = "".join(parts)
+            elif len(parts) == 2 and len(parts[1]) == 3:
+                try:
+                    if int(parts[0]) > 0:
+                        cleaned = parts[0] + parts[1]
+                except ValueError:
+                    pass
+
+        try:
+            dec = Decimal(cleaned).quantize(Decimal("0.01"))
+            if dec > Decimal("0.00"):
+                return dec
+        except (InvalidOperation, ValueError, TypeError):
+            pass
+        return None
+
+    if raw is not None:
+        if isinstance(raw, (int, float, Decimal)):
+            if raw <= 0:
+                return None
+            try:
+                dec = Decimal(str(raw)).quantize(Decimal("0.01"))
+                if dec > Decimal("0.00"):
+                    return dec
+            except (InvalidOperation, ValueError, TypeError):
+                pass
+        else:
+            raw_s = str(raw).strip()
+            if raw_s.startswith("-") or " - " in raw_s or "(" in raw_s:
+                return None
+            dec = _to_decimal(raw_s)
+            if dec:
+                return dec
+
+    # Fallback em texto de publicações
+    if text_fallback:
+        patterns = [
+            r"(?:valor\s+da\s+causa|d[aá]-se\s+[aà]\s+causa\s+o\s+valor\s+de|atribu[ií]-se\s+[aà]\s+causa\s+o\s+valor\s+de)\s*(?:em|:)?\s*(?:r\$)?\s*([\d\.,]+)",
+            r"(?:condena[cç][aã]o\s+no\s+valor\s+de|arbitrad[oa]\s+em)\s*(?:r\$)?\s*([\d\.,]+)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text_fallback, re.IGNORECASE)
+            if m:
+                dec = _to_decimal(m.group(1))
+                if dec:
+                    return dec
+
+    return None
+
+
+def normalize_court_code(raw: Any, cnj: Optional[str] = None) -> Optional[str]:
+    """
+    Normaliza a sigla do tribunal para o formato canônico oficial.
+    Exemplos:
+      - 'TRT-2', 'TRT 02', 'trt2', 'TRT02', 'Tribunal Regional do Trabalho da 2ª Região' -> 'TRT2'
+      - 'TRT-15', 'trt15' -> 'TRT15'
+      - 'TST', 'Tribunal Superior do Trabalho' -> 'TST'
+      - 'TJSP', 'Tribunal de Justiça de São Paulo' -> 'TJSP'
+      - Processo CNJ NNNNNNN-DD.AAAA.J.TR.OOOO -> inferência canônica precisa pelo ramo J.TR
+    """
+    raw_str = str(raw or "").strip()
+
+    if raw_str and raw_str.upper() not in {"N/A", "NONE", "NULL", ""}:
+        clean_upper = unicodedata.normalize("NFKD", raw_str)
+        clean_upper = "".join(c for c in clean_upper if not unicodedata.combining(c)).upper()
+
+        # 1. TRT 1 a 24 (dois dígitos testados antes de um dígito para evitar TRT1 casando em TRT15)
+        m_trt = re.search(r"\bTRT[\s-]*0?(2[0-4]|1[0-9]|[1-9])\b", clean_upper)
+        if m_trt:
+            return f"TRT{int(m_trt.group(1))}"
+
+        m_trt_ext = re.search(r"TRIBUNAL\s+REGIONAL\s+DO\s+TRABALHO.*?0?(2[0-4]|1[0-9]|[1-9])(?:\s*A|\s*O|\s*ª|\s*º)?\s+REGIAO", clean_upper)
+        if not m_trt_ext:
+            m_trt_ext = re.search(r"TRIBUNAL\s+REGIONAL\s+DO\s+TRABALHO.*?0?(2[0-4]|1[0-9]|[1-9])\b", clean_upper)
+        if m_trt_ext:
+            return f"TRT{int(m_trt_ext.group(1))}"
+
+        # 2. TST
+        if re.search(r"\bTST\b|TRIBUNAL\s+SUPERIOR\s+DO\s+TRABALHO", clean_upper):
+            return "TST"
+
+        # 3. TRF 1 a 6
+        m_trf = re.search(r"\bTRF[\s-]*0?([1-6])\b", clean_upper)
+        if m_trf:
+            return f"TRF{int(m_trf.group(1))}"
+
+        # 4. Tribunais de Justiça Estaduais (TJSP, TJRJ, etc.)
+        m_tj = re.search(r"\bTJ[\s-]*([A-Z]{2})\b", clean_upper)
+        if m_tj:
+            return f"TJ{m_tj.group(1).upper()}"
+
+        # 5. Tribunais Superiores
+        if re.search(r"\bSTJ\b", clean_upper):
+            return "STJ"
+        if re.search(r"\bSTF\b", clean_upper):
+            return "STF"
+
+    # Fallback por desmembramento do número CNJ: NNNNNNN-DD.AAAA.J.TR.OOOO
+    if cnj:
+        m_cnj = re.search(r"\.\d{4}\.(?P<J>\d)\.(?P<TR>\d{2})\.", str(cnj))
+        if m_cnj:
+            j_ramo = m_cnj.group("J")
+            tr_code = m_cnj.group("TR")
+            tr_num = int(tr_code)
+
+            if j_ramo == "5":  # Justiça do Trabalho
+                if tr_num == 0:
+                    return "TST"
+                if 1 <= tr_num <= 24:
+                    return f"TRT{tr_num}"
+            elif j_ramo == "8":  # Justiça Estadual
+                if tr_num in TJ_MAP:
+                    return TJ_MAP[tr_num].upper()
+            elif j_ramo == "4":  # Justiça Federal
+                if 1 <= tr_num <= 6:
+                    return f"TRF{tr_num}"
+
+    if raw_str and raw_str.upper() not in {"N/A", "NONE", "NULL", ""}:
+        return raw_str.strip().upper()[:50]
+
+    return None
+
 # Termos genéricos que NÃO devem mascarar os motivos substantivos do processo
 GENERIC_SUBJECT_TERMS = {
     "reclamacao trabalhista", "direito do trabalho", "obrigacoes", "responsabilidade civil",
@@ -43,34 +273,46 @@ GENERIC_SUBJECT_TERMS = {
 # Mapa léxico determinístico de altíssima precisão para extração em microssegundos (0.01ms)
 DETAILED_CAUSE_PATTERNS = [
     # Bancário / Cível / Consumidor
-    (7780, "Fraude Bancária / Golpe do PIX / Contestação de Transação", re.compile(r"golpe\s+do\s+pix|fraude|transa[cç][aã]o\s+n[aã]o\s+reconhecida|bloqueio\s+indevido|bloqueio\s+de\s+conta|med\s+pix|invas[aã]o\s+de\s+conta|engenharia\s+social|fortuito\s+interno|s[uú]mula\s*479", re.I)),
-    (7779, "Negativação Indevida (SPC / Serasa)", re.compile(r"negativa[cç][aã]o\s+indevida|inscri[cç][aã]o\s+indevida|serasa|spc|cadastro\s+de\s+inadimplentes|apontamento\s+desabonador", re.I)),
-    (9587, "Tarifas Bancárias e Cobrança Indevida", re.compile(r"tarifa\s+banc[aá]ria|cesta\s+de\s+servi[cç]os|pacote\s+de\s+servi[cç]os|cobran[cç]a\s+indevida|falha\s+na\s+presta[cç][aã]o|repeti[cç][aã]o\s+do\s+ind[eé]bito|taxa\s+de\s+manuten[cç][aã]o", re.I)),
-    (4960, "Revisão de Contrato e Juros Abusivos", re.compile(r"revis[aã]o\s+de\s+contrato|juros\s+abusivos|anatocismo|taxa\s+de\s+juros|tabela\s+price|cl[aá]usula\s+abusiva|capitaliza[cç][aã]o\s+de\s+juros", re.I)),
-    (997, "Busca e Apreensão em Alienação Fiduciária", re.compile(r"busca\s+e\s+apreens[aã]o|aliena[cç][aã]o\s+fiduci[aá]ria|decreto[\s-]lei\s*911|apreens[aã]o\s+de\s+ve[ií]culo|purga[cç][aã]o\s+da\s+mora", re.I)),
-    (4970, "Empréstimo Consignado e Reserva de Margem (RMC)", re.compile(r"empr[eé]stimo\s+consignado|reserva\s+de\s+margem|rmc|rcc|desconto\s+em\s+folha|cart[aã]o\s+consignado|margem\s+consign[aá]vel", re.I)),
-    (7771, "Cartão de Crédito e Anuidade", re.compile(r"cart[aã]o\s+de\s+cr[eé]dito|anuidade|limite\s+do\s+cart[aã]o|fatura\s+do\s+cart[aã]o", re.I)),
-    (4980, "Superendividamento e Repactuação de Dívidas", re.compile(r"superendividamento|lei\s*14\.?181|repactua[cç][aã]o\s+de\s+d[ií]vidas|m[ií]nimo\s+existencial|renegocia[cç][aã]o", re.I)),
-    (10433, "Indenização por Danos Morais (Direito do Consumidor)", re.compile(r"dano\s+moral\s+ao\s+consumidor|cdc|c[oó]digo\s+de\s+defesa\s+do\s+consumidor|rela[cç][aã]o\s+de\s+consumo", re.I)),
+    (7780, "Fraude Bancária / Golpe do PIX / Contestação de Transação", re.compile(r"golpe\s+do\s+pix|fraude|transa[cç][aã]o\s+n[aã]o\s+reconhecida|bloqueio\s+indevido|bloqueio\s+de\s+conta|med\s+pix|invas[aã]o\s+de\s+conta|engenharia\s+social|fortuito\s+interno|s[uú]mula\s*479")),
+    (7779, "Negativação Indevida (SPC / Serasa)", re.compile(r"negativa[cç][aã]o\s+indevida|inscri[cç][aã]o\s+indevida|serasa|spc|cadastro\s+de\s+inadimplentes|apontamento\s+desabonador")),
+    (9587, "Tarifas Bancárias e Cobrança Indevida", re.compile(r"tarifa\s+banc[aá]ria|cesta\s+de\s+servi[cç]os|pacote\s+de\s+servi[cç]os|cobran[cç]a\s+indevida|falha\s+na\s+presta[cç][aã]o|repeti[cç][aã]o\s+do\s+ind[eé]bito|taxa\s+de\s+manuten[cç][aã]o")),
+    (4960, "Revisão de Contrato e Juros Abusivos", re.compile(r"revis[aã]o\s+de\s+contrato|juros\s+abusivos|anatocismo|taxa\s+de\s+juros|tabela\s+price|cl[aá]usula\s+abusiva|capitaliza[cç][aã]o\s+de\s+juros")),
+    (997, "Busca e Apreensão em Alienação Fiduciária", re.compile(r"busca\s+e\s+apreens[aã]o|aliena[cç][aã]o\s+fiduci[aá]ria|decreto[\s-]lei\s*911|apreens[aã]o\s+de\s+ve[ií]culo|purga[cç][aã]o\s+da\s+mora")),
+    (4970, "Empréstimo Consignado e Reserva de Margem (RMC)", re.compile(r"empr[eé]stimo\s+consignado|reserva\s+de\s+margem|rmc|rcc|desconto\s+em\s+folha|cart[aã]o\s+consignado|margem\s+consign[aá]vel")),
+    (7771, "Cartão de Crédito e Anuidade", re.compile(r"cart[aã]o\s+de\s+cr[eé]dito|anuidade|limite\s+do\s+cart[aã]o|fatura\s+do\s+cart[aã]o")),
+    (4980, "Superendividamento e Repactuação de Dívidas", re.compile(r"superendividamento|lei\s*14\.?181|repactua[cç][aã]o\s+de\s+d[ií]vidas|m[ií]nimo\s+existencial|renegocia[cç][aã]o")),
+    (10433, "Indenização por Danos Morais (Direito do Consumidor)", re.compile(r"dano\s+moral\s+ao\s+consumidor|cdc|c[oó]digo\s+de\s+defesa\s+do\s+consumidor|rela[cç][aã]o\s+de\s+consumo")),
 
     # Trabalhista Bancário e Geral
-    (224, "Direitos da Categoria Bancária (7ª e 8ª Horas / Cargo de Confiança)", re.compile(r"banc[aá]ri[ao]|cargo\s+de\s+confian[cç]a|7[aª]\s+hora|8[aª]\s+hora|s[eé]tima\s+e\s+oitava|enquadramento\s+banc[aá]rio|gratifica[cç][aã]o\s+de\s+fun[cç][aã]o|jornada\s+de\s+seis\s+horas|art\.\s*224", re.I)),
-    (2550, "Equiparação Salarial e Desvio de Função", re.compile(r"equipara[cç][aã]o\s+salarial|desvio\s+de\s+fun[cç][aã]o|paradigma|diferen[cç]as?\s+salariais?|ac[uú]mulo\s+de\s+fun[cç][aã]o", re.I)),
-    (2551, "Participação nos Lucros e Resultados (PLR) e Bônus", re.compile(r"\bplr\b|participa[cç][aã]o\s+nos\s+lucros|b[oô]nus|pr[eé]mio\s+produ[cç][aã]o|programa\s+de\s+remunera[cç][aã]o", re.I)),
-    (2552, "Cobrança de Metas e Estorno de Comissões", re.compile(r"estorno\s+de\s+comiss[oõ]es|cobran[cç]a\s+de\s+metas|metas\s+abusivas|diferen[cç]as?\s+de\s+comiss|comiss[oõ]es\s+por\s+vendas", re.I)),
-    (1694, "Horas Extras e Intervalo Intrajornada", re.compile(r"horas?\s+extras?|sobrejornada|intrajornada|banco\s+de\s+horas|art\.\s*71|controle\s+de\s+ponto|cart[aã]o\s+de\s+ponto|jornada\s+de\s+trabalho|dsr|sobreaviso", re.I)),
-    (2546, "Inadimplemento de Verbas Rescisórias e Multa 40%", re.compile(r"verbas\s+rescis[oó]rias|multa\s+do\s+art\.\s*477|multa\s+de\s+40%|aviso\s+pr[eé]vio\s+indenizado|saldo\s+de\s+sal[aá]rio|13[oº]\s+sal[aá]rio|f[eé]rias\s+proporcionais|trct|rescis[aã]o\s+indireta", re.I)),
-    (2029, "Irregularidade / Ausência de Depósitos de FGTS", re.compile(r"dep[oó]sitos?\s+do\s+fgts|extrato\s+anal[ií]tico\s+do\s+fgts|diferen[cç]as\s+de\s+fgts|fundo\s+de\s+garantia|saque\s+do\s+fgts|guias\s+de\s+fgts", re.I)),
-    (1855, "Assédio Moral e Danos Morais Trabalhistas", re.compile(r"ass[eé]dio\s+moral|dano\s+moral|danos\s+morais|indeniza[cç][aã]o\s+por\s+dano|humilha[cç][aã]o|tratamento\s+degradante", re.I)),
-    (1656, "Adicional de Insalubridade (NR-15)", re.compile(r"insalubridade|agente\s+insalubre|nr[\s-]*15|laudo\s+pericial\s+insalub", re.I)),
-    (1681, "Adicional de Periculosidade (NR-16)", re.compile(r"periculosidade|inflam[aá]veis|energia\s+el[eé]trica|nr[\s-]*16|risco\s+acentuado", re.I)),
-    (1904, "Responsabilidade Subsidiária / Terceirização (Súmula 331 TST)", re.compile(r"responsabilidade\s+subsidi[aá]ria|s[uú]mula\s*331|tomadora?\s+de\s+servi[cç]os|culpa\s+in\s+vigilando|terceiriza[cç][aã]o|prestadora\s+de\s+servi[cç]os", re.I)),
-    (1998, "Reconhecimento de Vínculo Empregatício (Pejotização)", re.compile(r"v[ií]nculo\s+de\s+emprego|v[ií]nculo\s+empregat[ií]cio|anota[cç][aã]o\s+da\s+ctps|subordina[cç][aã]o\s+jur[ií]dica|pejotiza[cç][aã]o", re.I)),
-    (8801, "Acidente de Trabalho / Doença Ocupacional", re.compile(r"acidente\s+de\s+trabalho|doen[cç]a\s+ocupacional|ler\s*\/?\s*dort|nexo\s+causal|estabilidade\s+acident[aá]ria", re.I)),
-    (1682, "Adicional Noturno", re.compile(r"adicional\s+noturno|jornada\s+noturna|hora\s+noturna", re.I)),
-    (2555, "Reintegração e Estabilidade Provisória", re.compile(r"reintegra[cç][aã]o|estabilidade\s+provis[oó]ria|estabilidade\s+gestante|cipeir[ao]|acidente\s+de\s+trabalho", re.I)),
-    (10000, "Execução e Cumprimento de Sentença Trabalhista", re.compile(r"sisbajud|penhora|bloqueio|c[aá]lculos\s+de\s+liquida[cç][aã]o|cumprimento\s+de\s+senten[cç]a|execu[cç][aã]o\s+trabalhista|execu[cç][aã]o\s+de\s+t[ií]tulo", re.I)),
+    (224, "Direitos da Categoria Bancária (7ª e 8ª Horas / Cargo de Confiança)", re.compile(r"banc[aá]ri[ao]|cargo\s+de\s+confian[cç]a|7[aª]\s+hora|8[aª]\s+hora|s[eé]tima\s+e\s+oitava|enquadramento\s+banc[aá]rio|gratifica[cç][aã]o\s+de\s+fun[cç][aã]o|jornada\s+de\s+seis\s+horas|art\.\s*224")),
+    (2550, "Equiparação Salarial e Desvio de Função", re.compile(r"equipara[cç][aã]o\s+salarial|desvio\s+de\s+fun[cç][aã]o|paradigma|diferen[cç]as?\s+salariais?|ac[uú]mulo\s+de\s+fun[cç][aã]o")),
+    (2551, "Participação nos Lucros e Resultados (PLR) e Bônus", re.compile(r"\bplr\b|participa[cç][aã]o\s+nos\s+lucros|b[oô]nus|pr[eé]mio\s+produ[cç][aã]o|programa\s+de\s+remunera[cç][aã]o")),
+    (2552, "Cobrança de Metas e Estorno de Comissões", re.compile(r"estorno\s+de\s+comiss[oõ]es|cobran[cç]a\s+de\s+metas|metas\s+abusivas|diferen[cç]as?\s+de\s+comiss|comiss[oõ]es\s+por\s+vendas")),
+    (1694, "Horas Extras e Intervalo Intrajornada", re.compile(r"horas?\s+extras?|sobrejornada|intrajornada|banco\s+de\s+horas|art\.\s*71|controle\s+de\s+ponto|cart[aã]o\s+de\s+ponto|jornada\s+de\s+trabalho|dsr|sobreaviso")),
+    (2546, "Inadimplemento de Verbas Rescisórias e Multa 40%", re.compile(r"verbas\s+rescis[oó]rias|multa\s+do\s+art\.\s*477|multa\s+de\s+40%|aviso\s+pr[eé]vio\s+indenizado|saldo\s+de\s+sal[aá]rio|13[oº]\s+sal[aá]rio|f[eé]rias\s+proporcionais|trct|rescis[aã]o\s+indireta")),
+    (2029, "Irregularidade / Ausência de Depósitos de FGTS", re.compile(r"dep[oó]sitos?\s+do\s+fgts|extrato\s+anal[ií]tico\s+do\s+fgts|diferen[cç]as\s+de\s+fgts|fundo\s+de\s+garantia|saque\s+do\s+fgts|guias\s+de\s+fgts")),
+    (1855, "Assédio Moral e Danos Morais Trabalhistas", re.compile(r"ass[eé]dio\s+moral|dano\s+moral|danos\s+morais|indeniza[cç][aã]o\s+por\s+dano|humilha[cç][aã]o|tratamento\s+degradante")),
+    (1656, "Adicional de Insalubridade (NR-15)", re.compile(r"insalubridade|agente\s+insalubre|nr[\s-]*15|laudo\s+pericial\s+insalub")),
+    (1681, "Adicional de Periculosidade (NR-16)", re.compile(r"periculosidade|inflam[aá]veis|energia\s+el[eé]trica|nr[\s-]*16|risco\s+acentuado")),
+    (1904, "Responsabilidade Subsidiária / Terceirização (Súmula 331 TST)", re.compile(r"responsabilidade\s+subsidi[aá]ria|s[uú]mula\s*331|tomadora?\s+de\s+servi[cç]os|culpa\s+in\s+vigilando|terceiriza[cç][aã]o|prestadora\s+de\s+servi[cç]os")),
+    (1998, "Reconhecimento de Vínculo Empregatício (Pejotização)", re.compile(r"v[ií]nculo\s+de\s+emprego|v[ií]nculo\s+empregat[ií]cio|anota[cç][aã]o\s+da\s+ctps|subordina[cç][aã]o\s+jur[ií]dica|pejotiza[cç][aã]o")),
+    (8801, "Acidente de Trabalho / Doença Ocupacional", re.compile(r"acidente\s+de\s+trabalho|doen[cç]a\s+ocupacional|ler\s*\/?\s*dort|nexo\s+causal|estabilidade\s+acident[aá]ria")),
+    (1682, "Adicional Noturno", re.compile(r"adicional\s+noturno|jornada\s+noturna|hora\s+noturna")),
+    (2555, "Reintegração e Estabilidade Provisória", re.compile(r"reintegra[cç][aã]o|estabilidade\s+provis[oó]ria|estabilidade\s+gestante|cipeir[ao]|acidente\s+de\s+trabalho")),
+    (10000, "Execução e Cumprimento de Sentença Trabalhista", re.compile(r"sisbajud|penhora|bloqueio|c[aá]lculos\s+de\s+liquida[cç][aã]o|cumprimento\s+de\s+senten[cç]a|execu[cç][aã]o\s+trabalhista|execu[cç][aã]o\s+de\s+t[ií]tulo")),
 ]
+
+_CAUSE_FILTERS = [
+    (
+        code,
+        label,
+        p,
+        tuple({w for part in p.pattern.split("|") for w in re.findall(r"[a-z0-9]{3,}", part)}),
+    )
+    for code, label, p in DETAILED_CAUSE_PATTERNS
+]
+
+_CAUSE_CACHE: Dict[str, list] = {}
 
 
 def extract_real_cause_fast(
@@ -89,9 +331,17 @@ def extract_real_cause_fast(
     matched_causes = []
 
     if full_text:
-        for code, label, pattern in DETAILED_CAUSE_PATTERNS:
-            if pattern.search(full_text):
-                matched_causes.append({"codigo": code, "nome": label})
+        full_text_lower = full_text.lower()
+        if full_text_lower in _CAUSE_CACHE:
+            matched_causes = [dict(c) for c in _CAUSE_CACHE[full_text_lower]]
+        else:
+            for code, label, pattern, kws in _CAUSE_FILTERS:
+                if (not kws or any(kw in full_text_lower for kw in kws)) and pattern.search(full_text_lower):
+                    matched_causes.append({"codigo": code, "nome": label})
+                    if len(matched_causes) >= 3:
+                        break
+            if len(_CAUSE_CACHE) < 2048:
+                _CAUSE_CACHE[full_text_lower] = [dict(c) for c in matched_causes]
 
     # Se achou causas específicas no texto da publicação/sentença, usa elas prioritariamente!
     if matched_causes:
@@ -214,12 +464,10 @@ class CNJProcessSearcher:
 
     COMUNICA_URL = "https://comunicaapi.pje.jus.br/api/v1/comunicacao"
     DATAJUD_BASE = "https://api-publica.datajud.cnj.jus.br"
-    # Chave pública oficial disponibilizada pelo CNJ (https://datajud-wiki.cnj.jus.br)
-    DEFAULT_DATAJUD_KEY = "cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw=="  # gitleaks:allow
 
     def __init__(self, session: Optional[requests.Session] = None):
-        key = os.getenv("DATAJUD_API_KEY") or self.DEFAULT_DATAJUD_KEY
-        self.datajud_key = key.strip() if key else self.DEFAULT_DATAJUD_KEY
+        key = os.getenv("DATAJUD_API_KEY", "").strip()
+        self.datajud_key = key
         self.session = session or requests.Session()
         
         # Suporte a proxy dedicado isolado (não interfere no pip/build do Render)
@@ -695,10 +943,9 @@ class CNJProcessSearcher:
             by_alias[alias].append(cnj)
 
         datajud_results = {}
-        headers = {
-            "Authorization": f"APIKey {self.datajud_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
+        if self.datajud_key:
+            headers["Authorization"] = f"APIKey {self.datajud_key}"
 
         for alias, cnj_list in by_alias.items():
             url = f"{self.DATAJUD_BASE}/{alias}/_search"
@@ -707,7 +954,7 @@ class CNJProcessSearcher:
                 batch = cnj_list[i:i + 50]
                 body = {
                     "size": len(batch),
-                    "_source": ["numeroProcesso", "tribunal", "nivelSigilo", "assuntos", "movimentos.codigo", "grau"],
+                    "_source": ["numeroProcesso", "tribunal", "nivelSigilo", "assuntos", "movimentos.codigo", "grau", "dataAjuizamento", "valorCausa"],
                     "query": {
                         "terms": {
                             "numeroProcesso": batch
@@ -759,17 +1006,16 @@ class CNJProcessSearcher:
         top_tribunals = sorted_tribunals[:max_tribunals]
 
         datajud_results = {}
-        headers = {
-            "Authorization": f"APIKey {self.datajud_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
+        if self.datajud_key:
+            headers["Authorization"] = f"APIKey {self.datajud_key}"
 
         def _fetch_alias_batch(alias: str, cnjs: List[str]) -> List[Dict[str, Any]]:
             url = f"{self.DATAJUD_BASE}/{alias}/_search"
             batch = cnjs[:50]
             body = {
                 "size": len(batch),
-                "_source": ["numeroProcesso", "tribunal", "nivelSigilo", "assuntos", "movimentos.codigo", "grau"],
+                "_source": ["numeroProcesso", "tribunal", "nivelSigilo", "assuntos", "movimentos.codigo", "grau", "dataAjuizamento", "valorCausa"],
                 "query": {
                     "terms": {
                         "numeroProcesso": batch
@@ -877,10 +1123,22 @@ class CNJProcessSearcher:
         grau_val = "TST (Recursal)" if is_tst else dj.get("grau", "G1")
         sigilo_val = int(dj.get("nivelSigilo", 0))
 
+        # Metadados judiciais: data de distribuição, valor da causa e tribunal canônico
+        raw_dist = dj.get("dataAjuizamento") or com_data.get("dataUltimaPublicacao") or com_data.get("data_disponibilizacao")
+        data_distribuicao = parse_iso_date(raw_dist, text_fallback=texto_concat)
+
+        raw_val = dj.get("valorCausa")
+        valor_causa = parse_currency_value(raw_val, text_fallback=texto_concat)
+
+        raw_trib = dj.get("tribunal") or com_data.get("siglaTribunal") or com_data.get("tribunal")
+        canonical_tribunal = normalize_court_code(raw_trib, cnj=cnj)
+
         return {
             "numeroProcesso": cnj,
             "numero_processo": cnj,
-            "tribunal": dj.get("tribunal") or com_data.get("siglaTribunal", "N/A"),
+            "tribunal": canonical_tribunal or dj.get("tribunal") or com_data.get("siglaTribunal", "N/A"),
+            "data_distribuicao": data_distribuicao,
+            "valor_causa": valor_causa,
             "grau": grau_val,
             "is_tst_recurso": is_tst,
             "nivelSigilo": sigilo_val,
@@ -917,3 +1175,13 @@ class CNJProcessSearcher:
     def _infer_subjects_from_text(texto: str) -> List[Dict[str, Any]]:
         """Infere o motivo do processo pelo texto da publicação utilizando extract_real_cause_fast."""
         return extract_real_cause_fast([], [texto])
+
+
+def detect_subsidiary_liability_in_processes(
+    processes: List[Dict[str, Any]],
+    evaluated_company: str = "",
+    evaluated_cnpj: str = "",
+) -> Dict[str, Any]:
+    """Re-exportação utilitária de detecção de responsabilidade subsidiária (US-19)."""
+    from app.services.ai_analyzer import detect_subsidiary_liability_in_processes as _detect
+    return _detect(processes, evaluated_company=evaluated_company, evaluated_cnpj=evaluated_cnpj)

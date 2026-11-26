@@ -1,6 +1,6 @@
 export const config = {
   runtime: 'edge',
-  regions: ['gru1'], // Força execução física em São Paulo (Guarulhos - Brasil)
+  regions: ['gru1'], // Forca execucao fisica em Sao Paulo (Guarulhos - Brasil)
 };
 
 const ALLOWED_HOSTS = new Set([
@@ -9,7 +9,91 @@ const ALLOWED_HOSTS = new Set([
   'api.portaldatransparencia.gov.br',
 ]);
 
+const DEFAULT_COMUNICA_URL = 'https://comunicaapi.pje.jus.br/api/v1/comunicacao';
+const DEFAULT_DATAJUD_BASE_URL = 'https://api-publica.datajud.cnj.jus.br';
+
+/**
+ * Comparacao segura em tempo constante para prevenir timing attacks.
+ */
+function constantTimeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') {
+    return false;
+  }
+  const encoder = new TextEncoder();
+  const bufA = encoder.encode(a);
+  const bufB = encoder.encode(b);
+  const maxLen = Math.max(bufA.length, bufB.length);
+
+  let diff = bufA.length ^ bufB.length;
+  for (let i = 0; i < maxLen; i++) {
+    const byteA = i < bufA.length ? bufA[i] : 0;
+    const byteB = i < bufB.length ? bufB[i] : 0;
+    diff |= byteA ^ byteB;
+  }
+  return diff === 0;
+}
+
+function resolveUpstreamUrl(request) {
+  const reqUrl = new URL(request.url);
+  const rawTarget = (
+    reqUrl.searchParams.get('target') ||
+    request.headers.get('x-target-url') ||
+    reqUrl.searchParams.get('url') ||
+    ''
+  ).trim();
+
+  if (rawTarget) {
+    let parsed;
+    try {
+      parsed = new URL(rawTarget);
+    } catch {
+      return { url: null, status: 400, error: 'Invalid target URL' };
+    }
+    if (parsed.protocol !== 'https:' || !ALLOWED_HOSTS.has(parsed.hostname)) {
+      return { url: null, status: 400, error: 'Host not allowed by proxy whitelist' };
+    }
+    return { url: parsed.toString(), status: 200, error: null };
+  }
+
+  const service = (reqUrl.searchParams.get('service') || '').trim().toLowerCase();
+  const alias = (reqUrl.searchParams.get('alias') || '').trim();
+  if (service === 'datajud' || alias) {
+    if (!/^api_publica_[a-z0-9_]+$/i.test(alias)) {
+      return { url: null, status: 400, error: 'Invalid DataJud alias' };
+    }
+    return { url: `${DEFAULT_DATAJUD_BASE_URL}/${alias}/_search`, status: 200, error: null };
+  }
+
+  const forwardParams = new URLSearchParams(reqUrl.searchParams);
+  forwardParams.delete('target');
+  forwardParams.delete('url');
+  forwardParams.delete('service');
+  forwardParams.delete('alias');
+  const qs = forwardParams.toString();
+  if (qs) {
+    return { url: `${DEFAULT_COMUNICA_URL}?${qs}`, status: 200, error: null };
+  }
+  return { url: null, status: 400, error: 'Missing target URL' };
+}
+
 export default async function handler(req) {
+  const expectedSecret = (typeof process !== 'undefined' && process.env && process.env.PROXY_SHARED_SECRET)
+    ? String(process.env.PROXY_SHARED_SECRET).trim()
+    : '';
+  const providedSecret = (req.headers.get('x-proxy-secret') || '').trim();
+
+  // Validacao obrigatoria em tempo constante antes de qualquer requisicao externa
+  if (!expectedSecret || !providedSecret || !constantTimeEqual(providedSecret, expectedSecret)) {
+    return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+      status: 401,
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
+  }
+
   if (req.method === 'OPTIONS') {
     return new Response(null, {
       status: 204,
@@ -21,58 +105,18 @@ export default async function handler(req) {
     });
   }
 
-  const expectedSecret = (typeof process !== 'undefined' && process.env && process.env.PROXY_SHARED_SECRET)
-    ? String(process.env.PROXY_SHARED_SECRET).trim()
-    : '';
-  if (expectedSecret) {
-    const authHeader = req.headers.get('authorization') || '';
-    const bearerSecret = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : authHeader.trim();
-    const providedSecret = (req.headers.get('x-proxy-secret') || bearerSecret || '').trim();
-    let isMatch = providedSecret.length === expectedSecret.length;
-    let diff = 0;
-    const len = Math.max(providedSecret.length, expectedSecret.length);
-    for (let i = 0; i < len; i++) {
-      const charA = i < providedSecret.length ? providedSecret.charCodeAt(i) : 0;
-      const charB = i < expectedSecret.length ? expectedSecret.charCodeAt(i) : 0;
-      diff |= charA ^ charB;
-    }
-    if (!isMatch || diff !== 0) {
-      return new Response(JSON.stringify({ error: 'Unauthorized proxy access' }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-      });
-    }
-  } else {
-    console.warn('[Proxy Warning] PROXY_SHARED_SECRET não configurado. Operando em modo aberto para desenvolvimento.');
-  }
-
-  const urlObj = new URL(req.url);
-  const targetUrl = urlObj.searchParams.get('target') || req.headers.get('x-target-url');
-
-  if (!targetUrl) {
-    return new Response(JSON.stringify({ error: 'Missing target URL' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+  const resolved = resolveUpstreamUrl(req);
+  if (!resolved.url) {
+    return new Response(JSON.stringify({ error: resolved.error }), {
+      status: resolved.status,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      },
     });
   }
 
-  let parsedTarget;
-  try {
-    parsedTarget = new URL(targetUrl);
-  } catch {
-    return new Response(JSON.stringify({ error: 'Invalid target URL' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-    });
-  }
-
-  if (!ALLOWED_HOSTS.has(parsedTarget.hostname)) {
-    return new Response(JSON.stringify({ error: 'Host not allowed by proxy whitelist' }), {
-      status: 403,
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
-    });
-  }
-
+  const parsedTarget = new URL(resolved.url);
   const forwardHeaders = new Headers();
   forwardHeaders.set(
     'User-Agent',
@@ -81,7 +125,6 @@ export default async function handler(req) {
   forwardHeaders.set('Accept', 'application/json, text/plain, */*');
   forwardHeaders.set('Accept-Language', 'pt-BR,pt;q=0.9,en-US;q=0.8');
 
-  // Repassa headers de autenticação do DataJud (Authorization: APIKey ...) ou CGU (chave-api-dados)
   const authHeader = req.headers.get('authorization');
   if (authHeader) forwardHeaders.set('Authorization', authHeader);
 
@@ -97,11 +140,12 @@ export default async function handler(req) {
   }
 
   try {
+    const method = req.method.toUpperCase();
     const bodyText =
-      req.method !== 'GET' && req.method !== 'HEAD' ? await req.text() : undefined;
+      method !== 'GET' && method !== 'HEAD' ? await req.text() : undefined;
 
     const upstreamRes = await fetch(parsedTarget.toString(), {
-      method: req.method,
+      method,
       headers: forwardHeaders,
       body: bodyText,
     });
@@ -111,15 +155,18 @@ export default async function handler(req) {
       status: upstreamRes.status,
       headers: {
         'Content-Type': upstreamRes.headers.get('content-type') || 'application/json',
+        'Cache-Control': 'no-store',
         'Access-Control-Allow-Origin': '*',
         'X-Proxy-Region': 'gru1-sp',
       },
     });
   } catch (err) {
-    return new Response(JSON.stringify({ error: String(err) }), {
+    return new Response(JSON.stringify({ error: String(err?.message || err) }), {
       status: 502,
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      },
     });
   }
 }
-
