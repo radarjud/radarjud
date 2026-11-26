@@ -304,6 +304,9 @@ def _deep_scan_background_worker(
             search.predictions_summary = deep_results.get("plus_previsao_condenacao", [])
             search.overall_risk_score = deep_results.get("score_risco_terceirizacao", 0.0)
             search.ai_analysis = deep_results.get("ai_analysis", {})
+            if "condenacoes_subsidiarias_tomadoras_count" in deep_results:
+                search.condenacoes_subsidiarias_tomadoras_count = deep_results.get("condenacoes_subsidiarias_tomadoras_count", 0)
+                search.tomadoras_subsidiarias_pj = deep_results.get("tomadoras_subsidiarias_pj", [])
             search.movements_hash = deep_results.get("movements_hash")
             search.economic_standing = deep_results["idoneidade_economica"]
             if search.economic_standing and isinstance(search.economic_standing, dict):
@@ -337,6 +340,8 @@ def _deep_scan_background_worker(
                             observation=proc.get("observation"),
                             sentence_outcome=proc.get("sentence_outcome", "em_aberto"),
                             has_expert_report=proc.get("has_expert_report", False),
+                            has_subsidiary_liability=bool(proc.get("has_subsidiary_liability", False)),
+                            subsidiary_contractors_json=proc.get("subsidiary_contractors") or [],
                             data_distribuicao=proc.get("data_distribuicao"),
                             valor_causa=proc.get("valor_causa"),
                             raw_metadata=proc.get("raw_metadata"),
@@ -782,6 +787,8 @@ def search_company():
                 economic_standing=econ_data,
                 cnae_codigo=econ_data.get("cnae_codigo") if isinstance(econ_data, dict) else None,
                 cnae_descricao=econ_data.get("cnae_descricao") if isinstance(econ_data, dict) else None,
+                condenacoes_subsidiarias_tomadoras_count=fast_results.get("condenacoes_subsidiarias_tomadoras_count", 0),
+                tomadoras_subsidiarias_pj=fast_results.get("tomadoras_subsidiarias_pj", []),
                 overall_risk_score=fast_results.get("score_risco_terceirizacao", 0.0),
                 ai_analysis=fast_results.get("ai_analysis", {}),
                 movements_hash=new_hash,
@@ -806,6 +813,8 @@ def search_company():
                     observation=proc.get("observation"),
                     sentence_outcome=proc.get("sentence_outcome", "em_aberto"),
                     has_expert_report=proc.get("has_expert_report", False),
+                    has_subsidiary_liability=bool(proc.get("has_subsidiary_liability", False)),
+                    subsidiary_contractors_json=proc.get("subsidiary_contractors") or [],
                     data_distribuicao=proc.get("data_distribuicao"),
                     valor_causa=proc.get("valor_causa"),
                     raw_metadata=proc.get("raw_metadata"),
@@ -1985,6 +1994,7 @@ def get_search_history():
 
 
 @api_bp.route("/history/<int:search_id>", methods=["GET", "DELETE"])
+@api_bp.route("/searches/<int:search_id>", methods=["GET"])
 def get_search_detail(search_id: int):
     """
     GET: Retorna os dados detalhados e a lista de processos de uma análise específica.

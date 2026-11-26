@@ -110,6 +110,24 @@ class CompanySearch(db.Model):
             from app.services.prediction_engine import build_condenacao_por_motivo
             cond_por_motivo = build_condenacao_por_motivo([p.to_dict() for p in self.processes])
 
+        sub_count = self.condenacoes_subsidiarias_tomadoras_count
+        sub_tomadoras = self.tomadoras_subsidiarias_pj
+        if (sub_count is None or sub_tomadoras is None) and self.processes:
+            from app.services.ai_analyzer import detect_subsidiary_liability_in_processes
+            sub_res = detect_subsidiary_liability_in_processes(
+                [p.to_dict() for p in self.processes],
+                evaluated_company=self.company_name,
+            )
+            sub_count = sub_res["condenacoes_subsidiarias_tomadoras_count"]
+            sub_tomadoras = sub_res["tomadoras_subsidiarias_pj"]
+        sub_count = int(sub_count or 0)
+        sub_tomadoras = list(sub_tomadoras or [])
+        msg_sub = (
+            f"Histórico de Responsabilidade Subsidiária: {sub_count} processos com condenação subsidiária atribuída a contratantes anteriores"
+            if sub_count > 0
+            else "Nenhuma condenação subsidiária de contratante identificada na amostra"
+        )
+
         return {
             "id": self.id,
             "tenant_id": self.tenant_id,
@@ -143,13 +161,9 @@ class CompanySearch(db.Model):
             "idoneidade_economica": econ_data,
             "logo": self._sanitize_logo_for_export(econ_data.get("logo", {}) if isinstance(econ_data, dict) else {}),
             "ai_analysis": self.ai_analysis or {},
-            "condenacoes_subsidiarias_tomadoras_count": int(self.condenacoes_subsidiarias_tomadoras_count or 0),
-            "tomadoras_subsidiarias_pj": self.tomadoras_subsidiarias_pj or [],
-            "mensagem_responsabilidade_subsidiaria": (
-                f"Histórico de Responsabilidade Subsidiária: {int(self.condenacoes_subsidiarias_tomadoras_count or 0)} processos com condenação subsidiária atribuída a contratantes anteriores"
-                if int(self.condenacoes_subsidiarias_tomadoras_count or 0) > 0
-                else "Nenhuma condenação subsidiária de contratante identificada na amostra"
-            ),
+            "condenacoes_subsidiarias_tomadoras_count": sub_count,
+            "tomadoras_subsidiarias_pj": sub_tomadoras,
+            "mensagem_responsabilidade_subsidiaria": msg_sub,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
