@@ -267,6 +267,21 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         else "Nada Consta (CEIS/CNEP/PGFN)"
     )
 
+    # Sinais Públicos de Solvência Real e Certidões (US-22)
+    sinais_solvencia = (
+        data.get("sinais_solvencia_publica")
+        or econ.get("sinais_solvencia_publica")
+        or {}
+    )
+    if not sinais_solvencia:
+        from app.services.solvency_signals_service import solvency_signals_service
+        sinais_solvencia = solvency_signals_service.consolidate_solvency_signals(
+            company_name=company_name,
+            cnpj=raw_cnpj,
+            cadastral_data={"situacao_cadastral": situacao_rfb},
+            capital_social=float(econ.get("capital_social_num") or 0.0),
+        )
+
     # Rankings
     raw_cond_ranking = (
         data.get("ranking_motivos_condenacao")
@@ -375,7 +390,12 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             "prob_insolv": prob_insolv,
             "risco_sub": risco_sub,
             "sancoes_texto": sancoes_texto,
+            "sinais_solvencia_publica": sinais_solvencia,
+            "demonstracao_contabil_status": sinais_solvencia.get("demonstracao_contabil_status"),
+            "resumo_solvencia": sinais_solvencia.get("resumo_solvencia"),
+            "fontes_consultadas": sinais_solvencia.get("fontes_consultadas", []),
         },
+        "sinais_solvencia_publica": sinais_solvencia,
         "ranking_condenacoes": ranking_condenacoes,
         "ranking_motivos": ranking_motivos,
         "condenacao_por_motivo": condenacao_por_motivo,

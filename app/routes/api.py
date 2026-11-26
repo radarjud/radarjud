@@ -283,6 +283,7 @@ def _deep_scan_background_worker(
             deep_results["unidades_consolidadas"] = econ.get("unidades_consolidadas") or cap_display.get("unidades_consolidadas", 1)
             deep_results["observacao_porte"] = econ.get("observacao_porte") or cap_display.get("observacao_porte", "")
             deep_results["capital_social_display"] = econ.get("capital_social_display") or cap_display
+            deep_results["sinais_solvencia_publica"] = econ.get("sinais_solvencia_publica")
 
             deep_results["ai_analysis"] = orchestrator.ai_analyzer.analyze_company(deep_results)
             deep_results["parecer_agente_adk"] = deep_results["ai_analysis"]
@@ -615,6 +616,7 @@ def search_company():
                 res["capital_social_consolidado"] = econ_data.get("valor_formatado") or econ_data.get("capital_social_formatado")
                 res["observacao_porte"] = econ_data.get("observacao_porte")
                 res["capital_social_display"] = econ_data.get("capital_social_display")
+                res["sinais_solvencia_publica"] = econ_data.get("sinais_solvencia_publica")
                 if econ_data.get("indice_exposicao_financeira") is not None:
                     res["indice_exposicao_financeira"] = econ_data["indice_exposicao_financeira"]
                     res["score_risco_terceirizacao"] = econ_data["indice_exposicao_financeira"]
@@ -751,6 +753,7 @@ def search_company():
         fast_results["capital_social_consolidado"] = econ_data.get("valor_formatado") or econ_data.get("capital_social_formatado")
         fast_results["observacao_porte"] = econ_data.get("observacao_porte")
         fast_results["capital_social_display"] = econ_data.get("capital_social_display")
+        fast_results["sinais_solvencia_publica"] = econ_data.get("sinais_solvencia_publica")
         if econ_data.get("indice_exposicao_financeira") is not None:
             fast_results["indice_exposicao_financeira"] = econ_data["indice_exposicao_financeira"]
             fast_results["score_risco_terceirizacao"] = econ_data["indice_exposicao_financeira"]
@@ -2029,6 +2032,7 @@ def get_search_detail(search_id: int):
             result["condenacao_por_motivo"] = fresh_metrics.get("condenacao_por_motivo", search.condenacao_por_motivo or [])
             result["previsao_bloqueada"] = fresh_metrics.get("previsao_bloqueada", False)
             result["motivo_bloqueio_previsao"] = fresh_metrics.get("motivo_bloqueio_previsao")
+        result["sinais_solvencia_publica"] = result.get("sinais_solvencia_publica") or (result.get("idoneidade_economica") or {}).get("sinais_solvencia_publica")
         result["parecer_agente_adk"] = result.get("ai_analysis", {})
         return jsonify(result), 200
     except Exception as exc:

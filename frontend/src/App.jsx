@@ -132,6 +132,7 @@ function normalize(raw) {
     previsaoBloqueada: isPrevisaoBloqueada,
     motivoBloqueioPrevisao: payload.motivo_bloqueio_previsao || (isPrevisaoBloqueada ? 'Previsão de condenação desativada por ausência de passivo condenatório prévio na amostra (presunção de conformidade e integridade probatória - Súmula 331 TST).' : null),
     idoneidadeEconomica: econ,
+    sinaisSolvenciaPublica: payload.sinais_solvencia_publica || econ?.sinais_solvencia_publica || null,
     subsidiaryRisk: subsidiaryRisk(rawEcon),
     hasEconomicData: Boolean(rawEcon),
     logo: logo,
@@ -440,7 +441,16 @@ function Overview({ data, navigate, catalogTerm }) {
 
 
       {hasData && <Panel title="Diligência complementar" subtitle="Informações para verificar antes da contratação">
-        <p>Histórico de responsabilidade subsidiária, contratos públicos e alertas de PEP: dados específicos não disponibilizados nesta consulta.</p>
+        {data.sinaisSolvenciaPublica?.resumo_solvencia ? (
+          <p><strong>Solvência e Certidões:</strong> {businessText(data.sinaisSolvenciaPublica.resumo_solvencia)}</p>
+        ) : (
+          <p>Histórico de responsabilidade subsidiária, contratos públicos e alertas de PEP: dados específicos não disponibilizados nesta consulta.</p>
+        )}
+        {data.sinaisSolvenciaPublica?.orientacao_homologacao && (
+          <p style={{ color: '#245a81', fontWeight: 600 }}>
+            📌 Orientação de Homologação: {businessText(data.sinaisSolvenciaPublica.orientacao_homologacao)}
+          </p>
+        )}
         {data.hasEconomicData && <p>Restrições federais: {data.idoneidadeEconomica.possui_sancoes_cgu || data.idoneidadeEconomica.possui_divida_ativa ? 'Apontamentos informados' : 'Consulte as bases oficiais para confirmação'}.</p>}
       </Panel>}
       {/* Parecer do Consultor de Inteligência Artificial (Agente ADK radarjusAgent) */}
@@ -557,6 +567,7 @@ function Overview({ data, navigate, catalogTerm }) {
       {/* Idoneidade Econômica & Risco de Exposição Subsidiária */}
       {data?.hasEconomicData && (() => {
         const econ = data.idoneidadeEconomica;
+        const sinais = data.sinaisSolvenciaPublica || econ?.sinais_solvencia_publica || {};
         const isCenarioA = (econ.cenario_tipo === 'CENARIO_A') || (econ.cenario === 'CENARIO_A') || (econ.cenario_class === 'seguro');
         const badgePorte = econ.badge_compatibilidade_porte || econ.observacao_porte || econ.capital_social_display?.observacao_porte;
         const capitalFormatted = econ.capital_social_formatado || econ.valor_formatado || econ.capital_social_display?.valor_formatado || 'R$ 0,00';
@@ -656,6 +667,39 @@ function Overview({ data, navigate, catalogTerm }) {
                   </small>
                 </div>
               </div>
+
+              {/* Sinais Públicos de Solvência e Certidões (US-22) */}
+              {Array.isArray(sinais?.fontes_consultadas) && sinais.fontes_consultadas.length > 0 && (
+                <div style={{ marginTop: '12px', background: '#f8fafc', padding: '14px', borderRadius: '8px', border: '1px solid #e2e8f0' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap', gap: '6px' }}>
+                    <strong style={{ fontSize: '13px', color: '#1e293b' }}>
+                      Fontes e Certidões Públicas Verificadas
+                    </strong>
+                    <span style={{ fontSize: '12px', color: '#475569' }}>
+                      Demonstrações Contábeis: <b>{sinais.demonstracao_contabil_status || 'Demonstração contábil pública indisponível'}</b>
+                    </span>
+                  </div>
+                  <div style={{ display: 'grid', gap: '8px' }}>
+                    {sinais.fontes_consultadas.map((f, idx) => (
+                      <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px', padding: '8px 10px', background: '#fff', borderRadius: '6px', border: '1px solid #edf2f7', flexWrap: 'wrap', gap: '8px' }}>
+                        <span style={{ color: '#334155' }}>
+                          <strong>{f.fonte}:</strong> {f.detalhe}
+                        </span>
+                        <span style={{
+                          fontWeight: 600,
+                          padding: '2px 8px',
+                          borderRadius: '4px',
+                          fontSize: '11px',
+                          background: f.status === 'Regular' ? '#dcfce7' : f.status === 'Restrição identificada' ? '#fee2e2' : '#f1f5f9',
+                          color: f.status === 'Regular' ? '#166534' : f.status === 'Restrição identificada' ? '#991b1b' : '#475569',
+                        }}>
+                          {f.status}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           <p>Status da varredura: {translateScanStatus(data.scanStatus)} · Desfechos mapeados: {formatNumber(classified)} · Transparência: {secrecyEntries.length ? "Parcial" : "Indisponível"}</p><p>Estimativa baseada no histórico e porte; faixa provável de variação (90% de confiança) quando disponível.</p></details>
         );
