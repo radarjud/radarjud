@@ -9,6 +9,7 @@ from app.services.monitoring_job import (
     evaluate_monitored_supplier,
     dispatch_alert,
 )
+from app.services.ai_analyzer import detect_subsidiary_liability_in_processes
 from app.services.notifier import NotificationService
 from app.services.task_dispatcher import (
     TaskDispatcher,
@@ -28,10 +29,10 @@ __all__ = [
     "run_monitoring_job",
     "evaluate_monitored_supplier",
     "dispatch_alert",
+    "detect_subsidiary_liability_in_processes",
     "NotificationService",
     "TaskDispatcher",
     "UpstashRedisDispatcher",
     "InProcessFallbackDispatcher",
     "get_task_dispatcher",
 ]
-

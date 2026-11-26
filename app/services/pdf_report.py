@@ -346,6 +346,26 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
     scan_status = _safe_str(data.get("scan_status") or data.get("scanStatus"), "COMPLETED")
 
+    # Histórico de Responsabilidade Subsidiária (Súmula 331 TST - US-19)
+    sub_count = int(
+        data.get("condenacoes_subsidiarias_tomadoras_count")
+        if data.get("condenacoes_subsidiarias_tomadoras_count") is not None
+        else (
+            (ai.get("historico_responsabilidade_subsidiaria") or {}).get("condenacoes_subsidiarias_tomadoras_count") or 0
+        )
+    )
+    raw_sub_tomadoras = (
+        data.get("tomadoras_subsidiarias_pj")
+        or (ai.get("historico_responsabilidade_subsidiaria") or {}).get("tomadoras_subsidiarias_pj")
+        or []
+    )
+    sub_tomadoras = [str(t) for t in raw_sub_tomadoras if t] if isinstance(raw_sub_tomadoras, list) else []
+    sub_msg = (
+        f"Histórico de Responsabilidade Subsidiária: {sub_count} processos com condenação subsidiária atribuída a contratantes anteriores"
+        if sub_count > 0
+        else "Nenhuma condenação subsidiária de contratante identificada na amostra"
+    )
+
     return {
         "company_name": _safe_str(company_name, "Empresa Consultada"),
         "cnpj_formatted": cnpj_formatted,
@@ -356,6 +376,9 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         "prob_condenacao": prob_condenacao,
         "conf_label": conf_label,
         "conf_detail": conf_detail,
+        "condenacoes_subsidiarias_tomadoras_count": sub_count,
+        "tomadoras_subsidiarias_pj": sub_tomadoras,
+        "mensagem_responsabilidade_subsidiaria": sub_msg,
         "outcomes": {
             "condenacoes": int(outcomes.get("condenacoes") or 0),
             "acordos": int(outcomes.get("acordos") or 0),
@@ -385,6 +408,9 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             "resumo_executivo": resumo_executivo,
             "alertas_331": [str(a) for a in alertas_331 if a][:5],
             "recomendacoes": [str(r) for r in recomendacoes_comp if r][:5],
+            "condenacoes_subsidiarias_tomadoras_count": sub_count,
+            "tomadoras_subsidiarias_pj": sub_tomadoras,
+            "mensagem_responsabilidade_subsidiaria": sub_msg,
         },
     }
 
@@ -722,6 +748,41 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
         for rec_item in comp["recomendacoes"]:
             story.append(Paragraph(f"• {_xml_escape(rec_item)}", style_small))
 
+    # Histórico de Responsabilidade Subsidiária (Súmula 331 TST - US-19)
+    sub_count = int(comp.get("condenacoes_subsidiarias_tomadoras_count", 0) or 0)
+    sub_tomadoras = comp.get("tomadoras_subsidiarias_pj") or []
+    sub_msg = comp.get("mensagem_responsabilidade_subsidiaria") or (
+        f"Histórico de Responsabilidade Subsidiária: {sub_count} processos com condenação subsidiária atribuída a contratantes anteriores"
+        if sub_count > 0
+        else "Nenhuma condenação subsidiária de contratante identificada na amostra"
+    )
+    story.append(Spacer(1, 6))
+    if sub_count > 0:
+        sub_card_bg = colors.HexColor("#fef7ea")
+        sub_border = colors.HexColor("#b67b23")
+        tomadoras_line = f"<br/><font size='8' color='#445566'><b>Tomadoras PJ identificadas:</b> {_xml_escape(', '.join(sub_tomadoras[:10]))}</font>" if sub_tomadoras else ""
+        sub_para = Paragraph(
+            f"<font color='#b67b23'><b>{_xml_escape(sub_msg)}</b></font>{tomadoras_line}",
+            style_small,
+        )
+    else:
+        sub_card_bg = colors.HexColor("#f0f9f4")
+        sub_border = colors.HexColor("#25865a")
+        sub_para = Paragraph(
+            f"<font color='#25865a'><b>{_xml_escape(sub_msg)}</b></font>",
+            style_small,
+        )
+    sub_box = Table([[sub_para]], colWidths=[page_w])
+    sub_box.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), sub_card_bg),
+        ("BOX", (0, 0), (-1, -1), 0.8, sub_border),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(sub_box)
+
     story.append(Spacer(1, 10))
     story.append(Paragraph(
         "Fontes Oficiais Consultadas: Comunica PJe (CNJ), DataJud (CNJ), Receita Federal do Brasil, CGU (CEIS/CNEP) e PGFN. "
@@ -789,11 +850,20 @@ def _generate_pdf_pure_python(report: Dict[str, Any]) -> bytes:
         else:
             lines.append("   Nenhuma condenacao ou vetor recorrente mapeado.")
 
+    sub_count_pure = int(comp.get("condenacoes_subsidiarias_tomadoras_count", 0) or 0)
+    sub_msg_pure = comp.get("mensagem_responsabilidade_subsidiaria") or (
+        f"Histórico de Responsabilidade Subsidiária: {sub_count_pure} processos com condenação subsidiária atribuída a contratantes anteriores"
+        if sub_count_pure > 0
+        else "Nenhuma condenação subsidiária de contratante identificada na amostra"
+    )
     lines.extend([
         "-" * 78,
         "4. PARECER EXECUTIVO DE COMPLIANCE (SUMULA 331 TST)",
         f"   Recomendacao: {comp['recomendacao']} | Perfil de Risco: {comp['perfil_risco']}",
+        f"   {sub_msg_pure}",
     ])
+    if comp.get("tomadoras_subsidiarias_pj"):
+        lines.append(f"   Tomadoras PJ: {', '.join(comp['tomadoras_subsidiarias_pj'][:5])}")
 
     # Quebra linhas longas para caber confortavelmente em A4
     wrapped_lines: List[str] = []
