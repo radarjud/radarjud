@@ -42,6 +42,7 @@ const OUTCOME_LABELS = {
 };
 const CHART_COLORS = ['#245a81', '#674b3c', '#b79b85', '#8998a7'];
 const formatNumber = (value) => new Intl.NumberFormat('pt-BR').format(Number(value) || 0);
+const formatMoneyBRL = (value) => value == null ? null : new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(Number(value) || 0);
 const formatPercent = (value) => `${Number(value || 0).toLocaleString('pt-BR', { maximumFractionDigits: 1 })}%`;
 const formatProcessNumber = (raw) => {
   if (!raw) return 'Não informado';
@@ -126,6 +127,21 @@ function normalize(raw) {
       : 'Nenhuma condenação subsidiária de contratante identificada na amostra'
   );
 
+  const cpObj = isRecord(payload.contratos_poder_publico) ? payload.contratos_poder_publico : {};
+  const cpStatus = String(cpObj.status || 'DISPONIVEL').toUpperCase();
+  const cpTotal = typeof cpObj.total_contratos === 'number' ? cpObj.total_contratos : 0;
+  const cpEsferas = Array.isArray(cpObj.esferas) ? cpObj.esferas : [];
+  const cpOrgaos = Array.isArray(cpObj.orgaos_contratantes) ? cpObj.orgaos_contratantes : [];
+  const cpValorTotal = typeof cpObj.valor_global_total === 'number' ? cpObj.valor_global_total : null;
+  const cpValorFormatado = cpObj.valor_global_formatado || (cpValorTotal != null ? formatMoneyBRL(cpValorTotal) : null);
+  const cpMsg = cpObj.mensagem || (
+    cpStatus === 'INDISPONIVEL'
+      ? 'Base governamental temporariamente indisponível no momento da consulta.'
+      : (cpTotal === 0
+        ? 'Nenhum contrato público localizado nas bases consultadas'
+        : `${cpTotal} contrato(s) público(s) identificado(s) nas bases governamentais`)
+  );
+
   return {
     name: companyName,
     total: total,
@@ -134,6 +150,13 @@ function normalize(raw) {
     subsidiaryLiabilityCount: subCount,
     subsidiaryContractorsPJ: subTomadoras,
     subsidiaryMessage: subMsg,
+    publicContractsStatus: cpStatus,
+    publicContractsTotal: cpTotal,
+    publicContractsEsferas: cpEsferas,
+    publicContractsOrgaos: cpOrgaos,
+    publicContractsValorTotal: cpValorTotal,
+    publicContractsValorFormatado: cpValorFormatado,
+    publicContractsMensagem: cpMsg,
     reasons: Array.isArray(payload.ranking_motivos) ? payload.ranking_motivos : [],
     rankingCondenacoes: Array.isArray(payload.ranking_motivos_condenacao) ? payload.ranking_motivos_condenacao : [],
     condenacaoPorMotivo: Array.isArray(payload.condenacao_por_motivo) ? payload.condenacao_por_motivo : [],
@@ -521,6 +544,140 @@ function Overview({ data, navigate, catalogTerm }) {
               </span>
             </div>
           )}
+
+          {/* US-20: Contratos com o Poder Público (PNCP / Portal da Transparência) */}
+          <div
+            className="public-contracts-section"
+            style={{
+              marginTop: '16px',
+              marginBottom: '16px',
+              boxSizing: 'border-box',
+              maxWidth: '100%',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', flexWrap: 'wrap' }}>
+              <Building2 size={16} color="#1a56db" />
+              <strong style={{ fontSize: '13px', color: '#17283a', textTransform: 'uppercase', letterSpacing: '0.02em' }}>
+                Contratos com o Poder Público
+              </strong>
+            </div>
+
+            {data.publicContractsStatus === 'INDISPONIVEL' ? (
+              <div
+                className="public-contracts-unavailable-card"
+                style={{
+                  background: '#f8fafc',
+                  borderLeft: '4px solid #64748b',
+                  padding: '12px 16px',
+                  borderRadius: '8px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  flexWrap: 'wrap',
+                  boxSizing: 'border-box',
+                  maxWidth: '100%',
+                }}
+              >
+                <AlertCircle size={18} color="#64748b" />
+                <span style={{ color: '#475569', fontSize: '13px' }}>
+                  Base governamental temporariamente indisponível no momento da consulta.
+                </span>
+              </div>
+            ) : data.publicContractsTotal > 0 ? (
+              <div
+                className="public-contracts-active-card"
+                style={{
+                  background: '#f0f7fc',
+                  borderLeft: '4px solid #1a56db',
+                  padding: '14px 18px',
+                  borderRadius: '8px',
+                  boxSizing: 'border-box',
+                  maxWidth: '100%',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap', marginBottom: '8px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    <strong style={{ color: '#1a56db', fontSize: '14px' }}>
+                      {data.publicContractsTotal} contrato(s) público(s) localizado(s)
+                    </strong>
+                    {data.publicContractsValorFormatado && (
+                      <span style={{ fontSize: '12px', color: '#1e293b', fontWeight: 600, background: '#e0effe', padding: '2px 8px', borderRadius: '4px' }}>
+                        Valor Global: {data.publicContractsValorFormatado}
+                      </span>
+                    )}
+                  </div>
+                  {data.publicContractsEsferas && data.publicContractsEsferas.length > 0 && (
+                    <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+                      {data.publicContractsEsferas.map((esfera, idx) => (
+                        <span
+                          key={idx}
+                          style={{
+                            background: '#dbeafe',
+                            color: '#1e40af',
+                            padding: '2px 7px',
+                            borderRadius: '4px',
+                            fontSize: '11px',
+                            fontWeight: 600,
+                          }}
+                        >
+                          {esfera}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {data.publicContractsOrgaos && data.publicContractsOrgaos.length > 0 && (
+                  <div style={{ marginTop: '8px' }}>
+                    <small style={{ color: '#556677', display: 'block', marginBottom: '6px', fontWeight: 600 }}>
+                      Órgãos Contratantes Identificados:
+                    </small>
+                    <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                      {data.publicContractsOrgaos.map((orgao, idx) => (
+                        <span
+                          key={idx}
+                          style={{
+                            background: '#fff',
+                            border: '1px solid #bfdbfe',
+                            color: '#1e3a8a',
+                            padding: '3px 8px',
+                            borderRadius: '4px',
+                            fontSize: '11px',
+                            fontWeight: 600,
+                            wordBreak: 'break-word',
+                          }}
+                        >
+                          {orgao}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div
+                className="public-contracts-empty-card"
+                style={{
+                  background: '#f0f9f4',
+                  borderLeft: '4px solid #25865a',
+                  padding: '12px 16px',
+                  borderRadius: '8px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  flexWrap: 'wrap',
+                  boxSizing: 'border-box',
+                  maxWidth: '100%',
+                }}
+              >
+                <CheckCircle2 size={18} color="#25865a" />
+                <span style={{ color: '#25865a', fontSize: '13px', fontWeight: 600 }}>
+                  Nenhum contrato público localizado nas bases consultadas
+                </span>
+              </div>
+            )}
+          </div>
+
           {data.hasEconomicData && (
             <p style={{ margin: 0, fontSize: '13px', color: '#556677' }}>
               Restrições federais: {data.idoneidadeEconomica.possui_sancoes_cgu || data.idoneidadeEconomica.possui_divida_ativa ? 'Apontamentos informados' : 'Consulte as bases oficiais para confirmação'}.

@@ -88,7 +88,34 @@ ul { margin: 4pt 0 8pt; padding-left: 15pt; }
 </div>
 {% endif %}
 {% if comp.alertas_331 %}<ul>{% for item in comp.alertas_331 %}<li>{{ item }}</li>{% endfor %}</ul>{% endif %}
-<p>Histórico de contratos públicos e alertas de PEP: dados específicos não disponibilizados nesta consulta.</p><h2>Resumo executivo</h2><p>{{ comp.resumo_executivo }}</p><h2>Resumo dos processos analisados</h2><table class="kpis"><tr>{% for label,value in [('Processos',report.total_processes),('Condenações',out.condenacoes),('Acordos',out.acordos),('Improcedentes',out.improcedentes),('Em aberto',out.em_aberto)] %}<td><div class="kpi-label">{{ label }}</div><div class="kpi-value num">{{ value }}</div></td>{% endfor %}</tr></table>{% if outcomes_svg %}<section class="chart-block"><h2>Distribuição de desfechos</h2><div class="chart-frame">{{ outcomes_svg | safe }}</div></section>{% endif %}<h2>Mais informações</h2><table class="econ"><colgroup><col style="width:54%"><col style="width:46%"></colgroup><tr>
+{% set cp = report.contratos_poder_publico or {} %}
+{% if cp.status == 'INDISPONIVEL' %}
+<div class="public-contracts-card" style="break-inside: avoid; background:#f8fafc; border-left:4px solid #64748b; padding:8px 12px; margin-bottom:10px; border-radius:4px;">
+  <span style="color:#475569; font-size:11px;">Base governamental temporariamente indisponível no momento da consulta.</span>
+</div>
+{% elif cp.total_contratos and cp.total_contratos > 0 %}
+<div class="public-contracts-card" style="break-inside: avoid; background:#f0f7fc; border-left:4px solid #1a56db; padding:8px 12px; margin-bottom:10px; border-radius:4px;">
+  <strong style="color:#1a56db; font-size:12px;">Contratos com o Poder Público: {{ cp.total_contratos }} contrato(s) localizado(s)</strong>
+  {% if cp.valor_global_formatado %}
+  <span style="font-size:11px; color:#17283a; font-weight:600; margin-left:6px;">(Valor Global: {{ cp.valor_global_formatado }})</span>
+  {% endif %}
+  {% if cp.esferas %}
+  <p style="margin:4px 0 0; font-size:11px; color:#334155;">
+    <strong>Esferas:</strong> {{ cp.esferas | join(', ') }}
+  </p>
+  {% endif %}
+  {% if cp.orgaos_contratantes %}
+  <p style="margin:3px 0 0; font-size:11px; color:#445566;">
+    <strong>Órgãos Contratantes:</strong> {{ cp.orgaos_contratantes | join(', ') }}
+  </p>
+  {% endif %}
+</div>
+{% else %}
+<div class="public-contracts-card" style="break-inside: avoid; background:#f0f9f4; border-left:4px solid #25865a; padding:8px 12px; margin-bottom:10px; border-radius:4px;">
+  <span style="color:#25865a; font-size:11px; font-weight:600;">Nenhum contrato público localizado nas bases consultadas</span>
+</div>
+{% endif %}
+<h2>Resumo executivo</h2><p>{{ comp.resumo_executivo }}</p><h2>Resumo dos processos analisados</h2><table class="kpis"><tr>{% for label,value in [('Processos',report.total_processes),('Condenações',out.condenacoes),('Acordos',out.acordos),('Improcedentes',out.improcedentes),('Em aberto',out.em_aberto)] %}<td><div class="kpi-label">{{ label }}</div><div class="kpi-value num">{{ value }}</div></td>{% endfor %}</tr></table>{% if outcomes_svg %}<section class="chart-block"><h2>Distribuição de desfechos</h2><div class="chart-frame">{{ outcomes_svg | safe }}</div></section>{% endif %}<h2>Mais informações</h2><table class="econ"><colgroup><col style="width:54%"><col style="width:46%"></colgroup><tr>
 <td><div class="econ-label">CAPITAL SOCIAL DECLARATÓRIO</div><div class="econ-value num">{{ econ.capital_fmt }}</div><div class="detail">{{ econ.badge_porte }}<br>{{ econ.subtitulo_unidades }}</div></td>
 <td><div class="econ-label">SITUAÇÃO CADASTRAL RFB</div><div class="econ-value" style="color:{{ '#25865a' if econ.situacao_rfb == 'ATIVA' else '#c34a4a' }}">{{ econ.situacao_rfb }}</div><div class="detail">Sanções/Débitos: {{ econ.sancoes_texto }}</div></td>
 </tr><tr>

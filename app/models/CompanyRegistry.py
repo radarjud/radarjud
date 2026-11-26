@@ -22,6 +22,10 @@ class CompanyRegistry(db.Model):
     cnae_codigo = db.Column(db.String(20), nullable=True, index=True)
     cnae_descricao = db.Column(db.String(255), nullable=True)
 
+    # Contratos com o Poder Público (PNCP / Portal da Transparência - US-20)
+    public_contracts = db.Column(db.JSON, nullable=True)
+    public_contracts_cached_at = db.Column(db.DateTime, nullable=True)
+
     created_at = db.Column(db.DateTime, default=get_utc_now, nullable=False)
     updated_at = db.Column(
         db.DateTime,
@@ -43,6 +47,8 @@ class CompanyRegistry(db.Model):
             "capital_social": float(self.capital_social) if self.capital_social is not None else None,
             "cnae_codigo": self.cnae_codigo,
             "cnae_descricao": self.cnae_descricao,
+            "public_contracts": self.public_contracts,
+            "public_contracts_cached_at": self.public_contracts_cached_at.isoformat() if self.public_contracts_cached_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
