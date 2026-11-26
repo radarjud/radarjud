@@ -10,6 +10,13 @@ from app.services.monitoring_job import (
     dispatch_alert,
 )
 from app.services.ai_analyzer import detect_subsidiary_liability_in_processes
+from app.services.notifier import NotificationService
+from app.services.task_dispatcher import (
+    TaskDispatcher,
+    UpstashRedisDispatcher,
+    InProcessFallbackDispatcher,
+    get_task_dispatcher,
+)
 
 __all__ = [
     "CNJClient",
@@ -23,5 +30,9 @@ __all__ = [
     "evaluate_monitored_supplier",
     "dispatch_alert",
     "detect_subsidiary_liability_in_processes",
+    "NotificationService",
+    "TaskDispatcher",
+    "UpstashRedisDispatcher",
+    "InProcessFallbackDispatcher",
+    "get_task_dispatcher",
 ]
-

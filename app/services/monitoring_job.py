@@ -102,17 +102,13 @@ def evaluate_monitored_supplier(
     }
 
 
-def dispatch_alert(
+def _build_alert_payload(
     supplier: MonitoredSupplier,
     triggers: list[str],
     deltas: dict[str, Any],
-    timeout: float = 5.0,
 ) -> dict[str, Any]:
-    """
-    Despacha o payload estruturado de alerta (integração US-11) para os canais cadastrados
-    do tenant (webhook_url e alert_email), respeitando estritamente a LGPD e Anti-IDOR.
-    """
-    payload = {
+    """Constrói payload estruturado e compatível com LGPD para alertas US-09/US-11."""
+    return {
         "event": "SUPPLIER_ALERT",
         "tenant_id": supplier.tenant_id,
         "supplier_id": supplier.id,
@@ -124,6 +120,19 @@ def dispatch_alert(
         "alert_email": supplier.alert_email,
         "timestamp": datetime.now(UTC).isoformat(),
     }
+
+
+def dispatch_alert(
+    supplier: MonitoredSupplier,
+    triggers: list[str],
+    deltas: dict[str, Any],
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """
+    Despacha o payload estruturado de alerta (integração US-11) para os canais cadastrados
+    do tenant (webhook_url e alert_email), respeitando estritamente a LGPD e Anti-IDOR.
+    """
+    payload = _build_alert_payload(supplier, triggers, deltas)
 
     result = {
         "tenant_id": supplier.tenant_id,
@@ -172,6 +181,7 @@ def run_monitoring_job(
     tenant_id: int | None = None,
     evaluator_fn: Callable[[MonitoredSupplier], dict[str, Any]] | None = None,
     timeout_webhook: float = 5.0,
+    dispatcher: Any = None,
 ) -> dict[str, Any]:
     """
     Executa a rotina periódica de monitoramento contínuo sobre fornecedores ativos.
@@ -179,11 +189,13 @@ def run_monitoring_job(
     - Executa gc.collect() a cada lote.
     - Detecção determinística de 4 gatilhos de alerta.
     - Idempotência estrita: 0 alertas duplicados quando não há novos eventos.
-    - Retorna sumário estruturado de execução.
+    - Quando `dispatcher` (TaskDispatcher US-11) é fornecido, enfileira os alertas
+      assincronamente para processamento desacoplado via Redis/Fallback.
     """
     start_time = time.time()
     total_processed = 0
     total_alerts_emitted = 0
+    total_enqueued = 0
     total_errors = 0
     alert_events: list[dict[str, Any]] = []
 
@@ -272,11 +284,24 @@ def run_monitoring_job(
                         "after": new_scenario,
                     }
 
-                # Idempotência: só despacha alerta se houver gatilhos críticos detectados
+                # Idempotência: só despacha/enfileira alerta se houver gatilhos críticos detectados
                 if triggers:
-                    dispatch_res = dispatch_alert(supplier, triggers, deltas, timeout=timeout_webhook)
-                    total_alerts_emitted += 1
-                    alert_events.append(dispatch_res)
+                    if dispatcher is not None:
+                        alert_payload = _build_alert_payload(supplier, triggers, deltas)
+                        task_id = dispatcher.enqueue("SUPPLIER_ALERT", alert_payload)
+                        total_enqueued += 1
+                        total_alerts_emitted += 1
+                        alert_events.append({
+                            "tenant_id": supplier.tenant_id,
+                            "supplier_id": supplier.id,
+                            "task_id": task_id,
+                            "queued": True,
+                            "payload": alert_payload,
+                        })
+                    else:
+                        dispatch_res = dispatch_alert(supplier, triggers, deltas, timeout=timeout_webhook)
+                        total_alerts_emitted += 1
+                        alert_events.append(dispatch_res)
 
                 # Atualiza snapshot de baseline para que próximas execuções sejam idempotentes
                 supplier.last_movements_hash = new_movements_hash
@@ -305,6 +330,7 @@ def run_monitoring_job(
         "processed": total_processed,
         "total_active": total_active,
         "alerts_emitted": total_alerts_emitted,
+        "enqueued": total_enqueued,
         "errors": total_errors,
         "alert_events": alert_events,
         "execution_time_seconds": round(elapsed, 3),
