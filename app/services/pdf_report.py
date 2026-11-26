@@ -395,6 +395,24 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         "mensagem": cp_msg,
     }
 
+    # Compliance de Pessoas Politicamente Expostas no QSA (CGU - US-21)
+    raw_pep = data.get("compliance_pep") or {}
+    pep_status = _safe_str(raw_pep.get("status"), "NAO_IDENTIFICADO").upper()
+    pep_total = int(raw_pep.get("total_vinculos_identificados") or 0)
+    pep_ocorrencias = list(raw_pep.get("ocorrencias") or [])
+    pep_recomendacao = _safe_str(
+        raw_pep.get("recomendacao"),
+        "Nenhum vínculo com Pessoa Politicamente Exposta (PEP) identificado no QSA consultado."
+        if pep_status == "NAO_IDENTIFICADO"
+        else "Identificado possível vínculo com Pessoa Politicamente Exposta (PEP) no QSA. Recomenda-se diligência reforçada de integridade e verificação documental antes da homologação."
+    )
+    compliance_pep_dict = {
+        "status": pep_status,
+        "total_vinculos_identificados": pep_total,
+        "ocorrencias": pep_ocorrencias,
+        "recomendacao": pep_recomendacao,
+    }
+
     return {
         "company_name": _safe_str(company_name, "Empresa Consultada"),
         "cnpj_formatted": cnpj_formatted,
@@ -432,6 +450,7 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         "ranking_motivos": ranking_motivos,
         "condenacao_por_motivo": condenacao_por_motivo,
         "contratos_poder_publico": contratos_dict,
+        "compliance_pep": compliance_pep_dict,
         "compliance": {
             "recomendacao": recomendacao,
             "perfil_risco": perfil_risco,
@@ -442,6 +461,7 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             "tomadoras_subsidiarias_pj": sub_tomadoras,
             "mensagem_responsabilidade_subsidiaria": sub_msg,
             "contratos_poder_publico": contratos_dict,
+            "compliance_pep": compliance_pep_dict,
         },
     }
 
@@ -857,6 +877,50 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
     ]))
     story.append(cp_box)
 
+    # Compliance PEP no QSA (CGU - US-21)
+    pep = report.get("compliance_pep") or {}
+    pep_status = str(pep.get("status") or "NAO_IDENTIFICADO").upper()
+    pep_total = int(pep.get("total_vinculos_identificados") or 0)
+    pep_rec = str(pep.get("recomendacao") or "")
+    story.append(Spacer(1, 6))
+
+    if pep_status == "INDISPONIVEL":
+        pep_card_bg = colors.HexColor("#f8fafc")
+        pep_border = colors.HexColor("#64748b")
+        pep_para = Paragraph(
+            "<font color='#475569'><b>Compliance PEP (QSA):</b> Base oficial de PEP temporariamente indisponível no momento da consulta.</font>",
+            style_small,
+        )
+    elif pep_status == "ALERTA_PEP" and pep_total > 0:
+        pep_card_bg = colors.HexColor("#fff7ed")
+        pep_border = colors.HexColor("#ea580c")
+        pep_details = []
+        for oc in (pep.get("ocorrencias") or [])[:3]:
+            pep_details.append(f"<br/>&bull; {_xml_escape(oc.get('cargo_funcao', ''))} — {_xml_escape(oc.get('esfera_orgao', ''))} <i>({_xml_escape(oc.get('descricao_correspondencia', ''))})</i>")
+        pep_str = "".join(pep_details)
+        pep_para = Paragraph(
+            f"<font color='#c2410c'><b>Alerta de Compliance PEP: {pep_total} vínculo(s) identificado(s) no QSA</b></font><br/><font size='8' color='#7c2d12'>{_xml_escape(pep_rec)}</font>{pep_str}",
+            style_small,
+        )
+    else:
+        pep_card_bg = colors.HexColor("#f0f9f4")
+        pep_border = colors.HexColor("#25865a")
+        pep_para = Paragraph(
+            "<font color='#25865a'><b>Compliance PEP (QSA):</b> Nenhum vínculo com Pessoa Politicamente Exposta (PEP) identificado no QSA consultado</font>",
+            style_small,
+        )
+
+    pep_box = Table([[pep_para]], colWidths=[page_w])
+    pep_box.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), pep_card_bg),
+        ("BOX", (0, 0), (-1, -1), 0.8, pep_border),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(pep_box)
+
     story.append(Spacer(1, 10))
     story.append(Paragraph(
         "Fontes Oficiais Consultadas: Comunica PJe (CNJ), DataJud (CNJ), Receita Federal do Brasil, CGU (CEIS/CNEP) e PGFN. "
@@ -954,6 +1018,18 @@ def _generate_pdf_pure_python(report: Dict[str, Any]) -> bytes:
             lines.append(f"   Orgaos Contratantes: {', '.join(cp_pure['orgaos_contratantes'][:4])}")
     else:
         lines.append(f"   Contratos com o Poder Publico: Nenhum contrato publico localizado nas bases consultadas")
+
+    pep_pure = report.get("compliance_pep") or comp.get("compliance_pep") or {}
+    pep_status_pure = str(pep_pure.get("status") or "NAO_IDENTIFICADO").upper()
+    pep_total_pure = int(pep_pure.get("total_vinculos_identificados") or 0)
+    if pep_status_pure == "INDISPONIVEL":
+        lines.append("   Compliance PEP: Base oficial de PEP temporariamente indisponivel no momento da consulta.")
+    elif pep_status_pure == "ALERTA_PEP" and pep_total_pure > 0:
+        lines.append(f"   Alerta Compliance PEP: {pep_total_pure} vinculo(s) identificado(s) no QSA")
+        for oc in (pep_pure.get("ocorrencias") or [])[:3]:
+            lines.append(f"     - {oc.get('cargo_funcao', '')} | {oc.get('esfera_orgao', '')} ({oc.get('descricao_correspondencia', '')})")
+    else:
+        lines.append("   Compliance PEP: Nenhum vinculo com Pessoa Politicamente Exposta (PEP) identificado no QSA")
 
     # Quebra linhas longas para caber confortavelmente em A4
     wrapped_lines: List[str] = []

@@ -321,6 +321,15 @@ def _deep_scan_background_worker(
                     cnpj=deep_cnpj,
                     company_name=search.company_name,
                 )
+            if search.compliance_pep is None or (
+                isinstance(search.compliance_pep, dict) and search.compliance_pep.get("status") == "INDISPONIVEL"
+            ):
+                from app.services.pep_compliance_service import pep_compliance_service
+                qsa_list = (econ.get("qsa") or econ.get("qsa_nomes") or []) if isinstance(econ, dict) else []
+                search.compliance_pep = pep_compliance_service.check_qsa_compliance(
+                    qsa=qsa_list,
+                    cnpj=deep_cnpj,
+                )
             search.movements_hash = deep_results.get("movements_hash")
             search.economic_standing = deep_results["idoneidade_economica"]
             if search.economic_standing and isinstance(search.economic_standing, dict):
@@ -661,6 +670,21 @@ def search_company():
                     if contratos_pub.get("total_contratos", 0) > 0 or not cached_search.contratos_poder_publico:
                         cached_search.contratos_poder_publico = contratos_pub
                         res["contratos_poder_publico"] = contratos_pub
+
+                # Compliance PEP no QSA (CGU - US-21): hidratação se ainda não computado
+                from app.services.pep_compliance_service import pep_compliance_service
+                qsa_list = econ_data.get("qsa") or econ_data.get("qsa_nomes") or []
+                if not cached_search.compliance_pep or (
+                    isinstance(cached_search.compliance_pep, dict) and cached_search.compliance_pep.get("status") == "INDISPONIVEL"
+                ):
+                    pep_comp = pep_compliance_service.check_qsa_compliance(
+                        qsa=qsa_list,
+                        cnpj=clean_search_cnpj,
+                    )
+                    cached_search.compliance_pep = pep_comp
+                    res["compliance_pep"] = pep_comp
+                else:
+                    res["compliance_pep"] = cached_search.compliance_pep
                 res["cached"] = True
                 res["cache_level"] = "L1_DATABASE"
                 res["search_id"] = cached_search.id
@@ -812,6 +836,15 @@ def search_company():
         )
         fast_results["contratos_poder_publico"] = contratos_pub
 
+        # Compliance de Pessoas Politicamente Expostas no QSA (CGU - US-21)
+        from app.services.pep_compliance_service import pep_compliance_service
+        qsa_list = econ_data.get("qsa") or econ_data.get("qsa_nomes") or []
+        pep_compliance = pep_compliance_service.check_qsa_compliance(
+            qsa=qsa_list,
+            cnpj=clean_search_cnpj,
+        )
+        fast_results["compliance_pep"] = pep_compliance
+
         # Persistência do resultado no PostgreSQL
         search_id = None
         try:
@@ -835,6 +868,7 @@ def search_company():
                 condenacoes_subsidiarias_tomadoras_count=fast_results.get("condenacoes_subsidiarias_tomadoras_count", 0),
                 tomadoras_subsidiarias_pj=fast_results.get("tomadoras_subsidiarias_pj", []),
                 contratos_poder_publico=contratos_pub,
+                compliance_pep=pep_compliance,
                 overall_risk_score=fast_results.get("score_risco_terceirizacao", 0.0),
                 ai_analysis=fast_results.get("ai_analysis", {}),
                 movements_hash=new_hash,
@@ -2108,6 +2142,29 @@ def get_search_detail(search_id: int):
                     db.session.commit()
                 except Exception:
                     pass
+
+        if not result.get("compliance_pep") or (
+            isinstance(result.get("compliance_pep"), dict) and result.get("compliance_pep", {}).get("status") == "INDISPONIVEL"
+        ):
+            from app.services.pep_compliance_service import pep_compliance_service
+            econ_s = search.economic_standing if isinstance(search.economic_standing, dict) else {}
+            qsa_list = econ_s.get("qsa") or econ_s.get("qsa_nomes") or []
+            c_cnpj = (
+                econ_s.get("cnpj_utilizado") or
+                econ_s.get("cnpj_triangulado") or
+                (econ_s.get("cnpjs_consolidados")[0] if econ_s.get("cnpjs_consolidados") else None) or
+                econ_s.get("cnpj")
+            )
+            pep_det = pep_compliance_service.check_qsa_compliance(
+                qsa=qsa_list,
+                cnpj=c_cnpj,
+            )
+            result["compliance_pep"] = pep_det
+            search.compliance_pep = pep_det
+            try:
+                db.session.commit()
+            except Exception:
+                pass
         return jsonify(result), 200
     except Exception as exc:
         logger.error("Erro ao obter detalhes da pesquisa ID %d: %s", search_id, exc)
@@ -2366,6 +2423,15 @@ def _search_record_to_pdf_payload(search: CompanySearch) -> dict:
         if search.economic_standing.get("risco_calote_subsidiario") is not None:
             result["risco_subsidiario"] = search.economic_standing["risco_calote_subsidiario"]
     result["parecer_agente_adk"] = result.get("ai_analysis") or {}
+    if not result.get("compliance_pep"):
+        from app.services.pep_compliance_service import pep_compliance_service
+        econ_s = search.economic_standing if isinstance(search.economic_standing, dict) else {}
+        qsa_list = econ_s.get("qsa") or econ_s.get("qsa_nomes") or []
+        c_cnpj = econ_s.get("cnpj_utilizado") or econ_s.get("cnpj_triangulado") or None
+        result["compliance_pep"] = pep_compliance_service.check_qsa_compliance(
+            qsa=qsa_list,
+            cnpj=c_cnpj,
+        )
     return result
 
 
@@ -2568,6 +2634,15 @@ def handle_pdf_export_request(
                         payload["idoneidade_economica"] = saved.economic_standing
             except Exception:
                 pass
+        if not payload.get("compliance_pep"):
+            from app.services.pep_compliance_service import pep_compliance_service
+            econ_s = payload.get("idoneidade_economica") if isinstance(payload.get("idoneidade_economica"), dict) else {}
+            qsa_list = econ_s.get("qsa") or econ_s.get("qsa_nomes") or payload.get("qsa") or []
+            c_cnpj = econ_s.get("cnpj_utilizado") or econ_s.get("cnpj_triangulado") or payload.get("cnpj") or None
+            payload["compliance_pep"] = pep_compliance_service.check_qsa_compliance(
+                qsa=qsa_list,
+                cnpj=c_cnpj,
+            )
         return _build_pdf_response(payload, filename_hint=str(live_name))
 
     # 2. Busca por search_id (rota /history/<id>/summary.pdf ou ?search_id=)

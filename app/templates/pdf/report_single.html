@@ -115,6 +115,33 @@ ul { margin: 4pt 0 8pt; padding-left: 15pt; }
   <span style="color:#25865a; font-size:11px; font-weight:600;">Nenhum contrato público localizado nas bases consultadas</span>
 </div>
 {% endif %}
+{% set pep = report.compliance_pep or comp.compliance_pep or {} %}
+{% if pep.status == 'INDISPONIVEL' %}
+<div class="pep-compliance-card" style="break-inside: avoid; background:#f8fafc; border-left:4px solid #64748b; padding:8px 12px; margin-bottom:10px; border-radius:4px;">
+  <span style="color:#475569; font-size:11px;">Base oficial de PEP (CGU) temporariamente indisponível no momento da consulta.</span>
+</div>
+{% elif pep.status == 'ALERTA_PEP' and pep.total_vinculos_identificados and pep.total_vinculos_identificados > 0 %}
+<div class="pep-compliance-card" style="break-inside: avoid; background:#fff7ed; border-left:4px solid #ea580c; padding:8px 12px; margin-bottom:10px; border-radius:4px;">
+  <strong style="color:#c2410c; font-size:12px;">Alerta de Compliance PEP: {{ pep.total_vinculos_identificados }} vínculo(s) identificado(s) no QSA</strong>
+  <p style="margin:4px 0 0; font-size:11px; color:#9a3412;">
+    {{ pep.recomendacao }}
+  </p>
+  {% if pep.ocorrencias %}
+  <ul style="margin:6px 0 0 16px; padding:0; font-size:10px; color:#431407;">
+    {% for oc in pep.ocorrencias[:5] %}
+    <li style="margin-bottom:3px;">
+      <strong>{{ oc.cargo_funcao }}</strong> — {{ oc.esfera_orgao }} 
+      <span style="color:#c2410c; font-weight:600;">({{ oc.descricao_correspondencia }})</span>
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</div>
+{% else %}
+<div class="pep-compliance-card" style="break-inside: avoid; background:#f0f9f4; border-left:4px solid #25865a; padding:8px 12px; margin-bottom:10px; border-radius:4px;">
+  <span style="color:#25865a; font-size:11px; font-weight:600;">Nenhum vínculo com Pessoa Politicamente Exposta (PEP) identificado no QSA consultado</span>
+</div>
+{% endif %}
 <h2>Resumo executivo</h2><p>{{ comp.resumo_executivo }}</p><h2>Resumo dos processos analisados</h2><table class="kpis"><tr>{% for label,value in [('Processos',report.total_processes),('Condenações',out.condenacoes),('Acordos',out.acordos),('Improcedentes',out.improcedentes),('Em aberto',out.em_aberto)] %}<td><div class="kpi-label">{{ label }}</div><div class="kpi-value num">{{ value }}</div></td>{% endfor %}</tr></table>{% if outcomes_svg %}<section class="chart-block"><h2>Distribuição de desfechos</h2><div class="chart-frame">{{ outcomes_svg | safe }}</div></section>{% endif %}<h2>Mais informações</h2><table class="econ"><colgroup><col style="width:54%"><col style="width:46%"></colgroup><tr>
 <td><div class="econ-label">CAPITAL SOCIAL DECLARATÓRIO</div><div class="econ-value num">{{ econ.capital_fmt }}</div><div class="detail">{{ econ.badge_porte }}<br>{{ econ.subtitulo_unidades }}</div></td>
 <td><div class="econ-label">SITUAÇÃO CADASTRAL RFB</div><div class="econ-value" style="color:{{ '#25865a' if econ.situacao_rfb == 'ATIVA' else '#c34a4a' }}">{{ econ.situacao_rfb }}</div><div class="detail">Sanções/Débitos: {{ econ.sancoes_texto }}</div></td>
