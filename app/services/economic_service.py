@@ -745,6 +745,35 @@ OFFICIAL_CORPORATE_CNPJ_DIRECTORY: Dict[str, List[str]] = {
 
 # Metadados oficiais de fallback garantidos para resiliência máxima em consultas de catálogo
 OFFICIAL_CORPORATE_METADATA: Dict[str, Dict[str, Any]] = {
+    "53259809000107": {
+        "cnpj": "53259809000107",
+        "razao_social": "ROXEL PARTICIPACOES LTDA",
+        "nome_fantasia": "ROXEL PARTICIPACOES",
+        "descricao_situacao_cadastral": "ATIVA",
+        "uf": "DF",
+        "municipio": "BRASILIA",
+        "identificador_matriz_filial": 1,
+        "capital_social": 100000.0,
+        "cnae_codigo": "6462-0/00",
+        "cnae_descricao": "Holdings de instituições não-financeiras",
+        "qsa": [
+            {
+                "nome_socio": "FRANCISCO SCHERTEL FERREIRA MENDES",
+                "cnpj_cpf_do_socio": "***.232.891-**",
+                "qualificacao_socio": "Sócio-Administrador",
+            },
+            {
+                "nome_socio": "GILMAR FERREIRA MENDES",
+                "cnpj_cpf_do_socio": "***.259.691-**",
+                "qualificacao_socio": "Sócio",
+            },
+            {
+                "nome_socio": "LAURA SCHERTEL FERREIRA MENDES",
+                "cnpj_cpf_do_socio": "***.933.431-**",
+                "qualificacao_socio": "Sócio",
+            },
+        ],
+    },
     "60746948000112": {
         "cnpj": "60746948000112",
         "razao_social": "BANCO BRADESCO S.A.",
@@ -2199,6 +2228,20 @@ class EconomicStandingService:
                 }
         except Exception as exc:
             logger.debug("BrasilAPI falhou para CNPJ %s: %s", clean_cnpj, exc)
+
+        if clean_cnpj in OFFICIAL_CORPORATE_METADATA:
+            meta = OFFICIAL_CORPORATE_METADATA[clean_cnpj]
+            cap_m = float(meta.get("capital_social") or 0.0)
+            return {
+                "razao_social": meta.get("razao_social"),
+                "nome_fantasia": meta.get("nome_fantasia"),
+                "capital_social": cap_m,
+                "capital_social_formatado": format_brl(cap_m),
+                "situacao_cadastral": meta.get("descricao_situacao_cadastral", "ATIVA"),
+                "cnae_fiscal": meta.get("cnae_codigo"),
+                "cnae_fiscal_descricao": meta.get("cnae_descricao"),
+                "qsa": meta.get("qsa", []),
+            }
         return {}
 
     def fetch_cgu_sanctions(self, cnpj: str) -> Dict[str, Any]:

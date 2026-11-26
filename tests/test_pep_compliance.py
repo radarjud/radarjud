@@ -379,3 +379,34 @@ def test_pep_compliance_pdf_rendering(app_instance):
     pdf_neg = generate_company_report_pdf(payload_neg)
     assert isinstance(pdf_neg, bytes)
     assert pdf_neg.startswith(b"%PDF-")
+
+
+def test_pep_compliance_baseline_and_roxel_participacoes(app, client):
+    """
+    Valida a detecção determinística de PEP para a empresa Roxel Participações Ltda,
+    cujo QSA possui Gilmar Ferreira Mendes (Ministro do STF - PEP Direto) e
+    Francisco Schertel Ferreira Mendes (Filho de Ministro do STF - Familiar de PEP 1º grau).
+    """
+    from app.services.economic_service import EconomicStandingService
+    from app.services.pep_compliance_service import check_qsa_pep_compliance
+
+    with app.app_context():
+        # Limpa para garantir acionamento do seed_pep_baseline_if_empty
+        PEPRegistry.query.delete()
+        db.session.commit()
+
+        econ = EconomicStandingService()
+        data = econ.fetch_brasilapi_data("53259809000107")
+        assert data.get("razao_social") == "ROXEL PARTICIPACOES LTDA"
+        qsa = data.get("qsa")
+        assert len(qsa) == 3
+
+        res = check_qsa_pep_compliance(qsa=qsa, cnpj="53259809000107", force_refresh=True)
+        assert res["status"] == "ALERTA_PEP"
+        assert res["total_vinculos_identificados"] >= 2
+
+        # Valida que Gilmar Mendes e Francisco Mendes foram identificados
+        cargos = [oc["cargo_funcao"] for oc in res["ocorrencias"]]
+        assert any("Ministro do Supremo Tribunal Federal" in c for c in cargos)
+        assert any("Familiar de PEP (Filho de Ministro do STF)" in c for c in cargos)
+
