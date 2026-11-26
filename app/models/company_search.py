@@ -48,6 +48,9 @@ class CompanySearch(db.Model):
     condenacoes_subsidiarias_tomadoras_count = db.Column(db.Integer, default=0, nullable=True)
     tomadoras_subsidiarias_pj = db.Column(db.JSON, nullable=True)
 
+    # Contratos com o Poder Público (PNCP / Portal da Transparência - US-20)
+    contratos_poder_publico = db.Column(db.JSON, nullable=True)
+
     created_at = db.Column(db.DateTime, default=get_utc_now, nullable=False)
     updated_at = db.Column(db.DateTime, default=get_utc_now, onupdate=get_utc_now, nullable=False)
 
@@ -128,6 +131,18 @@ class CompanySearch(db.Model):
             else "Nenhuma condenação subsidiária de contratante identificada na amostra"
         )
 
+        contratos_pub = self.contratos_poder_publico
+        if not isinstance(contratos_pub, dict):
+            contratos_pub = {
+                "status": "DISPONIVEL",
+                "total_contratos": 0,
+                "esferas": [],
+                "orgaos_contratantes": [],
+                "valor_global_total": None,
+                "valor_global_formatado": None,
+                "mensagem": "Nenhum contrato público localizado nas bases consultadas",
+            }
+
         return {
             "id": self.id,
             "tenant_id": self.tenant_id,
@@ -164,6 +179,7 @@ class CompanySearch(db.Model):
             "condenacoes_subsidiarias_tomadoras_count": sub_count,
             "tomadoras_subsidiarias_pj": sub_tomadoras,
             "mensagem_responsabilidade_subsidiaria": msg_sub,
+            "contratos_poder_publico": contratos_pub,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
