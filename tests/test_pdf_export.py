@@ -494,3 +494,61 @@ def test_pdf_svg_charts_generation():
     assert "25.0%" in comp_svg
     assert "75.0%" in comp_svg
 
+
+def test_pdf_separates_execution_phase_and_has_no_conflict_markers():
+    """
+    Garante que o relatório PDF e seu template HTML:
+    1. Não possuem marcadores residuais de merge git;
+    2. Separam rótulos de execução/cumprimento da tabela de motivos;
+    3. Incluem o bloco dedicado 'Processos em Fase de Execução / Sentença Aplicada'.
+    """
+    from pathlib import Path
+    from jinja2 import Environment, FileSystemLoader
+
+    template_path = Path(__file__).resolve().parents[1] / "app" / "templates" / "pdf" / "report_single.html"
+    raw_html = template_path.read_text(encoding="utf-8")
+    assert "<<<<<<<" not in raw_html
+    assert ">>>>>>>" not in raw_html
+
+    payload = _sample_bradesco_payload()
+    payload["ranking_motivos"].append({"motivo": "Execução de Sentença", "quantidade": 35, "percentual": 3.7})
+    payload["condenacao_por_motivo"] = [
+        {
+            "motivo": "Execução / Cumprimento de Sentença",
+            "total_processos": 35,
+            "condenacoes": 35,
+            "taxa_condenacao": 100.0,
+            "faixa_variacao": "92,0% a 99,5%",
+        },
+        {
+            "motivo": "Horas Extras / Jornada",
+            "total_processos": 210,
+            "condenacoes": 145,
+            "taxa_condenacao": 69.0,
+            "faixa_variacao": "63,5% a 74,0%",
+        },
+    ]
+
+    norm = normalize_report_payload(payload)
+    assert norm["execution_phase_summary"]["total_processos"] == 35
+    assert all("Execução" not in r["motivo"] for r in norm["ranking_motivos"])
+    assert all("Execução" not in c["motivo"] for c in norm["condenacao_por_motivo"])
+
+    env = Environment(loader=FileSystemLoader(str(template_path.parent)))
+    rendered_html = env.get_template("report_single.html").render(
+        report=norm,
+        econ=norm["economic"],
+        comp=norm["compliance"],
+        out=norm["outcomes"],
+        outcomes_svg="<svg></svg>",
+        bayes_svg="<svg></svg>",
+        pct=lambda v: f"{v:.1f}%" if v is not None else "—",
+        scan_label=lambda s: s,
+    )
+    assert "Processos em Fase de Execução / Sentença Aplicada" in rendered_html
+    assert "35 processo(s)" in rendered_html
+
+    pdf_bytes = generate_company_report_pdf(payload)
+    assert pdf_bytes.startswith(b"%PDF-")
+    assert len(pdf_bytes) > 500
+

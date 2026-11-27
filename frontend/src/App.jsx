@@ -5,7 +5,10 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   businessText,
   subsidiaryRisk,
-  translateScanStatus
+  translateScanStatus,
+  isExecutionPhaseLabel,
+  separateExecutionPhaseData,
+  EXECUTION_PHASE_DESCRIPTION,
 } from './businessLabels.js';
 import './prescriptive.css';
 import ProcessFiltersBar from './ProcessFiltersBar.jsx';
@@ -142,6 +145,14 @@ function normalize(raw) {
         : `${cpTotal} contrato(s) público(s) identificado(s) nas bases governamentais`)
   );
 
+  const sepExec = separateExecutionPhaseData({
+    rankingMotivos: payload.ranking_motivos,
+    rankingCondenacoes: payload.ranking_motivos_condenacao,
+    condenacaoPorMotivo: payload.condenacao_por_motivo,
+    executionPhaseSummary: payload.execution_phase_summary,
+    totalProcessos: total,
+  });
+
   return {
     name: companyName,
     total: total,
@@ -157,9 +168,10 @@ function normalize(raw) {
     publicContractsValorTotal: cpValorTotal,
     publicContractsValorFormatado: cpValorFormatado,
     publicContractsMensagem: cpMsg,
-    reasons: Array.isArray(payload.ranking_motivos) ? payload.ranking_motivos : [],
-    rankingCondenacoes: Array.isArray(payload.ranking_motivos_condenacao) ? payload.ranking_motivos_condenacao : [],
-    condenacaoPorMotivo: Array.isArray(payload.condenacao_por_motivo) ? payload.condenacao_por_motivo : [],
+    reasons: sepExec.rankingMotivos,
+    rankingCondenacoes: sepExec.rankingCondenacoes,
+    condenacaoPorMotivo: sepExec.condenacaoPorMotivo,
+    executionPhaseSummary: sepExec.executionPhaseSummary,
     outcomes: outcomesObj,
     secrecy: isRecord(payload.niveis_sigilo) ? payload.niveis_sigilo : null,
     predictions: Array.isArray(payload.plus_previsao_condenacao) ? payload.plus_previsao_condenacao : [],
@@ -350,7 +362,20 @@ function Overview({ data, navigate, catalogTerm }) {
   const secrecyEntries = data?.secrecy ? Object.entries(data.secrecy) : [];
   const observed = secrecyEntries.reduce((sum, [, count]) => sum + Number(count || 0), 0);
   const knownSecret = secrecyEntries.reduce((sum, [level, count]) => sum + (Number(level) > 0 ? Number(count || 0) : 0), 0);
-  const reasons = data?.reasons || [];
+  const overviewExec = separateExecutionPhaseData({
+    rankingMotivos: data?.reasons,
+    rankingCondenacoes: data?.rankingCondenacoes,
+    condenacaoPorMotivo: data?.condenacaoPorMotivo,
+    executionPhaseSummary: data?.executionPhaseSummary,
+    totalProcessos: data?.total,
+  });
+  const reasons = overviewExec.rankingMotivos;
+  const motiveTableRows = (
+    overviewExec.condenacaoPorMotivo.length
+      ? overviewExec.condenacaoPorMotivo
+      : overviewExec.rankingCondenacoes
+  ).filter((item) => !isExecutionPhaseLabel(item?.motivo));
+  const execPhase = overviewExec.executionPhaseSummary;
   const outcomes = data?.outcomes || {};
   const hasData = Boolean(data);
   const classified = Object.values(outcomes).reduce((sum, value) => sum + Number(value || 0), 0);
@@ -413,8 +438,7 @@ function Overview({ data, navigate, catalogTerm }) {
         {Array.isArray(ai?.recomendacoes_compliance) && ai.recomendacoes_compliance.length ? <ul>{ai.recomendacoes_compliance.map((item,i)=><li key={i}>{businessText(item)}</li>)}</ul> : <p>Prescrições ainda não disponibilizadas. Consulte o parecer antes de decidir.</p>}
       </section>}
       {/* Condenações por Motivo do Processo (US-18) */}
-      {((Array.isArray(data?.condenacaoPorMotivo) && data.condenacaoPorMotivo.length > 0) ||
-        (Array.isArray(data?.rankingCondenacoes) && data.rankingCondenacoes.length > 0)) && (
+      {motiveTableRows.length > 0 && (
         <Panel
           title="Condenações por Motivo do Processo"
           subtitle="Histórico de condenações por assunto e faixa provável de variação"
@@ -431,7 +455,7 @@ function Overview({ data, navigate, catalogTerm }) {
                 </tr>
               </thead>
               <tbody>
-                {(data.condenacaoPorMotivo?.length ? data.condenacaoPorMotivo : data.rankingCondenacoes).map((item, index) => {
+                {motiveTableRows.map((item, index) => {
                   const totalProc = item.total_processos ?? item.total ?? item.count ?? null;
                   const condenacoes = item.condenacoes ?? item.quantidade_condenacoes ?? item.quantidade ?? 0;
                   const taxa = item.taxa_condenacao ?? item.taxa_no_motivo ?? item.taxa_condenacao_no_motivo ?? item.taxa_perda_no_motivo ?? null;
@@ -471,6 +495,31 @@ function Overview({ data, navigate, catalogTerm }) {
             <BarChart3 size={15} /> Taxas por assunto conforme os dados disponíveis. O símbolo — indica informação não disponibilizada.
           </div>
         </Panel>
+      )}
+
+      {/* Bloco dedicado para Processos em Fase de Execução / Sentença Aplicada */}
+      {execPhase && execPhase.total_processos > 0 && (
+        <section className="card panel execution-phase-card" aria-label="Processos em Fase de Execução / Sentença Aplicada">
+          <div className="execution-phase-header">
+            <div className="execution-phase-copy">
+              <h3>Processos em Fase de Execução / Sentença Aplicada</h3>
+              <p>{EXECUTION_PHASE_DESCRIPTION}</p>
+            </div>
+            <div className="execution-phase-kpi">
+              <strong>{formatNumber(execPhase.total_processos)} processo(s)</strong>
+              <span>{formatPercent(execPhase.percentual_total)} do total identificado</span>
+            </div>
+          </div>
+          {Array.isArray(execPhase.rotulos) && execPhase.rotulos.length > 0 && (
+            <div className="execution-phase-badges">
+              {execPhase.rotulos.map((rotulo, idx) => (
+                <span key={`${rotulo}-${idx}`} className="tag gray execution-phase-badge">
+                  {rotulo}
+                </span>
+              ))}
+            </div>
+          )}
+        </section>
       )}
 
 
@@ -1087,6 +1136,7 @@ function CompanyShareActions({ data }) {
         ranking_motivos: data.reasons || [],
         ranking_motivos_condenacao: data.rankingCondenacoes || [],
         condenacao_por_motivo: data.condenacaoPorMotivo || [],
+        execution_phase_summary: data.executionPhaseSummary || null,
         plus_previsao_condenacao: data.predictions || [],
         idoneidade_economica: data.idoneidadeEconomica || {},
         ai_analysis: data.aiAnalysis || {},
@@ -1240,6 +1290,9 @@ export default function App() {
               condenacaoPorMotivo: (updated.condenacaoPorMotivo && updated.condenacaoPorMotivo.length > 0)
                 ? updated.condenacaoPorMotivo
                 : prev?.condenacaoPorMotivo || [],
+              executionPhaseSummary: updated.executionPhaseSummary?.total_processos > 0
+                ? updated.executionPhaseSummary
+                : prev?.executionPhaseSummary || updated.executionPhaseSummary,
             }));
           }
           clearInterval(intervalId);
