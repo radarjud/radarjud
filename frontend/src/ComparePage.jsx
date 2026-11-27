@@ -8,6 +8,7 @@ import {
   ArrowRight, Sparkles, FileText, BarChart3, HelpCircle
 } from 'lucide-react';
 import { CompanyLogo } from './CompanyLogo.jsx';
+import { apiFetch } from './apiClient.js';
 
 /**
  * Utilitários de formatação para apresentação comparativa.
@@ -514,7 +515,7 @@ export default function ComparePage({ request, history = [], currentCompany, nav
 
     try {
       // 1. Tenta POST com as empresas já ranqueadas e consolidadas
-      let res = await fetch('/api/v1/export-compare-pdf', {
+      let res = await apiFetch('/export-compare-pdf', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -533,7 +534,7 @@ export default function ComparePage({ request, history = [], currentCompany, nav
           ? `search_ids=${searchIds.join(',')}`
           : `empresas=${encodeURIComponent(result.empresas_ranqueadas.map((c) => c.empresa).join(','))}`;
 
-        res = await fetch(`/api/v1/export-compare-pdf?${queryParams}`, {
+        res = await apiFetch(`/export-compare-pdf?${queryParams}`, {
           method: 'GET',
           headers: { Accept: 'application/pdf, application/json' }
         });
