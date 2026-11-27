@@ -1,6 +1,26 @@
+import datetime
 import hashlib
 import json
+from decimal import Decimal
 from typing import Any
+
+
+def make_json_safe(value: Any) -> Any:
+    """
+    Normaliza recursivamente estruturas Python para serialização JSON segura no PostgreSQL
+    e chamadas HTTP/LLM (converte datetime/date em ISO-8601 e Decimal em float).
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(k): make_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [make_json_safe(v) for v in value]
+    return str(value)
 
 
 def _sort_by_process_number(entry: dict[str, Any]) -> str:
@@ -62,6 +82,11 @@ def generate_movements_hash(processes_data: list[dict[str, Any]], rfb_status: st
     if rfb_status is not None:
         payload["rfb_status"] = str(rfb_status).strip().upper()
 
-    serialized = json.dumps(payload if rfb_status is not None else normalized_entries, sort_keys=True, separators=(",", ":"))
+    serialized = json.dumps(
+        payload if rfb_status is not None else normalized_entries,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
