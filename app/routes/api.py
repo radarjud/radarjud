@@ -294,8 +294,13 @@ def _deep_scan_background_worker(
             # Correção do status final (US-23):
             # Se todas as páginas válidas foram concluídas ou a trava de 0 CNJs novos encerrou a varredura,
             # o status canônico é COMPLETED — eliminando falsos selos parciais.
-            # Status parcial apenas se atingiu teto configurado com mais registros pendentes.
-            final_scan_status = "PARTIAL_FAST_PATH" if scan_res.get("hit_max_pages") else "COMPLETED"
+            # Status parcial apenas se atingiu teto configurado com mais registros pendentes ou se houve rate limit.
+            if scan_res.get("rate_limited"):
+                final_scan_status = "RATE_LIMITED"
+            elif scan_res.get("hit_max_pages"):
+                final_scan_status = "PARTIAL_FAST_PATH"
+            else:
+                final_scan_status = "COMPLETED"
 
             # Mescla todos os processos retornados em all_processes_map
             for cnj, data in scan_res.get("processes", {}).items():
@@ -805,6 +810,7 @@ def search_company():
         orchestrator._cache.pop(raw_query.lower(), None)
         orchestrator._cache.pop(query_term.lower(), None)
         orchestrator._cache.pop(normalized_name.lower(), None)
+        SEARCH_CACHE.pop(cache_key, None)
 
     current_job_id = str(uuid.uuid4())
     with ACTIVE_SEARCH_LOCK:
@@ -982,9 +988,16 @@ def search_company():
         fast_results["scan_status"] = (
             "BROWSER_PARTIAL" if browser_owned and not search_id else initial_status
         )
-        # O estado provisório do navegador não deve sobreviver no cache L0.
-        if not browser_owned:
+        # O estado provisório do navegador ou busca sob rate limit não deve sobreviver no cache L0.
+        if not browser_owned and initial_status not in ("RATE_LIMITED", "ERROR"):
             SEARCH_CACHE[cache_key] = (time.time(), fast_results)
+
+        if initial_status == "RATE_LIMITED":
+            fast_results["message"] = "Limite de requisições temporário na API do CNJ. Tente novamente em alguns segundos."
+            resp = jsonify(fast_results)
+            resp.headers["Retry-After"] = str(fast_results.get("retry_after_seconds", 3))
+            return resp, 429
+
         resp = jsonify(fast_results)
         if quota_header_val is not None:
             # Recalcula o saldo restante após a persistência da nova consulta
@@ -1652,6 +1665,149 @@ def incremental_sync(search_id: int):
         db.session.rollback()
         logger.exception("Erro na varredura incremental do search_id %d: %s", search_id, exc)
         return jsonify({"error": "Falha na sincronização incremental."}), 500
+
+
+@api_bp.route("/deep-scan-batch/<int:search_id>", methods=["POST"])
+@api_bp.route("/searches/<int:search_id>/deep-scan-batch", methods=["POST"])
+def deep_scan_batch(search_id: int):
+    """
+    Executa varredura profunda diluída em lotes curtos (1 a 3 páginas por chamada HTTP),
+    eliminando qualquer risco de timeout HTTP ou pico de memória no Render Free (512 MB).
+    Retorna status, next_page, total_acumulado e retry_after_seconds para controle determinístico pelo cliente.
+    """
+    search = db.session.get(CompanySearch, search_id)
+    if not search:
+        return jsonify({"error": "Registro de busca não encontrado."}), 404
+
+    # Anti-IDOR: Se a busca pertencer a um tenant específico, valida permissão
+    current_user = get_current_user_optional()
+    if search.tenant_id is not None:
+        if not current_user or current_user.tenant_id != search.tenant_id:
+            return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
+
+    payload = request.get_json(silent=True) or {}
+    page = int(payload.get("page") or 2)
+    batch_size = max(1, min(int(payload.get("batch_size") or 2), 3))
+
+    known_numbers = {
+        r[0]
+        for r in db.session.query(ProcessRecord.numero_processo)
+        .filter(ProcessRecord.company_search_id == search_id)
+        .all()
+        if r[0]
+    }
+
+    scan_cfg = get_scan_config()
+    is_render_env = scan_cfg.get("is_render", False)
+
+    strat = {
+        "comunica_query_term": search.company_name,
+        "display_title": search.company_name,
+        "is_broad_brand": True,
+        "mode": "BROAD_BRAND",
+    }
+    if isinstance(search.economic_standing, dict):
+        saved_strat = search.economic_standing.get("browser_search_strategy")
+        if saved_strat:
+            strat = saved_strat
+
+    def _on_batch_persist(page_num: int, batch_processes: dict, new_count: int):
+        batch_records = []
+        for cnj, pdata in (batch_processes or {}).items():
+            if not cnj or cnj in known_numbers:
+                continue
+            known_numbers.add(cnj)
+            raw_texts = pdata.get("publicacoes_texto", [])
+            classes_list = pdata.get("classes_pje", [])
+            assuntos = extract_real_cause_fast([], raw_texts, classes_pje=classes_list)
+            primary_name = assuntos[0].get("nome") if assuntos else "Obrigação / Reclamação em Apuração Inicial"
+            primary_code = assuntos[0].get("codigo") if assuntos else None
+            dist_date = parse_iso_date(pdata.get("dataUltimaPublicacao"))
+
+            rec = ProcessRecord(
+                company_search_id=search_id,
+                numero_processo=cnj,
+                tribunal=str(pdata.get("siglaTribunal") or pdata.get("tribunal") or "")[:50],
+                grau="TST (Recursal)" if pdata.get("is_tst_recurso") else "G1",
+                nivel_sigilo=0,
+                primary_subject=primary_name,
+                primary_subject_code=primary_code,
+                subjects_json=[a["nome"] for a in assuntos if a.get("nome")],
+                observation=f"Assunto identificado via publicação PJe: '{primary_name}'." if primary_name else None,
+                sentence_outcome="em_aberto",
+                has_expert_report=False,
+                data_distribuicao=dist_date,
+                raw_metadata=None,
+            )
+            batch_records.append(rec)
+
+        if batch_records:
+            for i in range(0, len(batch_records), 50):
+                db.session.bulk_save_objects(batch_records[i:i + 50])
+                db.session.commit()
+            del batch_records
+
+        s = db.session.get(CompanySearch, search_id)
+        if s:
+            s.total_processes = len(known_numbers)
+            s.last_checked_at = get_utc_now()
+            db.session.commit()
+
+        if is_render_env:
+            gc.collect()
+
+    scan_res = orchestrator.searcher.paginate_comunica_pje_standard(
+        search_strategy=strat,
+        start_page=page,
+        max_pages=scan_cfg["max_pages"],
+        max_pages_per_call=batch_size,
+        on_batch_persist=_on_batch_persist,
+        timeout=5.0,
+        known_cnjs=known_numbers,
+        batch_delay=scan_cfg["batch_delay"],
+    )
+
+    if scan_res.get("rate_limited"):
+        search.scan_status = "RATE_LIMITED"
+        db.session.commit()
+        return jsonify({
+            "status": "RATE_LIMITED",
+            "search_id": search_id,
+            "next_page": page,
+            "retry_after_seconds": scan_res.get("retry_after_seconds", 3),
+            "total_acumulado": search.total_processes,
+            "is_completed": False,
+        }), 200
+
+    if scan_res.get("is_completed"):
+        search.scan_status = "COMPLETED"
+        all_procs = [p.to_dict() for p in search.processes]
+        if all_procs:
+            fresh_metrics = orchestrator.predictor.generate_dashboard_metrics(search.company_name, all_procs)
+            search.outcomes_summary = fresh_metrics.get("desfechos_sentencas", search.outcomes_summary)
+            search.ranking_motivos = fresh_metrics.get("ranking_motivos", search.ranking_motivos)
+            search.ranking_motivos_condenacao = fresh_metrics.get("ranking_motivos_condenacao", search.ranking_motivos_condenacao)
+            search.condenacao_por_motivo = fresh_metrics.get("condenacao_por_motivo", search.condenacao_por_motivo)
+            search.predictions_summary = fresh_metrics.get("plus_previsao_condenacao", search.predictions_summary)
+            search.overall_risk_score = fresh_metrics.get("score_risco_terceirizacao", search.overall_risk_score)
+        db.session.commit()
+        return jsonify({
+            "status": "COMPLETED",
+            "search_id": search_id,
+            "next_page": None,
+            "total_acumulado": search.total_processes,
+            "is_completed": True,
+            "data": search.to_dict(),
+        }), 200
+
+    next_p = scan_res.get("next_page") or (page + scan_res.get("pages_read", batch_size))
+    return jsonify({
+        "status": "SCANNING",
+        "search_id": search_id,
+        "next_page": next_p,
+        "total_acumulado": search.total_processes,
+        "is_completed": False,
+    }), 200
 
 
 @api_bp.route("/ingest-deep-scan", methods=["POST"])

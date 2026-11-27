@@ -19,7 +19,13 @@ export async function fetchPjePage(termo, cnpj, page, signal, timeout = 6000) {
     signal?.removeEventListener('abort', abort);
     throw new Error('Razão social ou nome empresarial obrigatório para consultar o PJe');
   }
-  url.searchParams.set('nomeParte', termo);
+  const cleanTerm = String(termo || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\w\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  url.searchParams.set('nomeParte', cleanTerm || termo);
   url.searchParams.set('pagina', String(page));
   // Limite estrito oficial da API do CNJ é no máximo 50 itens por página (US-23)
   url.searchParams.set('itensPorPagina', String(BROWSER_PAGE_LIMIT));
@@ -57,6 +63,8 @@ export async function runBrowserDeepScan(termo, cnpj, page1Count, onProgress, { 
   const items = [];
   const failedPages = [];
   let received = page1Items.length;
+  let prevCommIds = '';
+  let consecutiveZeroNewPages = 0;
 
   for (let start = 2; start <= totalPages; start += 3) {
     signal?.throwIfAborted();
@@ -73,6 +81,17 @@ export async function runBrowserDeepScan(termo, cnpj, page1Count, onProgress, { 
       const pageItems = result.value?.items || [];
       received += pageItems.length;
 
+      // Trava 1: IDs de comunicação idênticos aos da página anterior (loop real)
+      const currentCommIds = pageItems
+        .map(it => String(it?.id || it?.idComunicacao || it?.numero_processo || it?.numeroProcesso || ''))
+        .filter(Boolean)
+        .sort()
+        .join(',');
+      if (currentCommIds && prevCommIds && currentCommIds === prevCommIds) {
+        stopEarly = true;
+      }
+      prevCommIds = currentCommIds;
+
       let newCount = 0;
       for (const item of pageItems) {
         const key = processKey(item);
@@ -82,9 +101,14 @@ export async function runBrowserDeepScan(termo, cnpj, page1Count, onProgress, { 
         newCount++;
       }
 
-      // Freio anti-loop determinístico: se a página retornou itens mas nenhum inédito, encerra
-      if (pageItems.length > 5 && newCount === 0) {
-        stopEarly = true;
+      // Trava 2: Encerra apenas se 3 páginas consecutivas não trouxerem nenhum CNJ novo
+      if (newCount === 0 && pageItems.length > 0) {
+        consecutiveZeroNewPages++;
+        if (consecutiveZeroNewPages >= 3) {
+          stopEarly = true;
+        }
+      } else if (newCount > 0) {
+        consecutiveZeroNewPages = 0;
       }
     });
 

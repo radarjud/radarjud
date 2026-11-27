@@ -21,6 +21,8 @@ from app.utils.sanitizer import (
     CORPORATE_SUFFIX_REGEX,
     classify_search_mode,
     resolve_search_strategy,
+    normalize_search_term_generic,
+    extract_corporate_core_name,
 )
 from app.utils.http_client import request_gov_br_with_fallback
 
@@ -691,28 +693,97 @@ class CNJProcessSearcher:
         brand_term: str,
         page_num: int = 1,
         timeout: float = 5.0,
+        fallback_term: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Busca uma única página no Comunica PJe com timeout curto (< 5s)."""
+        """
+        Busca uma única página no Comunica PJe com timeout curto (< 5s),
+        normalização genérica do termo de busca e fallback automático se retornar 0 itens.
+        Nunca mascara erro HTTP (429, 5xx, timeout) como lista vazia de sucesso.
+        """
+        primary_term = normalize_search_term_generic(brand_term) or brand_term.strip()
         p = {
-            "nomeParte": brand_term.strip(),
+            "nomeParte": primary_term,
             "pagina": page_num,
             "itensPorPagina": 50,
         }
         procs: Dict[str, Any] = {}
         self.last_page_raw_count = 0
         self.last_page_has_more = False
+        self.last_page_status_code = 200
+        self.last_page_rate_limited = False
+        self.last_retry_after = 3
+        self.last_effective_query_term = primary_term
+
+        def _do_request(query_val: str):
+            req_params = dict(p)
+            req_params["nomeParte"] = query_val
+            return self._request_gov("GET", self.COMUNICA_URL, params=req_params, timeout=timeout)
+
         try:
-            r = self._request_gov("GET", self.COMUNICA_URL, params=p, timeout=timeout)
+            r = _do_request(primary_term)
+            # Tratamento de Rate Limit (429) com espera curta única de 2s sem prender worker
+            if r.status_code == 429:
+                retry_header = r.headers.get("Retry-After")
+                wait_sec = min(3.0, float(retry_header)) if (retry_header and retry_header.isdigit()) else 2.0
+                logger.warning("PJe retornou 429 na página %d para '%s'. Tentando espera curta de %.1fs...", page_num, primary_term, wait_sec)
+                time.sleep(wait_sec)
+                r = _do_request(primary_term)
+
+            self.last_page_status_code = r.status_code
+            if r.status_code == 429:
+                self.last_page_rate_limited = True
+                self.last_retry_after = int(r.headers.get("Retry-After") or 3)
+                logger.warning("[SCAN_PAGE] pagina=%d status_http=429 rate_limit_confirmado para '%s'", page_num, primary_term)
+                return procs
+
             if r.status_code == 200:
                 py = r.json()
                 items = py if isinstance(py, list) else (
                     py.get("items") or py.get("itens") or py.get("content") or []
                 )
+
+                # Fallback genérico: se consulta primária retornou 200 OK com 0 itens na página 1,
+                # tenta o núcleo da razão social sem sufixos societários ou pontuação
+                if len(items) == 0 and page_num == 1:
+                    candidate_fallback = fallback_term or extract_corporate_core_name(primary_term)
+                    if candidate_fallback and candidate_fallback != primary_term and len(candidate_fallback) >= 3:
+                        logger.info(
+                            "Consulta primária '%s' retornou 0 itens no PJe. Tentando fallback genérico '%s'...",
+                            primary_term,
+                            candidate_fallback,
+                        )
+                        r_fb = _do_request(candidate_fallback)
+                        if r_fb.status_code == 200:
+                            py_fb = r_fb.json()
+                            items_fb = py_fb if isinstance(py_fb, list) else (
+                                py_fb.get("items") or py_fb.get("itens") or py_fb.get("content") or []
+                            )
+                            if items_fb:
+                                logger.info(
+                                    "Fallback genérico '%s' encontrou %d intimações no PJe!",
+                                    candidate_fallback,
+                                    len(items_fb),
+                                )
+                                items = items_fb
+                                self.last_effective_query_term = candidate_fallback
+
                 self.last_page_raw_count = len(items)
                 self.last_page_has_more = (len(items) == 50)
                 self._parse_comunica_items(items, procs)
+                logger.info(
+                    "[SCAN_PAGE] pagina=%d status_http=%d itens_retornados=%d cnjs_novos=%d total_acumulado=%d motivo_encerramento=%s",
+                    page_num,
+                    r.status_code,
+                    len(items),
+                    len(procs),
+                    len(procs),
+                    "FAST_PATH_SUCESSO" if procs else "ZERO_PROCESSOS_CONFIRMADO",
+                )
+            else:
+                logger.warning("[SCAN_PAGE] pagina=%d status_http=%d erro na API para '%s'", page_num, r.status_code, primary_term)
         except Exception as exc:
-            logger.debug("Comunica PJe página %d tratada com resiliência (%s): %s", page_num, brand_term, exc)
+            self.last_page_status_code = 0
+            logger.warning("[SCAN_PAGE] pagina=%d status_http=0 excecao de conexao (%s): %s", page_num, primary_term, exc)
         return procs
 
     def paginate_comunica_pje_standard(
@@ -720,6 +791,7 @@ class CNJProcessSearcher:
         search_strategy: Dict[str, Any],
         start_page: int = 1,
         max_pages: Optional[int] = None,
+        max_pages_per_call: Optional[int] = None,
         on_page_callback=None,
         on_batch_persist=None,
         timeout: float = 6.0,
@@ -728,26 +800,29 @@ class CNJProcessSearcher:
     ) -> Dict[str, Any]:
         """
         Varre sequencialmente o Comunica PJe em fluxo streaming por lote com RAM constante,
-        freio anti-loop em 3 camadas e limite dinâmico por ambiente (US-23).
+        freio anti-loop determinístico em 3 camadas e limite dinâmico por ambiente (US-23).
 
         Travas determinísticas anti-loop:
-        1. Trava de Novos Registros (principal contra repetição de páginas da API):
-           Se uma página trouxer 0 CNJs novos em relação aos já conhecidos, encerra imediatamente como COMPLETED.
-        2. Trava de Metadados:
-           Encerra naturalmente se a lista bruta de itens for vazia ou menor que 50 (fim oficial da lista no CNJ).
-        3. Teto configurável (SCAN_MAX_PAGES):
-           Se max_pages > 0 e page >= max_pages antes do fim natural, encerra sinalizando corte por teto de segurança.
+        1. Trava de Repetição Exata:
+           Se os IDs de comunicação da página atual forem idênticos aos da página anterior (loop real da API), encerra como COMPLETED.
+        2. Trava de 3 Páginas Consecutivas sem Novos CNJs:
+           Páginas intermediárias com 0 novos CNJs não interrompem a varredura prematuramente, permitindo capturar novas
+           intimações posteriores. Encerra apenas após 3 páginas consecutivas sem novos processos.
+        3. Trava de Metadados e Teto:
+           Encerra naturalmente se a lista bruta for vazia, menor que 50 ou atingir o teto oficial de metadados.
         """
         cfg = get_scan_config()
         effective_max_pages = cfg["max_pages"] if max_pages is None else max_pages
         effective_delay = cfg["batch_delay"] if batch_delay is None else batch_delay
         do_gc = cfg.get("gc_collect", False)
 
-        query_term = (
-            search_strategy.get("comunica_query_term")
+        raw_term = (
+            search_strategy.get("effective_query_term")
+            or search_strategy.get("comunica_query_term")
             or search_strategy.get("raw_input")
             or ""
         ).strip()
+        query_term = normalize_search_term_generic(raw_term) or raw_term
 
         all_processes: Dict[str, Any] = {}
         discovered_entities: Set[str] = set()
@@ -755,12 +830,24 @@ class CNJProcessSearcher:
         pages_read = 0
         hit_max_pages = False
         anti_loop_triggered = False
+        rate_limited = False
+        retry_after = 0
+        had_http_error = False
+        motivo = ""
+        prev_comm_ids: Optional[Set[str]] = None
+        consecutive_zero_new_pages = 0
 
         page = start_page
         while True:
-            # Trava 3: Se a próxima página ultrapassar o teto configurado (quando teto > 0)
+            # Trava de teto configurado por ambiente (SCAN_MAX_PAGES)
             if effective_max_pages > 0 and page > effective_max_pages:
                 hit_max_pages = True
+                motivo = "TETO_MAX_PAGES_ATINGIDO"
+                break
+
+            # Limite por lote curto (proteção contra timeout HTTP no Render)
+            if max_pages_per_call is not None and pages_read >= max_pages_per_call:
+                motivo = "LOTE_CURTO_CONCLUIDO"
                 break
 
             params = {
@@ -770,8 +857,17 @@ class CNJProcessSearcher:
             }
             try:
                 resp = self._request_gov("GET", self.COMUNICA_URL, params=params, timeout=timeout)
-                if not resp.ok:
-                    logger.warning("Comunica PJe HTTP %s na página %d para '%s'", resp.status_code, page, query_term)
+                if resp.status_code == 429:
+                    rate_limited = True
+                    retry_hdr = resp.headers.get("Retry-After")
+                    retry_after = int(retry_hdr) if (retry_hdr and retry_hdr.isdigit()) else 3
+                    motivo = "RATE_LIMITED_429"
+                    logger.warning("[SCAN_PAGE] pagina=%d status_http=429 rate_limit na paginacao para '%s'", page, query_term)
+                    break
+                elif not resp.ok:
+                    had_http_error = True
+                    motivo = f"HTTP_ERROR_{resp.status_code}"
+                    logger.warning("[SCAN_PAGE] pagina=%d status_http=%d erro na paginacao para '%s'", page, resp.status_code, query_term)
                     break
 
                 payload = resp.json()
@@ -782,32 +878,65 @@ class CNJProcessSearcher:
                 else:
                     raw_items = []
 
-                # Trava 2: Lista vazia indica fim natural da paginação pública
+                # Fim natural da paginação pública
                 if not raw_items:
+                    motivo = "FIM_NATURAL_LISTA_VAZIA"
+                    logger.info("[SCAN_PAGE] pagina=%d status_http=200 itens_retornados=0 cnjs_novos=0 total_acumulado=%d motivo_encerramento=%s", page, len(known_cnjs_set), motivo)
                     break
 
                 pages_read += 1
+
+                # Trava Anti-Loop 1: Comparação determinística de IDs de comunicação entre páginas consecutivas
+                current_comm_ids = set()
+                for it in raw_items:
+                    cid = (
+                        it.get("id")
+                        or it.get("idComunicacao")
+                        or it.get("numeroProcesso")
+                        or it.get("numero_processo")
+                    )
+                    if cid:
+                        current_comm_ids.add(str(cid))
+
+                if current_comm_ids and prev_comm_ids and current_comm_ids == prev_comm_ids:
+                    anti_loop_triggered = True
+                    motivo = "REPETICAO_EXATA_IDS_COMUNICACAO"
+                    logger.info(
+                        "[SCAN_PAGE] pagina=%d status_http=200 itens_retornados=%d cnjs_novos=0 total_acumulado=%d motivo_encerramento=%s",
+                        page, len(raw_items), len(known_cnjs_set), motivo
+                    )
+                    break
+                prev_comm_ids = current_comm_ids
+
                 page_processes: Dict[str, Any] = {}
                 self._parse_comunica_items(raw_items, page_processes, discovered_entities)
 
-                # Trava 1: Freio anti-loop determinístico por verificação de CNJs inéditos
                 page_cnjs = set(page_processes.keys())
                 new_cnjs = page_cnjs - known_cnjs_set
 
+                # Trava Anti-Loop 2: 3 páginas consecutivas sem novos CNJs
                 if len(new_cnjs) == 0:
+                    consecutive_zero_new_pages += 1
                     logger.info(
-                        "Freio anti-loop acionado na página %d: 0 novos CNJs identificados entre os %d processos retornados. Finalizando varredura como COMPLETED.",
-                        page,
-                        len(page_processes),
+                        "Página %d sem novos CNJs (%d/3 páginas consecutivas sem novos processos).",
+                        page, consecutive_zero_new_pages
                     )
-                    anti_loop_triggered = True
-                    # Mescla publicações/classes adicionais em processos já existentes no mapa
-                    for cnj, data in page_processes.items():
-                        if cnj in all_processes:
-                            for t in data.get("publicacoes_texto", []):
-                                if t not in all_processes[cnj].setdefault("publicacoes_texto", []):
-                                    all_processes[cnj]["publicacoes_texto"].append(t)
-                    break
+                    if consecutive_zero_new_pages >= 3:
+                        anti_loop_triggered = True
+                        motivo = "3_PAGINAS_CONSECUTIVAS_SEM_NOVOS_CNJS"
+                        logger.info(
+                            "[SCAN_PAGE] pagina=%d status_http=200 itens_retornados=%d cnjs_novos=0 total_acumulado=%d motivo_encerramento=%s",
+                            page, len(raw_items), len(known_cnjs_set), motivo
+                        )
+                        # Mescla publicações/classes adicionais
+                        for cnj, data in page_processes.items():
+                            if cnj in all_processes:
+                                for t in data.get("publicacoes_texto", []):
+                                    if t not in all_processes[cnj].setdefault("publicacoes_texto", []):
+                                        all_processes[cnj]["publicacoes_texto"].append(t)
+                        break
+                else:
+                    consecutive_zero_new_pages = 0
 
                 # Atualiza conjunto de CNJs conhecidos e mapa em memória
                 known_cnjs_set.update(new_cnjs)
@@ -841,19 +970,37 @@ class CNJProcessSearcher:
                 if do_gc:
                     gc.collect()
 
-                # Trava 2: Critério oficial de encerramento da API do CNJ (< 50 itens brutos)
+                # Trava Anti-Loop 3: Critério oficial de encerramento da API do CNJ (< 50 itens brutos)
                 if len(raw_items) < 50:
+                    motivo = "FIM_NATURAL_MENOS_DE_50_ITENS"
+                    logger.info(
+                        "[SCAN_PAGE] pagina=%d status_http=200 itens_retornados=%d cnjs_novos=%d total_acumulado=%d motivo_encerramento=%s",
+                        page, len(raw_items), len(new_cnjs), len(known_cnjs_set), motivo
+                    )
                     break
 
-                # Trava 2 adicional: se payload contiver metadados de total de páginas
                 total_pages = payload.get("totalPages") or payload.get("total_pages")
                 if total_pages and isinstance(total_pages, int) and page >= total_pages:
+                    motivo = "TOTAL_PAGINAS_METADADOS_ATINGIDO"
+                    logger.info(
+                        "[SCAN_PAGE] pagina=%d status_http=200 itens_retornados=%d cnjs_novos=%d total_acumulado=%d motivo_encerramento=%s",
+                        page, len(raw_items), len(new_cnjs), len(known_cnjs_set), motivo
+                    )
                     break
 
-                # Trava 3: Se a página atual atingiu o teto configurado
                 if effective_max_pages > 0 and page >= effective_max_pages:
                     hit_max_pages = True
+                    motivo = "TETO_MAX_PAGES_ATINGIDO"
+                    logger.info(
+                        "[SCAN_PAGE] pagina=%d status_http=200 itens_retornados=%d cnjs_novos=%d total_acumulado=%d motivo_encerramento=%s",
+                        page, len(raw_items), len(new_cnjs), len(known_cnjs_set), motivo
+                    )
                     break
+
+                logger.info(
+                    "[SCAN_PAGE] pagina=%d status_http=200 itens_retornados=%d cnjs_novos=%d total_acumulado=%d motivo_encerramento=CONTINUANDO",
+                    page, len(raw_items), len(new_cnjs), len(known_cnjs_set)
+                )
 
                 # Diluição no tempo configurável por ambiente (SCAN_BATCH_DELAY)
                 if effective_delay > 0:
@@ -862,11 +1009,17 @@ class CNJProcessSearcher:
                 page += 1
 
             except Exception as exc:
-                logger.error("Erro na paginação do Comunica PJe página %d: %s", page, exc)
+                had_http_error = True
+                motivo = f"EXCECAO_{type(exc).__name__}"
+                logger.error("[SCAN_PAGE] pagina=%d status_http=0 excecao na paginacao do PJe: %s", page, exc)
                 break
 
         # Se for busca ampla por marca/grupo (BROAD_BRAND), faz varredura complementar no TST
-        if search_strategy.get("is_broad_brand", False) or search_strategy.get("mode") == "BROAD_BRAND":
+        if (
+            (search_strategy.get("is_broad_brand", False) or search_strategy.get("mode") == "BROAD_BRAND")
+            and not rate_limited
+            and not had_http_error
+        ):
             try:
                 params_tst = {
                     "nomeParte": query_term,
@@ -904,11 +1057,18 @@ class CNJProcessSearcher:
             except Exception as tst_exc:
                 logger.debug("Consulta complementar TST tratada silenciosamente: %s", tst_exc)
 
-        is_completed = not hit_max_pages
+        is_completed = (
+            not hit_max_pages
+            and not rate_limited
+            and not had_http_error
+            and (motivo != "LOTE_CURTO_CONCLUIDO")
+        )
+        has_more_pages = (not is_completed) and (not hit_max_pages) and (not rate_limited) and (not had_http_error)
+        next_page = (page + 1) if has_more_pages else (page if rate_limited else None)
 
         logger.info(
-            "paginate_comunica_pje_standard('%s') finalizada: %d páginas lidas, %d processos únicos, %d entidades (hit_max_pages=%s, anti_loop=%s, is_completed=%s).",
-            query_term, pages_read, len(all_processes), len(discovered_entities), hit_max_pages, anti_loop_triggered, is_completed
+            "paginate_comunica_pje_standard('%s') finalizada: %d páginas lidas, %d processos únicos (hit_max_pages=%s, anti_loop=%s, rate_limited=%s, is_completed=%s, motivo=%s).",
+            query_term, pages_read, len(all_processes), hit_max_pages, anti_loop_triggered, rate_limited, is_completed, motivo
         )
 
         return {
@@ -918,7 +1078,11 @@ class CNJProcessSearcher:
             "total_processes": len(all_processes),
             "hit_max_pages": hit_max_pages,
             "anti_loop_triggered": anti_loop_triggered,
+            "rate_limited": rate_limited,
+            "retry_after_seconds": retry_after,
+            "next_page": next_page,
             "is_completed": is_completed,
+            "motivo_encerramento": motivo,
         }
 
     def fetch_brasil_api_fast(self, cnpj: str, timeout: float = 3.5) -> Dict[str, Any]:

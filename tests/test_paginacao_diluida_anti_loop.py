@@ -380,3 +380,214 @@ def test_deep_scan_background_worker_partial_on_max_pages_ceiling(app):
         # Total de processos persistidos: 5 (pág 1) + 50 (pág 2) = 55
         assert updated_search.total_processes == 55
 
+
+def test_generic_normalization_and_fallback():
+    """
+    Valida normalização 100% genérica (hífen, barra, pontuação colada, múltiplos espaços)
+    e fallback automático quando a consulta com razão social completa retorna 200 OK com 0 itens.
+    """
+    from app.utils.sanitizer import normalize_search_term_generic, extract_corporate_core_name
+
+    # 1. Normalização genérica pura
+    assert normalize_search_term_generic("ALFA-BETA COMERCIO & SERVICOS S.A.") == "ALFA BETA COMERCIO SERVICOS S A"
+    assert normalize_search_term_generic("XPTO/RJ - SOLUCOES TECNOLOGICAS LTDA.") == "XPTO RJ SOLUCOES TECNOLOGICAS LTDA"
+    assert normalize_search_term_generic("   EMPRESA   COM   ESPACOS   DUPLOS   ") == "EMPRESA COM ESPACOS DUPLOS"
+
+    # 2. Extração genérica do núcleo da razão social
+    assert extract_corporate_core_name("ALFA-BETA COMERCIO & SERVICOS S.A.") == "ALFA BETA COMERCIO SERVICOS"
+    assert extract_corporate_core_name("XPTO/RJ - SOLUCOES TECNOLOGICAS LTDA.") == "XPTO RJ SOLUCOES TECNOLOGICAS"
+
+    # 3. Fallback automático em fetch_single_comunica_page
+    searcher = CNJProcessSearcher()
+    fallback_items = [_build_dummy_item(f"60000000120245020{i:03d}", company="ALFA BETA") for i in range(10)]
+
+    def mock_request(method, url, params=None, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        p_name = params.get("nomeParte", "")
+        # Se for o termo original com sufixo "S A", retorna 0 itens
+        if "S A" in p_name:
+            resp.json.return_value = {"items": []}
+        else:
+            # Fallback sem o sufixo retorna os itens
+            resp.json.return_value = {"items": fallback_items}
+        return resp
+
+    searcher._request_gov = MagicMock(side_effect=mock_request)
+    procs = searcher.fetch_single_comunica_page("ALFA-BETA COMERCIO S.A.", page_num=1)
+    assert len(procs) == 10
+    assert searcher.last_page_raw_count == 10
+
+
+def test_pagination_intermediate_zero_new_cnjs_does_not_abort():
+    """
+    Valida que uma página intermediária com 0 novos CNJs (intimações repetidas de processos já vistos)
+    NÃO interrompe a varredura se as páginas posteriores continuarem trazendo processos.
+    """
+    searcher = CNJProcessSearcher()
+
+    page1_items = [_build_dummy_item(f"11000000120245020{i:03d}") for i in range(50)]
+    # Página 2: 50 intimações repetindo processos da página 1 (mas com IDs de comunicação diferentes)
+    page2_items = [
+        {**_build_dummy_item(f"11000000120245020{i:03d}"), "id": f"comm_p2_{i}"}
+        for i in range(50)
+    ]
+    # Página 3: 50 itens (50 novos CNJs inéditos)
+    page3_items = [_build_dummy_item(f"13000000120245020{i:03d}") for i in range(50)]
+    # Página 4: 10 novos CNJs (< 50 itens, fim natural)
+    page4_items = [_build_dummy_item(f"14000000120245020{i:03d}") for i in range(10)]
+
+    def mock_request(method, url, params=None, **kwargs):
+        resp = MagicMock()
+        resp.ok = True
+        resp.status_code = 200
+        p = params.get("pagina", 1) if params else 1
+        if p == 1:
+            resp.json.return_value = {"items": page1_items}
+        elif p == 2:
+            resp.json.return_value = {"items": page2_items}
+        elif p == 3:
+            resp.json.return_value = {"items": page3_items}
+        elif p == 4:
+            resp.json.return_value = {"items": page4_items}
+        else:
+            resp.json.return_value = {"items": []}
+        return resp
+
+    searcher._request_gov = MagicMock(side_effect=mock_request)
+
+    strat = {"comunica_query_term": "EMPRESA VOLUME ALTO", "mode": "BROAD_BRAND"}
+    res = searcher.paginate_comunica_pje_standard(
+        search_strategy=strat,
+        start_page=1,
+        max_pages=10,
+        batch_delay=0.0,
+    )
+
+    # Não abortou na página 2! Leu as 4 páginas completas
+    assert res["pages_read"] == 4
+    # Total de processos: 50 (pág 1) + 50 (pág 3) + 10 (pág 4) = 110 processos únicos
+    assert res["total_processes"] == 110
+    assert res["is_completed"] is True
+    assert res["hit_max_pages"] is False
+
+
+def test_pagination_terminates_after_3_consecutive_zero_new_cnjs():
+    """
+    Valida que a varredura encerra com status COMPLETED e anti_loop_triggered=True
+    somente após 3 páginas consecutivas sem nenhum CNJ novo.
+    """
+    searcher = CNJProcessSearcher()
+
+    page1_items = [_build_dummy_item(f"21000000120245020{i:03d}") for i in range(50)]
+    # Páginas 2, 3 e 4 repetem processos da página 1 com IDs de comunicação diferentes
+    def make_repeated_page(p_num):
+        return [
+            {**_build_dummy_item(f"21000000120245020{i:03d}"), "id": f"comm_p{p_num}_{i}"}
+            for i in range(50)
+        ]
+
+    def mock_request(method, url, params=None, **kwargs):
+        resp = MagicMock()
+        resp.ok = True
+        resp.status_code = 200
+        p = params.get("pagina", 1) if params else 1
+        if p == 1:
+            resp.json.return_value = {"items": page1_items}
+        elif p in (2, 3, 4, 5, 6):
+            resp.json.return_value = {"items": make_repeated_page(p)}
+        else:
+            resp.json.return_value = {"items": []}
+        return resp
+
+    searcher._request_gov = MagicMock(side_effect=mock_request)
+
+    strat = {"comunica_query_term": "EMPRESA COM INTIMACOES REPETIDAS", "mode": "BROAD_BRAND"}
+    res = searcher.paginate_comunica_pje_standard(
+        search_strategy=strat,
+        start_page=1,
+        max_pages=20,
+        batch_delay=0.0,
+    )
+
+    # Parou após 3 páginas consecutivas sem novos CNJs (páginas 1, 2, 3, 4 -> leu 4 páginas)
+    assert res["pages_read"] == 4
+    assert res["anti_loop_triggered"] is True
+    assert res["is_completed"] is True
+    assert res["total_processes"] == 50
+
+
+def test_rate_limit_429_returns_rate_limited_and_never_completed(app):
+    """
+    Valida que respostas HTTP 429 na página 1 ou na paginação NUNCA marcam a busca como COMPLETED
+    com 0 processos e retornam sinalização explícita de RATE_LIMITED com retry_after.
+    """
+    searcher = CNJProcessSearcher()
+
+    def mock_429(method, url, **kwargs):
+        resp = MagicMock()
+        resp.ok = False
+        resp.status_code = 429
+        resp.headers = {"Retry-After": "2"}
+        return resp
+
+    searcher._request_gov = MagicMock(side_effect=mock_429)
+
+    # 1. Página 1 sob 429
+    procs = searcher.fetch_single_comunica_page("EMPRESA RATE LIMITED", page_num=1)
+    assert len(procs) == 0
+    assert searcher.last_page_rate_limited is True
+    assert searcher.last_page_status_code == 429
+
+    # 2. Paginação sob 429
+    strat = {"comunica_query_term": "EMPRESA RATE LIMITED", "mode": "BROAD_BRAND"}
+    res = searcher.paginate_comunica_pje_standard(
+        search_strategy=strat,
+        start_page=1,
+        max_pages=5,
+        batch_delay=0.0,
+    )
+    assert res["rate_limited"] is True
+    assert res["is_completed"] is False
+    assert res["retry_after_seconds"] >= 2
+
+
+def test_deep_scan_batch_endpoint_short_batches(client, app):
+    """
+    Valida o endpoint /deep-scan-batch/<search_id> processando lotes curtos (1 a 3 páginas)
+    sem estourar timeout HTTP no Render Free.
+    """
+    with app.app_context():
+        search = CompanySearch(
+            company_name="EMPRESA BATCH SCAN S.A.",
+            normalized_name="EMPRESA BATCH SCAN S A",
+            total_processes=5,
+            scan_status="PARTIAL_FAST_PATH",
+        )
+        db.session.add(search)
+        db.session.commit()
+        search_id = search.id
+
+        # Simula resposta de lote para página 2 (50 itens)
+        batch_items = [_build_dummy_item(f"33000000120245020{i:03d}") for i in range(50)]
+
+        def mock_request(method, url, params=None, **kwargs):
+            resp = MagicMock()
+            resp.ok = True
+            resp.status_code = 200
+            p = params.get("pagina", 1) if params else 1
+            if p == 2:
+                resp.json.return_value = {"items": batch_items}
+            else:
+                resp.json.return_value = {"items": []}
+            return resp
+
+        with patch("app.services.cnj_searcher.CNJProcessSearcher._request_gov", side_effect=mock_request):
+            # Chama lote curto de 1 página (página 2)
+            resp = client.post(f"/api/v1/deep-scan-batch/{search_id}", json={"page": 2, "batch_size": 1})
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert data["search_id"] == search_id
+            assert data["total_acumulado"] >= 50
+
+
