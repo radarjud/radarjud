@@ -1,0 +1,74 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+// Simula o ambiente do navegador antes de importar o cliente.
+const makeStore = () => { const m = new Map(); return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) }; };
+const events = [];
+globalThis.window = {
+  localStorage: makeStore(),
+  sessionStorage: makeStore(),
+  location: { hash: '#/history', hostname: 'localhost' },
+  dispatchEvent: (e) => { events.push(e); return true; },
+};
+
+const { apiRequest, readAuth, writeAuth, consumeReturnTo, friendlyError } = await import('./apiClient.test');
+
+const json = (status, body, headers = {}) => ({
+  ok: status >= 200 && status < 300,
+  status,
+  headers: { get: (name) => headers[name] ?? null },
+  json: async () => body,
+});
+
+test('401 renova o token uma única vez e repete a chamada com o novo Bearer', async () => {
+  writeAuth({ access_token: 'velho', refresh_token: 'r1', user: { id: 1 } }, false);
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, auth: init.headers?.Authorization });
+    if (url.endsWith('/auth/refresh')) return json(200, { access_token: 'novo', refresh_token: 'r2' });
+    return init.headers.Authorization === 'Bearer novo' ? json(200, { ok: true }) : json(401, { error: 'expirado' });
+  };
+  // duas chamadas simultâneas disputam o mesmo refresh
+  const [a, b] = await Promise.all([apiRequest('/history'), apiRequest('/history?limit=5')]);
+  assert.deepEqual(a, { ok: true });
+  assert.deepEqual(b, { ok: true });
+  assert.equal(calls.filter((c) => c.url.endsWith('/auth/refresh')).length, 1);
+  assert.equal(readAuth().access_token, 'novo');
+  assert.equal(readAuth().refresh_token, 'r2');
+});
+
+test('refresh recusado encerra a sessão e leva para #/login guardando a rota', async () => {
+  writeAuth({ access_token: 'velho', refresh_token: 'ruim', user: { id: 1 } }, false);
+  window.location.hash = '#/history';
+  globalThis.fetch = async (url) => (url.endsWith('/auth/refresh') ? json(401, { error: 'inválido' }) : json(401, { error: 'expirado' }));
+  await assert.rejects(() => apiRequest('/history'), (e) => e.status === 401);
+  assert.equal(readAuth(), null);
+  assert.equal(window.location.hash, '#/login');
+  assert.equal(consumeReturnTo(), '#/history');
+  assert.ok(events.some((e) => e.type === 'radarjus:session-expired'));
+});
+
+test('login com senha errada não tenta renovar nem derruba nada', async () => {
+  window.location.hash = '#/login';
+  let refreshCalls = 0;
+  globalThis.fetch = async (url) => { if (url.endsWith('/auth/refresh')) refreshCalls += 1; return json(401, { error: 'Credenciais inválidas.' }); };
+  await assert.rejects(() => apiRequest('/auth/login', { method: 'POST', auth: false, body: '{}' }), /Credenciais inválidas/);
+  assert.equal(refreshCalls, 0);
+});
+
+test('402 de cota publica o uso e gera mensagem clara', async () => {
+  globalThis.fetch = async () => json(402, { error: 'x', code: 'QUOTA_EXCEEDED', used: 50, limit: 50, plan: 'PRO' });
+  let failure;
+  try { await apiRequest('/search-company', { method: 'POST', body: '{}' }); } catch (e) { failure = e; }
+  assert.equal(failure.code, 'QUOTA_EXCEEDED');
+  assert.match(friendlyError(failure), /Cota mensal de consultas esgotada\. Você usou 50 de 50 consultas do plano Pro/);
+  const quotaEvent = events.filter((e) => e.type === 'radarjus:quota').at(-1);
+  assert.deepEqual(quotaEvent.detail, { limit: 50, used: 50, remaining: 0 });
+});
+
+test('sem sessão, 401 em link compartilhado não redireciona', async () => {
+  window.location.hash = '#/overview/42';
+  globalThis.fetch = async () => json(401, { error: 'Faça login' });
+  await assert.rejects(() => apiRequest('/history/42'), (e) => e.status === 401);
+  assert.equal(window.location.hash, '#/overview/42');
+});

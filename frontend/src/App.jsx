@@ -24,9 +24,14 @@ import { CompanyLogo } from "./CompanyLogo.jsx";
 import { fetchPjePage, runBrowserDeepScan } from './services/pjeBrowserScanner.js';
 import CatalogPage, { normalizeCatalog, onlyDigits } from './CatalogPage.jsx';
 import ComparePage from './ComparePage.jsx';
+import { useAuth } from './AuthContext.jsx';
+import LoginPage from './LoginPage.jsx';
+import RegisterPage from './RegisterPage.jsx';
+import SessionCard from './SessionCard.jsx';
+import { AuthSplash } from './AuthLayout.jsx';
+import logoHorizontal from './assets/logo-radarjus-horizontal.png';
+import { apiFetch, apiRequest, consumeReturnTo, saveReturnTo } from './apiClient.js';
 
-// Vite encaminha /api ao Flask. Defina VITE_API_BASE_URL se a API estiver em outro host.
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
 const PAGE_LABELS = {
   search: 'Pesquisar empresas', catalog: 'Catálogo de empresas', overview: 'Visão geral', processes: 'Processos',
   predictions: 'Estimativas', history: 'Histórico', compare: 'Comparar empresas',
@@ -195,30 +200,8 @@ function normalize(raw) {
   };
 }
 
-async function request(path, options = {}) {
-  let response;
-  const endpoint = `${API_BASE}/api/v1${path}`;
-  try {
-    response = await fetch(endpoint, {
-      ...options,
-      headers: { 'Content-Type': 'application/json', ...options.headers },
-    });
-  } catch {
-    if (!API_BASE && typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-      throw new Error('A variável de ambiente VITE_API_BASE_URL não está configurada na Vercel apontando para o Render.');
-    }
-    throw new Error('Não foi possível conectar à API. Se o serviço no Render for gratuito, aguarde cerca de 1 minuto para inicialização (cold start).');
-  }
-  const body = await response.json().catch(() => null);
-  if (!response.ok) {
-    const failure = new Error(body?.error || body?.message || `Erro HTTP ${response.status}`);
-    failure.status = response.status;
-    failure.hasBody = body !== null;
-    throw failure;
-  }
-  if (body === null) throw new Error('A API não retornou JSON válido.');
-  return body;
-}
+// Cliente central: envia o Bearer, renova o token em 401 e encerra a sessão quando necessário.
+const request = apiRequest;
 
 function Stat({ label, value, hint, icon: Icon, tone }) {
   return (
@@ -273,8 +256,13 @@ function Sidebar({page,navigate,mobileOpen,setMobileOpen,showCatalog}) {
       <div className={`mobile-overlay ${mobileOpen ? 'visible' : ''}`} onClick={() => setMobileOpen(false)} />
       <aside className={`sidebar ${mobileOpen ? 'open' : ''}`}>
         <div className="brand">
-          <div className="brand-mark"><Activity size={26} /></div>
-          <div><strong>Radar<span>Jus</span></strong><small>INTELIGÊNCIA PREDITIVA</small></div>
+          <img
+            src={logoHorizontal}
+            alt="RadarJus - Inteligência Preditiva"
+            width="541"
+            height="173"
+            style={{ display: 'block', width: '100%', maxWidth: 190, height: 'auto' }}
+          />
           <button className="mobile-close" onClick={() => setMobileOpen(false)} aria-label="Fechar menu"><X size={20} /></button>
         </div>
         <div className="nav-label">PLATAFORMA</div>
@@ -298,10 +286,7 @@ function Sidebar({page,navigate,mobileOpen,setMobileOpen,showCatalog}) {
             <ShieldCheck size={19} />
             <div><b>Dados com contexto</b><small>Metadados públicos para auditoria e inteligência preditiva.</small></div>
           </div>
-          <div className="account">
-            <span className="avatar">RJ</span>
-            <div><b>RadarJus</b><small>Inteligência B2B & Previsibilidade</small></div>
-          </div>
+            <SessionCard />
         </div>
       </aside>
     </>
@@ -1144,7 +1129,7 @@ function CompanyShareActions({ data }) {
       };
 
       // Prioriza POST com os dados já carregados na tela (elimina 404 mesmo sem persistência prévia)
-      let response = await fetch(`${API_BASE}/api/v1/report/pdf`, {
+      let response = await apiFetch('/report/pdf', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(pdfPayload),
@@ -1153,9 +1138,9 @@ function CompanyShareActions({ data }) {
       // Fallback para GET por ID ou query string ?empresa=...
       if (!response || !response.ok) {
         const fallbackUrl = id
-          ? `${API_BASE}/api/v1/history/${id}/summary.pdf`
-          : `${API_BASE}/api/v1/report/pdf?empresa=${encodeURIComponent(data.name || '')}`;
-        response = await fetch(fallbackUrl);
+          ? `/history/${id}/summary.pdf`
+          : `/report/pdf?empresa=${encodeURIComponent(data.name || '')}`;
+        response = await apiFetch(fallbackUrl);
       }
 
       if (!response.ok) {
@@ -1205,7 +1190,7 @@ function CompanyShareActions({ data }) {
   );
 }
 
-export default function App() {
+function AppShell() {
   const [route, setRoute] = useState(() => parseRoute(window.location.hash));
   const { page, searchId } = route;
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -1507,4 +1492,43 @@ export default function App() {
       </div>
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Porta de entrada de autenticação: decide entre Login, Cadastro e o app.
+// ---------------------------------------------------------------------------
+function authRouteOf(hash) {
+  const clean = String(hash || '').split('?')[0].replace(/\/+$/, '');
+  if (clean === '#/login') return 'login';
+  if (clean === '#/register') return 'register';
+  return null;
+}
+
+export default function App() {
+  const { status, isAuthenticated } = useAuth();
+  const [hash, setHash] = useState(() => window.location.hash);
+
+  useEffect(() => {
+    const onHash = () => setHash(window.location.hash);
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+
+  const authRoute = authRouteOf(hash);
+
+  useEffect(() => {
+    if (status === 'loading') return;
+    if (!isAuthenticated && !authRoute) {
+      // Guarda a rota pedida para voltar a ela depois do login.
+      saveReturnTo(hash);
+      window.location.hash = '#/login';
+    } else if (isAuthenticated && authRoute) {
+      window.location.hash = consumeReturnTo();
+    }
+  }, [status, isAuthenticated, authRoute, hash]);
+
+  if (status === 'loading') return <AuthSplash />;
+  if (!isAuthenticated) return authRoute === 'register' ? <RegisterPage /> : <LoginPage />;
+  if (authRoute) return <AuthSplash label="Redirecionando..." />;
+  return <AppShell />;
 }

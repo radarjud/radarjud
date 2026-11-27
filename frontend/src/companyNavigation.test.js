@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { companyHash, companyShareUrl, parseRoute, validSearchId } from './companyNavigation.js';
+import { companyHash, companyShareUrl, isAuthPage, isProtectedRoute, parseRoute, validSearchId } from './companyNavigation.js';
 
 test('abre links diretos e mantém o ID entre abas da empresa', () => {
   const id = parseRoute('#/overview/42').searchId;
@@ -24,4 +24,24 @@ test('rotas antigas e novas funcionam e IDs inválidos não são aceitos', () =>
   assert.deepEqual(parseRoute('#/compare/99'), { page: 'compare', searchId: null });
   assert.deepEqual(parseRoute('#/invalid'), { page: 'search', searchId: null });
   for (const id of ['0', '-2', 'foo', '12a', '1.5', '9007199254740992', null]) assert.equal(validSearchId(id), null);
+});
+
+test('login e cadastro são rotas reconhecidas e públicas', () => {
+  assert.deepEqual(parseRoute('#/login'), { page: 'login', searchId: null });
+  assert.deepEqual(parseRoute('#/register'), { page: 'register', searchId: null });
+  assert.equal(isAuthPage('login'), true);
+  assert.equal(isAuthPage('search'), false);
+  assert.equal(isProtectedRoute('login', null), false);
+  assert.equal(isProtectedRoute('register', null), false);
+});
+
+test('rotas internas exigem sessão, exceto links compartilhados com ID', () => {
+  for (const page of ['search', 'catalog', 'overview', 'processes', 'predictions', 'history']) {
+    assert.equal(isProtectedRoute(page, null), true, `${page} sem ID deve ser protegida`);
+  }
+  for (const page of ['overview', 'processes', 'predictions']) {
+    assert.equal(isProtectedRoute(page, '42'), false, `${page}/42 é link compartilhado`);
+  }
+  assert.equal(isProtectedRoute('history', '42'), true);
+  assert.equal(isProtectedRoute('overview', 'abc'), true);
 });
