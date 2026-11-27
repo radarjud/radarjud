@@ -2,8 +2,8 @@ import React, { useRef, useState } from 'react';
 import { AlertCircle, ArrowRight, Info, RefreshCw, ShieldCheck } from 'lucide-react';
 import AuthLayout from './AuthLayout.jsx';
 import { CheckField, PasswordField, TextField } from './AuthFields.jsx';
-import { useAuth } from './context/AuthContext.jsx';
-import { friendlyError } from './services/apiClient.js';
+import { useAuth } from './AuthContext.jsx';
+import { friendlyError } from './apiClient.js';
 import { validateEmail } from './authValidation.js';
 
 function loginMessage(failure) {

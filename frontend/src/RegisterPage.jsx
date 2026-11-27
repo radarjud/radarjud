@@ -2,8 +2,8 @@ import React, { useRef, useState } from 'react';
 import { AlertCircle, ArrowRight, RefreshCw } from 'lucide-react';
 import AuthLayout from './AuthLayout.jsx';
 import { CheckField, PasswordField, PasswordStrength, TextField } from './AuthFields.jsx';
-import { useAuth } from './context/AuthContext.jsx';
-import { friendlyError } from './services/apiClient.js';
+import { useAuth } from './AuthContext.jsx';
+import { friendlyError } from './apiClient.js';
 import {
   maskCnpj, validateCnpj, validateCompany, validateEmail, validateFullName, validatePassword,
 } from './authValidation.js';

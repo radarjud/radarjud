@@ -1,7 +1,7 @@
 import React from 'react';
 import { LogIn, LogOut, UserPlus } from 'lucide-react';
-import { useAuth } from './context/AuthContext.jsx';
-import { quotaTone } from './services/session.js';
+import { useAuth } from './AuthContext.jsx';
+import { quotaTone } from './Session.js';
 
 // Bloco de sessão no rodapé da sidebar: empresa, perfil, plano, cota mensal e botão Sair.
 export default function SessionCard() {

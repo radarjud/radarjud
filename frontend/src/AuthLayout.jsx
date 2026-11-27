@@ -1,15 +1,18 @@
 import React from 'react';
-import { Activity, RefreshCw, ShieldCheck } from 'lucide-react';
+import { RefreshCw, ShieldCheck } from 'lucide-react';
+import logoHorizontal from './assets/logo-radarjus-horizontal.png';
 
-// Marca exibida nas telas de acesso. Para trocar pela logo final em SVG, altere só este componente.
+// Marca exibida nas telas de acesso (logo oficial RadarJus, PNG com fundo transparente para fundos escuros).
 export function BrandLockup() {
   return (
     <div className="auth-brand">
-      <div className="auth-brand-mark"><Activity size={26} /></div>
-      <div>
-        <strong>Radar<span>Jus</span></strong>
-        <small>INTELIGÊNCIA PREDITIVA</small>
-      </div>
+      <img
+        src={logoHorizontal}
+        alt="RadarJus - Inteligência Preditiva"
+        width="541"
+        height="173"
+        style={{ display: 'block', width: '100%', maxWidth: 240, height: 'auto' }}
+      />
     </div>
   );
 }
