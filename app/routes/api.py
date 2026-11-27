@@ -11,6 +11,7 @@ import hmac
 import asyncio
 import logging
 import threading
+from typing import Any
 from pathlib import Path
 import gc
 from datetime import datetime, timezone
@@ -82,10 +83,18 @@ CANCELLED_JOB_IDS = set()
 
 
 def fast_extract_cnpjs_from_texts(processes_dict: dict) -> list:
-    """Extrai CNPJs únicos por raiz (8 primeiros dígitos) diretamente dos textos do Comunica PJe em 1ms."""
+    """Extrai CNPJs únicos por raiz (8 primeiros dígitos) diretamente dos metadados/textos do Comunica PJe em 1ms."""
     seen_roots = {}
     for proc in processes_dict.values():
-        for txt in proc.get("publicacoes_texto", []):
+        for c in proc.get("cnpjs_encontrados", []) or []:
+            digits = re.sub(r"\D", "", str(c))
+            if len(digits) == 14:
+                root = digits[:8]
+                if root not in seen_roots:
+                    seen_roots[root] = digits
+                    if len(seen_roots) >= 3:
+                        return list(seen_roots.values())
+        for txt in (proc.get("publicacoes_texto") or ([proc["resumoPublicacao"]] if proc.get("resumoPublicacao") else [])):
             for match in CNPJ_REGEX.findall(str(txt)):
                 digits = re.sub(r"\D", "", match)
                 if len(digits) == 14:
@@ -95,6 +104,24 @@ def fast_extract_cnpjs_from_texts(processes_dict: dict) -> list:
                         if len(seen_roots) >= 3:
                             return list(seen_roots.values())
     return list(seen_roots.values())
+
+
+def _compact_raw_metadata(raw_meta: Any) -> Any:
+    """Remove HTML bruto (`publicacoes_texto`/`texto`) para manter o consumo de RAM < 380 MB e L1 leve."""
+    if not isinstance(raw_meta, dict):
+        return raw_meta
+    cleaned = {
+        k: v
+        for k, v in raw_meta.items()
+        if k not in ("publicacoes_texto", "textos_pje", "texto", "teor", "conteudo", "textoPublicacao", "raw_metadata")
+    }
+    if isinstance(cleaned.get("movimentos"), list) and len(cleaned["movimentos"]) > 20:
+        cleaned["movimentos"] = [
+            {"codigo": m.get("codigo"), **({"dataHora": m["dataHora"]} if m.get("dataHora") else {})}
+            for m in cleaned["movimentos"][:20]
+            if isinstance(m, dict) and m.get("codigo") is not None
+        ]
+    return cleaned or None
 
 # Integração com radarjusAgent (Google ADK + Vertex AI)
 RADARJUS_AGENT_DIR = Path(__file__).resolve().parents[2] / "radarjusAgent"
@@ -203,13 +230,20 @@ def _deep_scan_background_worker(
                     db.session.rollback()
                     logger.debug("Erro ao atualizar progresso da página %d: %s", page_num, db_e)
 
-            # 1. Paginação padrão até 20 páginas no Comunica PJe (começando da página 2)
+            # 1. Paginação calibrada para Render Free (até 15 páginas / 1.500 registros / orçamento de 50s)
+            from app.services.cnj_searcher import (
+                SYNC_SCAN_MAX_PAGES,
+                SYNC_SCAN_MAX_RECORDS,
+                SYNC_SCAN_TIME_BUDGET_SECONDS,
+            )
             scan_res = orchestrator.searcher.paginate_comunica_pje_standard(
                 search_strategy=strat,
                 start_page=2,
-                max_pages=20,
+                max_pages=SYNC_SCAN_MAX_PAGES,
                 on_page_callback=_on_page_update,
                 timeout=6.0,
+                time_budget_seconds=SYNC_SCAN_TIME_BUDGET_SECONDS,
+                max_records=SYNC_SCAN_MAX_RECORDS,
             )
 
             # Mescla todos os processos retornados em all_processes_map
@@ -359,7 +393,7 @@ def _deep_scan_background_worker(
                             subsidiary_contractors_json=proc.get("subsidiary_contractors") or [],
                             data_distribuicao=proc.get("data_distribuicao"),
                             valor_causa=proc.get("valor_causa"),
-                            raw_metadata=proc.get("raw_metadata"),
+                            raw_metadata=_compact_raw_metadata(proc.get("raw_metadata")),
                         )
                         new_records.append(record)
                         existing_numbers.add(num)
@@ -372,6 +406,7 @@ def _deep_scan_background_worker(
                         except Exception as batch_err:
                             db.session.rollback()
                             logger.debug("Lote de processos %d tratado defensivamente: %s", i, batch_err)
+                gc.collect()
             except Exception as rec_err:
                 logger.debug("Persistência detalhada de processos ignorada: %s", rec_err)
 
@@ -501,7 +536,19 @@ def search_company():
         return jsonify({"error": "empresas so são pesquisadas por razão social ou CNPJ"}), 400
 
     # 1. Resolução inteligente de estratégia de busca (BROAD_BRAND vs STRICT_RAZAO vs STRICT_CNPJ)
-    search_strategy = resolve_search_strategy(raw_query, brasil_api_fetcher=fetch_cnpj_brasilapi)
+    def _cnpj_name_resolver(cnpj_val: str) -> str | None:
+        try:
+            from app.models.CompanyRegistry import CompanyRegistry
+            clean_c = re.sub(r"\D", "", str(cnpj_val or ""))
+            if len(clean_c) == 14:
+                reg = CompanyRegistry.query.filter_by(cnpj=clean_c).first()
+                if reg and reg.razao_social:
+                    return reg.razao_social
+        except Exception:
+            pass
+        return fetch_cnpj_brasilapi(cnpj_val)
+
+    search_strategy = resolve_search_strategy(raw_query, brasil_api_fetcher=_cnpj_name_resolver)
     query_term = search_strategy["comunica_query_term"]
     display_title = search_strategy["display_title"]
     is_broad_brand = search_strategy["is_broad_brand"]
@@ -575,17 +622,32 @@ def search_company():
                 .order_by(CompanySearch.updated_at.desc())
                 .first()
             )
-            # Só retorna cache se houver processos (> 0), for recente e varredura COMPLETA.
-            # Evita que uma busca vazia anterior ou preliminar congele o sistema por 24 horas.
+            # Só retorna cache se houver processos (> 0), for recente e varredura concluída (completa ou teto parcial persistido).
+            # Evita que uma busca vazia anterior congele o sistema, mas garante reconsulta instantânea (< 300ms) no L1.
+            cached_econ = cached_search.economic_standing if (cached_search and isinstance(cached_search.economic_standing, dict)) else {}
+            saved_cache_key = (
+                (cached_econ.get("browser_search_strategy") or {}).get("cache_key")
+                or cached_econ.get("search_cache_key")
+            )
+            l1_status_ready = bool(
+                cached_search
+                and (
+                    cached_search.scan_status in ("COMPLETED", "BROWSER_PARTIAL", "PARTIAL_COMPLETED")
+                    or (
+                        cached_search.scan_status == "PARTIAL_FAST_PATH"
+                        and cached_search.last_checked_at
+                        and (get_utc_now() - cached_search.last_checked_at).total_seconds() > 90
+                    )
+                )
+            )
             if (
                 cached_search
                 and (cached_search.total_processes or 0) > 0
                 and cached_search.is_recent(hours=24)
-                and cached_search.scan_status == "COMPLETED"
-                and (not browser_requested or ((cached_search.economic_standing or {})
-                     .get("browser_search_strategy", {}).get("cache_key") == cache_key))
+                and l1_status_ready
+                and (not browser_requested or not saved_cache_key or saved_cache_key == cache_key)
             ):
-                logger.info("Curto-circuito Nível 1 ativado para '%s' (search_id=%d).", normalized_name, cached_search.id)
+                logger.info("Curto-circuito Nível 1 ativado para '%s' (search_id=%d, status=%s).", normalized_name, cached_search.id, cached_search.scan_status)
                 proc_dicts = [p.to_dict() for p in cached_search.processes]
                 res = cached_search.to_dict()
                 res["empresa"] = cached_search.company_name
@@ -600,7 +662,12 @@ def search_company():
                 res["score_risco_terceirizacao"] = cached_search.overall_risk_score or 0.0
                 res["overall_risk_score"] = cached_search.overall_risk_score or 0.0
 
-                if proc_dicts and len(proc_dicts) >= (cached_search.total_processes or 0):
+                needs_metrics_refresh = (
+                    not cached_search.outcomes_summary
+                    or cached_search.ranking_motivos is None
+                    or cached_search.predictions_summary is None
+                )
+                if needs_metrics_refresh and proc_dicts and len(proc_dicts) >= (cached_search.total_processes or 0):
                     fresh_metrics = orchestrator.predictor.generate_dashboard_metrics(
                         cached_search.company_name, proc_dicts
                     )
@@ -619,17 +686,29 @@ def search_company():
                     cached_search.condenacao_por_motivo = fresh_metrics.get("condenacao_por_motivo", cached_search.condenacao_por_motivo or [])
                     cached_search.predictions_summary = fresh_metrics["plus_previsao_condenacao"]
                     cached_search.overall_risk_score = fresh_metrics["score_risco_terceirizacao"]
-                # Análise de Idoneidade Econômica & Risco de Calote Subsidiário (Súmula 331 TST)
-                econ_data = economic_service.evaluate_economic_standing(
-                    company_name=cached_search.company_name,
-                    cnpj=cnpj_used,
-                    company_processes=proc_dicts,
-                    p_condenacao_trabalhista=res.get("probabilidade_condenacao_geral_pct") or 0.0,
-                    search_strategy=search_strategy,
+
+                # Reutiliza idoneidade econômica persistida no cache L1 (< 300ms) salvo se ausente ou homônimo INAPTA defasado
+                stale_inapta = (
+                    isinstance(cached_econ, dict)
+                    and cached_econ.get("situacao_cadastral") == "INAPTA"
+                    and (cached_search.total_processes or 0) >= 25
                 )
-                saved_browser_strategy = (cached_search.economic_standing or {}).get("browser_search_strategy")
-                if saved_browser_strategy:
-                    econ_data = {**econ_data, "browser_search_strategy": saved_browser_strategy}
+                econ_dirty = False
+                if cached_econ and not stale_inapta:
+                    econ_data = dict(cached_econ)
+                else:
+                    econ_data = economic_service.evaluate_economic_standing(
+                        company_name=cached_search.company_name,
+                        cnpj=cnpj_used,
+                        company_processes=proc_dicts,
+                        p_condenacao_trabalhista=res.get("probabilidade_condenacao_geral_pct") or 0.0,
+                        search_strategy=search_strategy,
+                    )
+                    saved_browser_strategy = cached_econ.get("browser_search_strategy") if isinstance(cached_econ, dict) else None
+                    if saved_browser_strategy:
+                        econ_data = {**econ_data, "browser_search_strategy": saved_browser_strategy}
+                    econ_dirty = True
+
                 res["idoneidade_economica"] = econ_data
                 res["logo"] = econ_data.get("logo", {})
                 res["capital_social_consolidado"] = econ_data.get("valor_formatado") or econ_data.get("capital_social_formatado")
@@ -641,11 +720,15 @@ def search_company():
                     res["score_risco_terceirizacao"] = econ_data["indice_exposicao_financeira"]
                     res["overall_risk_score"] = econ_data["indice_exposicao_financeira"]
 
-                # Re-executa o Agente ADK sobre os metadados (incluindo idoneidade econômica) para garantir parecer sempre atualizado
-                fresh_ai = orchestrator.ai_analyzer.analyze_company(res)
-                if fresh_ai:
-                    res["ai_analysis"] = fresh_ai
-                    cached_search.ai_analysis = fresh_ai
+                # Reutiliza parecer de IA persistido quando disponível (evita chamada Gemini em L1 hit)
+                if isinstance(cached_search.ai_analysis, dict) and cached_search.ai_analysis:
+                    res["ai_analysis"] = cached_search.ai_analysis
+                else:
+                    fresh_ai = orchestrator.ai_analyzer.analyze_company(res)
+                    if fresh_ai:
+                        res["ai_analysis"] = fresh_ai
+                        cached_search.ai_analysis = fresh_ai
+                        econ_dirty = True
 
                 # Contratos com o Poder Público (US-20): hidratação resiliente se ainda não computado
                 from app.services.public_contracts_service import public_contracts_service
@@ -663,21 +746,23 @@ def search_company():
                     if contratos_pub.get("total_contratos", 0) > 0 or not cached_search.contratos_poder_publico:
                         cached_search.contratos_poder_publico = contratos_pub
                         res["contratos_poder_publico"] = contratos_pub
+                        econ_dirty = True
                 res["cached"] = True
                 res["cache_level"] = "L1_DATABASE"
                 res["search_id"] = cached_search.id
                 res["processos"] = proc_dicts
                 res["parecer_agente_adk"] = res.get("ai_analysis", {})
 
-                # Atualiza os dados de idoneidade no banco de dados para eliminar dados defasados
-                try:
-                    cached_search.economic_standing = econ_data
-                    if econ_data and isinstance(econ_data, dict):
-                        cached_search.cnae_codigo = econ_data.get("cnae_codigo") or cached_search.cnae_codigo
-                        cached_search.cnae_descricao = econ_data.get("cnae_descricao") or cached_search.cnae_descricao
-                    db.session.commit()
-                except Exception:
-                    pass
+                # Persiste atualização apenas se houve recálculo (evita round-trip extra no Supabase)
+                if econ_dirty or needs_metrics_refresh:
+                    try:
+                        cached_search.economic_standing = econ_data
+                        if econ_data and isinstance(econ_data, dict):
+                            cached_search.cnae_codigo = econ_data.get("cnae_codigo") or cached_search.cnae_codigo
+                            cached_search.cnae_descricao = econ_data.get("cnae_descricao") or cached_search.cnae_descricao
+                        db.session.commit()
+                    except Exception:
+                        db.session.rollback()
 
                 resp = jsonify(res)
                 if current_user and current_user.tenant_id:
@@ -782,6 +867,8 @@ def search_company():
             discovered_entities=fast_results.get("discovered_entities", []),
             search_strategy=search_strategy,
         )
+        if isinstance(econ_data, dict):
+            econ_data = {**econ_data, "search_cache_key": cache_key}
         if browser_owned:
             econ_data = {**econ_data, "browser_search_strategy": search_strategy}
         fast_results["idoneidade_economica"] = econ_data
@@ -866,10 +953,11 @@ def search_company():
                     subsidiary_contractors_json=proc.get("subsidiary_contractors") or [],
                     data_distribuicao=proc.get("data_distribuicao"),
                     valor_causa=proc.get("valor_causa"),
-                    raw_metadata=proc.get("raw_metadata"),
+                    raw_metadata=_compact_raw_metadata(proc.get("raw_metadata")),
                 )
                 db.session.add(record)
             db.session.commit()
+            gc.collect()
         except Exception as db_exc:
             db.session.rollback()
             logger.debug("Persistência no DB ignorada ou indisponível: %s", db_exc)
@@ -1700,7 +1788,7 @@ def ingest_deep_scan():
                 has_expert_report=has_expert,
                 data_distribuicao=parsed_proc.get("data_distribuicao"),
                 valor_causa=parsed_proc.get("valor_causa"),
-                raw_metadata=parsed_proc,
+                raw_metadata=_compact_raw_metadata(parsed_proc),
             )
             new_records.append(record)
             existing_records[cnj] = record

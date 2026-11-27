@@ -7,7 +7,7 @@ from app.routes import api_bp
 from app.routes.auth import auth_bp
 
 
-def create_app(config_name: str = None) -> Flask:
+def create_app(config_name: str = None, seed_catalog: bool = True) -> Flask:
     """
     Application Factory para o LexGuard AI.
     Configura banco de dados PostgreSQL, CORS, logs e rotas da API.
@@ -159,48 +159,14 @@ def create_app(config_name: str = None) -> Flask:
                     conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_monitored_suppliers_tenant_active ON monitored_suppliers (tenant_id, active);"))
                     conn.commit()
 
-            # Pré-semeia e sincroniza CompanyRegistry com os metadados de grandes corporações para máxima velocidade
-            try:
-                import re
-                from app.models.CompanyRegistry import CompanyRegistry
-                from app.models.company_search import get_utc_now
-                from app.services.economic_service import OFFICIAL_CORPORATE_METADATA
-                now = get_utc_now()
-                for c_cnpj, meta in OFFICIAL_CORPORATE_METADATA.items():
-                    c_clean = re.sub(r"\D", "", c_cnpj)
-                    meta_cap = float(meta.get("capital_social") or 0.0)
-                    existing = CompanyRegistry.query.filter_by(cnpj=c_clean).first()
-                    if not existing:
-                        reg = CompanyRegistry(
-                            cnpj=c_clean,
-                            razao_social=meta["razao_social"][:255],
-                            nome_fantasia=meta.get("nome_fantasia", "")[:255] or None,
-                            situacao_cadastral=meta.get("descricao_situacao_cadastral", "ATIVA")[:50],
-                            matriz_filial="1" if meta.get("identificador_matriz_filial") == 1 else "2",
-                            municipio=meta.get("municipio", "")[:150] or None,
-                            uf=meta.get("uf", "")[:2] or None,
-                            capital_social=meta_cap,
-                            cnae_codigo=meta.get("cnae_codigo"),
-                            cnae_descricao=meta.get("cnae_descricao"),
-                            created_at=now,
-                            updated_at=now,
-                        )
-                        db.session.add(reg)
-                    else:
-                        changed = False
-                        if meta_cap > 0.0 and float(existing.capital_social or 0.0) == 0.0:
-                            existing.capital_social = meta_cap
-                            changed = True
-                        if not existing.cnae_codigo and meta.get("cnae_codigo"):
-                            existing.cnae_codigo = meta["cnae_codigo"]
-                            existing.cnae_descricao = meta.get("cnae_descricao")
-                            changed = True
-                        if changed:
-                            existing.updated_at = now
-                db.session.commit()
-            except Exception as e_seed:
-                db.session.rollback()
-                app.logger.debug("Sincronização de CompanyRegistry ignorada/já presente: %s", e_seed)
+            # Pré-semeia e sincroniza CompanyRegistry com o catálogo completo quando vazio ou incompleto
+            if seed_catalog:
+                try:
+                    from app.seeds.catalog_seed import seed_company_registry
+                    seed_company_registry(enrich_via_brasilapi=False, commit=True)
+                except Exception as e_seed:
+                    db.session.rollback()
+                    app.logger.debug("Sincronização de CompanyRegistry ignorada/já presente: %s", e_seed)
         except Exception as exc:
             app.logger.warning("Não foi possível conectar imediatamente ao PostgreSQL para db.create_all(): %s", exc)
 

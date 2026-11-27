@@ -311,7 +311,7 @@ def classify_process_canonical_motive(process: Dict[str, Any]) -> str:
                 elif isinstance(c, str) and c.strip():
                     candidates.append(c.strip())
 
-        texts = process.get("publicacoes_texto") or []
+        texts = process.get("publicacoes_texto") or ([process["resumoPublicacao"]] if process.get("resumoPublicacao") else [])
         if isinstance(texts, list):
             for t in texts[:3]:
                 if t and isinstance(t, str):
@@ -824,7 +824,7 @@ class BayesianRiskPredictor:
                 for s in subj_list
             )
             if is_all_generic:
-                raw_texts = p.get("publicacoes_texto") or []
+                raw_texts = p.get("publicacoes_texto") or ([p["resumoPublicacao"]] if p.get("resumoPublicacao") else [])
                 classes_pje = p.get("classes_pje") or []
                 if raw_texts or classes_pje:
                     extracted = extract_real_cause_fast([], raw_texts, classes_pje=classes_pje)

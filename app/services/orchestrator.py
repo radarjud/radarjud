@@ -20,7 +20,11 @@ from app.services.tpu_constants import (
     TPU_OUTCOME_CODES,
     TPU_EXPERT_REPORT_CODES,
 )
-from app.utils.http_client import request_gov_br_with_fallback
+from app.services.cnj_searcher import (
+    SYNC_SCAN_MAX_PAGES,
+    SYNC_SCAN_MAX_RECORDS,
+    SYNC_SCAN_TIME_BUDGET_SECONDS,
+)
 
 import html
 
@@ -515,7 +519,13 @@ class CNJMetadataOrchestrator:
         self.searcher.datajud_key = self.datajud_key
         if fast_path:
             return self.searcher.fetch_single_comunica_page(brand_term, page_num=1, timeout=5.0)
-        procs, disc = self.searcher.fetch_comunica_pje_all_branches(brand_term, max_pages=max_pages if max_pages > 2 else 10)
+        resolved_pages = min(SYNC_SCAN_MAX_PAGES, max_pages) if max_pages > 2 else min(SYNC_SCAN_MAX_PAGES, 10)
+        procs, disc = self.searcher.fetch_comunica_pje_all_branches(
+            brand_term,
+            max_pages=resolved_pages,
+            time_budget_seconds=SYNC_SCAN_TIME_BUDGET_SECONDS,
+            max_records=SYNC_SCAN_MAX_RECORDS,
+        )
         self.last_discovered_entities = list(disc)
         return procs
 
@@ -827,14 +837,14 @@ class CNJMetadataOrchestrator:
         """
         Executa a análise da empresa com dados reais completos.
         - Se fast_path=True: busca rápida (< 3s na primeira página).
-        - Se fast_path=False: Deep Scan em segundo plano varrendo em paralelo até 12 páginas (até 600 publicações)
-          para capturar todas as filiais e empresas vinculadas do grupo.
+        - Se fast_path=False: varredura calibrada para Render Free até 15 páginas (1.500 registros /
+          orçamento de 50s) descartando HTML bruto para manter RAM < 380 MB.
         """
         cache_key = company_name.strip().lower()
         if not fast_path and cache_key in self._cache:
             return self._cache[cache_key]
 
-        max_pages = 1 if fast_path else 12
+        max_pages = 1 if fast_path else SYNC_SCAN_MAX_PAGES
         discovered_entities: List[str] = []
 
         query_term = None
