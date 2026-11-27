@@ -57,6 +57,7 @@ from app.services.cnj_searcher import (
     get_scan_config,
     parse_iso_date,
     extract_real_cause_fast,
+    classify_process_outcome,
 )
 
 logger = logging.getLogger(__name__)
@@ -1667,11 +1668,124 @@ def incremental_sync(search_id: int):
         return jsonify({"error": "Falha na sincronização incremental."}), 500
 
 
+def _recalculate_search_metrics(search: CompanySearch):
+    """
+    Recalcula de forma leve (sem inflar memória com ORM) todas as métricas executivas,
+    taxas históricas, idoneidade econômica e parecer do Agente ADK sobre 100% dos processos
+    persistidos no banco de dados para a busca.
+    """
+    search_id = search.id
+
+    # Consulta SQL enxuta apenas com as colunas necessárias (RAM constante)
+    procs_raw = (
+        db.session.query(
+            ProcessRecord.numero_processo,
+            ProcessRecord.tribunal,
+            ProcessRecord.nivel_sigilo,
+            ProcessRecord.sentence_outcome,
+            ProcessRecord.primary_subject,
+            ProcessRecord.subjects_json,
+            ProcessRecord.has_subsidiary_liability,
+            ProcessRecord.subsidiary_contractors_json,
+        )
+        .filter(ProcessRecord.company_search_id == search_id)
+        .all()
+    )
+
+    all_procs = [
+        {
+            "numero_processo": r[0],
+            "tribunal": r[1],
+            "nivel_sigilo": r[2] or 0,
+            "sentence_outcome": r[3] or "em_aberto",
+            "primary_subject": r[4],
+            "subjects": r[5] or ([r[4]] if r[4] else []),
+            "has_subsidiary_liability": r[6],
+            "subsidiary_contractors": r[7],
+        }
+        for r in procs_raw
+    ]
+
+    total_procs = len(all_procs)
+    search.total_processes = total_procs
+
+    if all_procs:
+        fresh_metrics = orchestrator.predictor.generate_dashboard_metrics(search.company_name, all_procs)
+        search.outcomes_summary = fresh_metrics.get("desfechos_sentencas", search.outcomes_summary)
+        search.ranking_motivos = fresh_metrics.get("ranking_motivos", search.ranking_motivos)
+        search.ranking_motivos_condenacao = fresh_metrics.get("ranking_motivos_condenacao", search.ranking_motivos_condenacao)
+        search.condenacao_por_motivo = fresh_metrics.get("condenacao_por_motivo", search.condenacao_por_motivo)
+        search.predictions_summary = fresh_metrics.get("plus_previsao_condenacao", search.predictions_summary)
+        search.overall_risk_score = fresh_metrics.get("score_risco_terceirizacao", search.overall_risk_score)
+
+        secrecy_counts = fresh_metrics.get("niveis_sigilo", {})
+        secrecy_c = sum(qtd for lvl, qtd in secrecy_counts.items() if int(lvl) > 0)
+        search.secrecy_count = secrecy_c
+        search.secrecy_rate = round(secrecy_c / total_procs, 4) if total_procs > 0 else 0.0
+
+        # Responsabilidade Subsidiária (Súmula 331 TST)
+        sub_count = sum(1 for p in all_procs if p.get("has_subsidiary_liability"))
+        all_tomadoras = set()
+        for p in all_procs:
+            for t in (p.get("subsidiary_contractors") or []):
+                if t and isinstance(t, str) and t.strip():
+                    all_tomadoras.add(t.strip())
+        search.condenacoes_subsidiarias_tomadoras_count = sub_count
+        search.tomadoras_subsidiarias_pj = sorted(list(all_tomadoras))[:15]
+
+        # Reavaliação de Idoneidade Econômica e Risco Subsidiário com total real
+        p_cond = fresh_metrics.get("probabilidade_condenacao_geral_pct") or fresh_metrics.get("score_risco_terceirizacao") or 0.0
+        econ_cnpj = (
+            (search.economic_standing or {}).get("cnpj_utilizado")
+            or (search.economic_standing or {}).get("cnpj")
+            or ((search.economic_standing or {}).get("cnpjs_consolidados") or [None])[0]
+        ) if isinstance(search.economic_standing, dict) else None
+
+        strat = (search.economic_standing or {}).get("browser_search_strategy") if isinstance(search.economic_standing, dict) else None
+
+        fresh_econ = economic_service.evaluate_economic_standing(
+            company_name=search.company_name,
+            cnpj=econ_cnpj,
+            company_processes=all_procs[:100],  # Amostra para não pesar na rede/memória
+            p_condenacao_trabalhista=p_cond,
+            discovered_entities=list(all_tomadoras),
+            search_strategy=strat,
+        )
+        if isinstance(search.economic_standing, dict):
+            search.economic_standing = {**search.economic_standing, **fresh_econ}
+        else:
+            search.economic_standing = fresh_econ
+
+        # Parecer do Agente ADK sincronizado com 100% dos processos
+        ai_payload = {
+            **fresh_metrics,
+            "empresa": search.company_name,
+            "company_name": search.company_name,
+            "total_processos": total_procs,
+            "total": total_procs,
+            "condenacoes_subsidiarias_tomadoras_count": search.condenacoes_subsidiarias_tomadoras_count,
+            "tomadoras_subsidiarias_pj": search.tomadoras_subsidiarias_pj,
+            "idoneidade_economica": search.economic_standing or {},
+            "sinais_solvencia_publica": (search.economic_standing or {}).get("sinais_solvencia_publica"),
+            "processos": all_procs,
+        }
+        fresh_ai = orchestrator.ai_analyzer.analyze_company(ai_payload)
+        if fresh_ai:
+            search.ai_analysis = fresh_ai
+
+    db.session.commit()
+
+    del all_procs
+    del procs_raw
+    if get_scan_config().get("is_render"):
+        gc.collect()
+
+
 @api_bp.route("/deep-scan-batch/<int:search_id>", methods=["POST"])
 @api_bp.route("/searches/<int:search_id>/deep-scan-batch", methods=["POST"])
 def deep_scan_batch(search_id: int):
     """
-    Executa varredura profunda diluída em lotes curtos (1 a 3 páginas por chamada HTTP),
+    Executa varredura profunda diluída em lotes curtos com time-box e 100 itens por página,
     eliminando qualquer risco de timeout HTTP ou pico de memória no Render Free (512 MB).
     Retorna status, next_page, total_acumulado e retry_after_seconds para controle determinístico pelo cliente.
     """
@@ -1686,8 +1800,23 @@ def deep_scan_batch(search_id: int):
             return jsonify({"error": "Acesso negado: registro pertence a outra organização."}), 403
 
     payload = request.get_json(silent=True) or {}
+
+    # Encerramento antecipado a pedido do usuário: calcula métricas com os dados já coletados
+    if payload.get("finalize") is True:
+        search.scan_status = "COMPLETED"
+        _recalculate_search_metrics(search)
+        return jsonify({
+            "status": "COMPLETED",
+            "search_id": search_id,
+            "next_page": None,
+            "has_more": False,
+            "total_acumulado": search.total_processes,
+            "is_completed": True,
+            "data": search.to_dict(),
+        }), 200
+
     page = int(payload.get("page") or 2)
-    batch_size = max(1, min(int(payload.get("batch_size") or 2), 3))
+    batch_size = max(1, min(int(payload.get("batch_size") or 3), 5))
 
     known_numbers = {
         r[0]
@@ -1699,6 +1828,7 @@ def deep_scan_batch(search_id: int):
 
     scan_cfg = get_scan_config()
     is_render_env = scan_cfg.get("is_render", False)
+    time_budget = 8.0 if is_render_env else 10.0
 
     strat = {
         "comunica_query_term": search.company_name,
@@ -1724,6 +1854,30 @@ def deep_scan_batch(search_id: int):
             primary_code = assuntos[0].get("codigo") if assuntos else None
             dist_date = parse_iso_date(pdata.get("dataUltimaPublicacao"))
 
+            texto_concat = " ".join(raw_texts)
+            classe_str = " ".join(classes_list)
+            subjects_names = [a["nome"] for a in assuntos if a.get("nome")]
+            status_d = classify_process_outcome(set(), subjects_names, texto_concat, classe_str)
+            if status_d == "CONDENACAO":
+                outcome = "condenacoes"
+            elif status_d == "ACORDO":
+                outcome = "acordos"
+            elif status_d == "IMPROCEDENTE":
+                outcome = "improcedentes"
+            else:
+                outcome = pdata.get("sentence_outcome") or "em_aberto"
+
+            has_sub = bool(pdata.get("has_subsidiary_liability")) or (
+                "subsidiária" in texto_concat.lower() or "subsidiaria" in texto_concat.lower()
+            )
+            subsidiary_contractors = pdata.get("subsidiary_contractors") or []
+            if not subsidiary_contractors and has_sub:
+                from app.services.ai_analyzer import extract_pj_contractors_from_process
+                subsidiary_contractors = extract_pj_contractors_from_process(
+                    {"publicacoes_texto": raw_texts},
+                    evaluated_company=search.company_name,
+                )
+
             rec = ProcessRecord(
                 company_search_id=search_id,
                 numero_processo=cnj,
@@ -1734,8 +1888,10 @@ def deep_scan_batch(search_id: int):
                 primary_subject_code=primary_code,
                 subjects_json=[a["nome"] for a in assuntos if a.get("nome")],
                 observation=f"Assunto identificado via publicação PJe: '{primary_name}'." if primary_name else None,
-                sentence_outcome="em_aberto",
-                has_expert_report=False,
+                sentence_outcome=outcome,
+                has_expert_report=bool(pdata.get("has_expert_report", False)),
+                has_subsidiary_liability=has_sub,
+                subsidiary_contractors_json=subsidiary_contractors,
                 data_distribuicao=dist_date,
                 raw_metadata=None,
             )
@@ -1765,6 +1921,8 @@ def deep_scan_batch(search_id: int):
         timeout=5.0,
         known_cnjs=known_numbers,
         batch_delay=scan_cfg["batch_delay"],
+        itens_por_pagina=100,
+        time_budget_seconds=time_budget,
     )
 
     if scan_res.get("rate_limited"):
@@ -1782,16 +1940,7 @@ def deep_scan_batch(search_id: int):
 
     if scan_res.get("is_completed"):
         search.scan_status = "COMPLETED"
-        all_procs = [p.to_dict() for p in search.processes]
-        if all_procs:
-            fresh_metrics = orchestrator.predictor.generate_dashboard_metrics(search.company_name, all_procs)
-            search.outcomes_summary = fresh_metrics.get("desfechos_sentencas", search.outcomes_summary)
-            search.ranking_motivos = fresh_metrics.get("ranking_motivos", search.ranking_motivos)
-            search.ranking_motivos_condenacao = fresh_metrics.get("ranking_motivos_condenacao", search.ranking_motivos_condenacao)
-            search.condenacao_por_motivo = fresh_metrics.get("condenacao_por_motivo", search.condenacao_por_motivo)
-            search.predictions_summary = fresh_metrics.get("plus_previsao_condenacao", search.predictions_summary)
-            search.overall_risk_score = fresh_metrics.get("score_risco_terceirizacao", search.overall_risk_score)
-        db.session.commit()
+        _recalculate_search_metrics(search)
         return jsonify({
             "status": "COMPLETED",
             "search_id": search_id,

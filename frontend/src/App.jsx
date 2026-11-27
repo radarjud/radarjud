@@ -1174,6 +1174,7 @@ export default function App() {
   const [analyzing, setAnalyzing] = useState('');
   const activeSearch = useRef(null);
   const [scanProgress, setScanProgress] = useState(null);
+  const stopRequestedRef = useRef(false);
   function cancelSearch() {
     activeSearch.current?.abort();
     activeSearch.current = null;
@@ -1261,6 +1262,7 @@ export default function App() {
     const { signal } = controller;
     const current = () => activeSearch.current === controller && !signal.aborted;
     setScanProgress(null);
+    stopRequestedRef.current = false;
     setBusy(true);
     setError('');
     try {
@@ -1302,6 +1304,7 @@ export default function App() {
           let currentPage = 2;
           let isDone = false;
           while (!isDone && current()) {
+            if (stopRequestedRef.current) break;
             let batchRes;
             try {
               batchRes = await request(`/deep-scan-batch/${normalized.searchId}`, {
@@ -1319,7 +1322,7 @@ export default function App() {
               throw batchErr;
             }
 
-            if (!current()) break;
+            if (!current() || stopRequestedRef.current) break;
 
             if (batchRes?.status === 'RATE_LIMITED') {
               const waitSec = Number(batchRes?.retry_after_seconds || 3);
@@ -1351,6 +1354,22 @@ export default function App() {
           }
 
           if (current()) {
+            if (stopRequestedRef.current) {
+              setScanProgress({ running: true, message: 'Calculando métricas com processos coletados...' });
+              try {
+                const finalBatchRes = await request(`/deep-scan-batch/${normalized.searchId}`, {
+                  method: 'POST',
+                  signal,
+                  body: JSON.stringify({ finalize: true }),
+                });
+                if (finalBatchRes?.data) {
+                  const finalLive = normalize(finalBatchRes.data);
+                  if (finalLive && current()) {
+                    setData(prev => validSearchId(prev?.searchId) === validSearchId(normalized.searchId) ? finalLive : prev);
+                  }
+                }
+              } catch (_) {}
+            }
             const finalData = normalize(await request(`/history/${normalized.searchId}`, { signal }));
             if (current() && validSearchId(finalData?.searchId) === validSearchId(normalized.searchId)) {
               setData(prev => validSearchId(prev?.searchId) === validSearchId(normalized.searchId) ? finalData : prev);
@@ -1480,7 +1499,24 @@ export default function App() {
             ) : <div className="loading" role="status"><RefreshCw className="spin" /> Carregando consulta compartilhada...</div>
           )}
           {isCompanyPage(page) && !needsSharedData && <>
-            {scanProgress && <p role="status" className="company-share-message">{scanProgress.message}</p>}
+            {scanProgress && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', background: '#eef6fc', borderRadius: '8px', marginBottom: '14px', border: '1px solid #d0e3f0', flexWrap: 'wrap', gap: '8px' }}>
+                <p role="status" className="company-share-message" style={{ margin: 0, fontWeight: 500, color: '#1a4060' }}>{scanProgress.message}</p>
+                {scanProgress.running && (
+                  <button
+                    type="button"
+                    className="secondary"
+                    style={{ fontSize: '12px', padding: '4px 10px', whiteSpace: 'nowrap' }}
+                    onClick={() => {
+                      stopRequestedRef.current = true;
+                      setScanProgress(p => p ? { ...p, message: 'Finalizando e calculando métricas com processos coletados...' } : null);
+                    }}
+                  >
+                    Calcular com dados já coletados
+                  </button>
+                )}
+              </div>
+            )}
             {visibleData && <CompanyShareActions key={visibleData.searchId ?? visibleData.name} data={visibleData} />}
             {page === 'overview' && <Overview data={visibleData} navigate={navigate} catalogTerm={catalog.term} />}
             {page === 'processes' && <Processes data={visibleData} />}

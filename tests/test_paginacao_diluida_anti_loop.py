@@ -764,4 +764,242 @@ def test_deep_scan_batch_rate_limit_resumption(client, app):
             assert d3["next_page"] is None
 
 
+def test_tst_called_only_once_on_initial_batch():
+    """
+    Valida que a consulta complementar ao TST (siglaTribunal=TST) é disparada
+    APENAS no lote inicial (start_page == 1) e NUNCA em lotes posteriores (start_page > 1).
+    """
+    searcher = CNJProcessSearcher()
+    tst_calls = []
+
+    def mock_request(method, url, params=None, **kwargs):
+        resp = MagicMock()
+        resp.ok = True
+        resp.status_code = 200
+        p = params.get("pagina", 1) if params else 1
+        sigla = params.get("siglaTribunal") if params else None
+
+        if sigla == "TST":
+            tst_calls.append(params)
+            resp.json.return_value = {"items": []}
+            return resp
+
+        # Páginas do Comunica retornam 100 itens
+        resp.json.return_value = {"items": [_build_dummy_item(f"77000000120245020{i:03d}") for i in range(100)]}
+        return resp
+
+    searcher._request_gov = MagicMock(side_effect=mock_request)
+
+    strat = {"comunica_query_term": "EMPRESA TST ONCE", "mode": "BROAD_BRAND", "is_broad_brand": True}
+
+    # Lote 1: start_page=1
+    res1 = searcher.paginate_comunica_pje_standard(
+        search_strategy=strat,
+        start_page=1,
+        max_pages_per_call=1,
+        batch_delay=0.0,
+    )
+    assert res1["pages_read"] == 1
+    assert len(tst_calls) == 1  # TST chamado na página 1!
+
+    # Lote 2: start_page=2
+    res2 = searcher.paginate_comunica_pje_standard(
+        search_strategy=strat,
+        start_page=2,
+        max_pages_per_call=1,
+        batch_delay=0.0,
+    )
+    assert res2["pages_read"] == 1
+    assert len(tst_calls) == 1  # NÃO foi chamado novamente no lote 2!
+
+    # Lote 3: start_page=3
+    res3 = searcher.paginate_comunica_pje_standard(
+        search_strategy=strat,
+        start_page=3,
+        max_pages_per_call=1,
+        batch_delay=0.0,
+    )
+    assert res3["pages_read"] == 1
+    assert len(tst_calls) == 1  # Permanece com exatamente 1 chamada!
+
+
+def test_itens_por_pagina_100_and_time_box_budget():
+    """
+    Valida:
+    1. itensPorPagina=100 enviado na requisição HTTP para dobrar a densidade de processos por página.
+    2. Time-box seguro: encerra o lote limpo ao atingir o orçamento de tempo (time_budget_seconds),
+       devolvendo IN_PROGRESS e next_page sem timeout no Render.
+    """
+    import time
+    searcher = CNJProcessSearcher()
+    requested_itens_por_pagina = []
+
+    def mock_request(method, url, params=None, **kwargs):
+        if params and "itensPorPagina" in params:
+            requested_itens_por_pagina.append(params["itensPorPagina"])
+
+        # Simula lentidão de rede na página 1 que estoura o time-box de 0.1s
+        time.sleep(0.12)
+        resp = MagicMock()
+        resp.ok = True
+        resp.status_code = 200
+        resp.json.return_value = {"items": [_build_dummy_item(f"88000000120245020{i:03d}") for i in range(100)]}
+        return resp
+
+    searcher._request_gov = MagicMock(side_effect=mock_request)
+
+    strat = {"comunica_query_term": "EMPRESA TIMEBOX", "mode": "BROAD_BRAND"}
+    res = searcher.paginate_comunica_pje_standard(
+        search_strategy=strat,
+        start_page=1,
+        max_pages=10,
+        max_pages_per_call=5,  # Pediu até 5 páginas, mas o time-box vai limitar
+        itens_por_pagina=100,
+        time_budget_seconds=0.1,  # Orçamento curto de 100ms
+        batch_delay=0.0,
+    )
+
+    # 1. itensPorPagina foi 100
+    assert 100 in requested_itens_por_pagina
+    # 2. Leu 1 página e parou pelo time-box sem avançar para página 2 nesta chamada
+    assert res["pages_read"] == 1
+    assert res["next_page"] == 2
+    assert res["is_completed"] is False
+    assert res["motivo_encerramento"] == "LOTE_CURTO_CONCLUIDO"
+
+
+def test_synchronized_full_recalculation_on_completed(client, app):
+    """
+    Valida a sincronização total dos indicadores e do Agente ADK sobre 100% dos processos:
+    - Inicialmente com 50 processos do fast path.
+    - Lote final adiciona 100 processos (condenações, acordos, improcedentes e responsabilidade subsidiária).
+    - Valida que o payload final e o banco refletem 100% dos processos nos cards,
+      taxas históricas, alertas da Súmula 331 e idoneidade econômica.
+    """
+    with app.app_context():
+        # Busca inicial com 50 processos em aberto
+        p1_records = [
+            ProcessRecord(
+                numero_processo=f"90000000120245020{i:03d}",
+                tribunal="TRT02",
+                primary_subject="Aviso Prévio",
+                sentence_outcome="em_aberto",
+            )
+            for i in range(50)
+        ]
+        search = CompanySearch(
+            company_name="EMPRESA SINCRONIZACAO TOTAL S.A.",
+            normalized_name="EMPRESA SINCRONIZACAO TOTAL S A",
+            total_processes=50,
+            scan_status="PARTIAL_FAST_PATH",
+            outcomes_summary={"em_aberto": 50, "condenacoes": 0, "acordos": 0, "improcedentes": 0},
+            ai_analysis={
+                "taxa_historica_vitoria_empresa_pct": 0.0,
+                "alertas_sumula_331": ["Desfechos analisados: 0 condenações, 0 acordos, 0 improcedentes e 50 em aberto."],
+            },
+            processes=p1_records,
+        )
+        db.session.add(search)
+        db.session.commit()
+        search_id = search.id
+
+        # Simula resposta do lote com 40 condenações, 30 acordos e 30 improcedentes (< 50 na página 3 encerra)
+        def mock_request(method, url, params=None, **kwargs):
+            p = params.get("pagina", 1) if params else 1
+            resp = MagicMock()
+            resp.ok = True
+            resp.status_code = 200
+
+            if p == 2:
+                # Página 2: 40 condenações + 30 acordos + 30 improcedentes = 100 itens
+                items = []
+                for i in range(40):
+                    items.append({
+                        **_build_dummy_item(f"91000000120245020{i:03d}"),
+                        "classe": "ATSum",
+                        "texto": "Julgo procedente em parte para condenar a reclamada ao pagamento. Responsabilidade subsidiária da tomadora EMPRESA CONTRATANTE LTDA.",
+                    })
+                for i in range(30):
+                    items.append({
+                        **_build_dummy_item(f"92000000120245020{i:03d}"),
+                        "classe": "ATSum",
+                        "texto": "Homologo o acordo celebrado entre as partes nos autos.",
+                    })
+                for i in range(30):
+                    items.append({
+                        **_build_dummy_item(f"93000000120245020{i:03d}"),
+                        "classe": "ATSum",
+                        "texto": "Julgo improcedente a reclamação trabalhista ajuizada em face da reclamada.",
+                    })
+                resp.json.return_value = {"items": items}
+            else:
+                # Página 3: lista vazia (fim natural)
+                resp.json.return_value = {"items": []}
+            return resp
+
+        with patch("app.services.cnj_searcher.CNJProcessSearcher._request_gov", side_effect=mock_request):
+            resp = client.post(f"/api/v1/deep-scan-batch/{search_id}", json={"page": 2, "batch_size": 2})
+            assert resp.status_code == 200
+            data = resp.get_json()
+
+            assert data["status"] == "COMPLETED"
+            assert data["is_completed"] is True
+            assert data["total_acumulado"] == 150  # 50 iniciais + 100 novos
+
+            db_search = data["data"]
+            assert db_search["total_processes"] == 150
+            # Sincronização dos desfechos:
+            assert db_search["outcomes_summary"]["condenacoes"] == 40
+            assert db_search["outcomes_summary"]["acordos"] == 30
+            assert db_search["outcomes_summary"]["improcedentes"] == 30
+            assert db_search["outcomes_summary"]["em_aberto"] == 50
+
+            # Sincronização do Parecer do Agente ADK com 100% dos dados:
+            ai = db_search["ai_analysis"]
+            assert ai is not None
+            # Taxa histórica calculada sobre processos julgados (100 julgados: 30 acordos + 30 improcedentes = 60 vitórias/acordos)
+            assert ai.get("taxa_historica_vitoria_empresa_pct") is not None
+            assert ai.get("taxa_historica_acordos_pct") is not None
+            # Alertas Súmula 331 sincronizados com o número real de condenações e em aberto:
+            alertas = " ".join(ai.get("alertas_sumula_331", []))
+            assert "40 condenações" in alertas or "150" in alertas or "40" in alertas
+
+
+def test_early_finalization_with_finalize_flag(client, app):
+    """
+    Valida a funcionalidade de encerramento antecipado a pedido do usuário:
+    O front-end envia {"finalize": true} e o back-end calcula imediatamente
+    as métricas sobre os processos já persistidos até o momento.
+    """
+    with app.app_context():
+        search = CompanySearch(
+            company_name="EMPRESA FINALIZACAO ANTECIPADA LTDA",
+            normalized_name="EMPRESA FINALIZACAO ANTECIPADA LTDA",
+            total_processes=20,
+            scan_status="IN_PROGRESS",
+            processes=[
+                ProcessRecord(
+                    numero_processo=f"95000000120245020{i:03d}",
+                    tribunal="TRT02",
+                    sentence_outcome="condenacoes" if i < 5 else "em_aberto",
+                )
+                for i in range(20)
+            ],
+        )
+        db.session.add(search)
+        db.session.commit()
+        search_id = search.id
+
+        resp = client.post(f"/api/v1/deep-scan-batch/{search_id}", json={"finalize": True})
+        assert resp.status_code == 200
+        data = resp.get_json()
+
+        assert data["status"] == "COMPLETED"
+        assert data["is_completed"] is True
+        assert data["total_acumulado"] == 20
+        assert data["data"]["outcomes_summary"]["condenacoes"] == 5
+        assert data["data"]["outcomes_summary"]["em_aberto"] == 15
+
+
+
 

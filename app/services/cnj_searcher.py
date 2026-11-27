@@ -797,6 +797,8 @@ class CNJProcessSearcher:
         timeout: float = 6.0,
         known_cnjs: Optional[Set[str]] = None,
         batch_delay: Optional[float] = None,
+        itens_por_pagina: int = 100,
+        time_budget_seconds: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Varre sequencialmente o Comunica PJe em fluxo streaming por lote com RAM constante,
@@ -838,6 +840,7 @@ class CNJProcessSearcher:
         consecutive_zero_new_pages = 0
 
         page = start_page
+        batch_start_time = time.time()
         while True:
             # Trava de teto configurado por ambiente (SCAN_MAX_PAGES)
             if effective_max_pages > 0 and page > effective_max_pages:
@@ -850,10 +853,21 @@ class CNJProcessSearcher:
                 motivo = "LOTE_CURTO_CONCLUIDO"
                 break
 
+            # Limite orçamentário por time-box (proteção ativa contra timeout HTTP no Render Free)
+            if time_budget_seconds is not None and time_budget_seconds > 0 and pages_read > 0:
+                elapsed = time.time() - batch_start_time
+                if elapsed >= time_budget_seconds:
+                    motivo = "LOTE_CURTO_CONCLUIDO"
+                    logger.info(
+                        "[SCAN_PAGE] Time-box atingido (%.2fs >= %.2fs) após %d páginas lidas na página %d. Encerrando lote com segurança.",
+                        elapsed, time_budget_seconds, pages_read, page
+                    )
+                    break
+
             params = {
                 "nomeParte": query_term,
                 "pagina": page,
-                "itensPorPagina": 50,
+                "itensPorPagina": itens_por_pagina,
             }
             try:
                 resp = self._request_gov("GET", self.COMUNICA_URL, params=params, timeout=timeout)
@@ -1015,8 +1029,10 @@ class CNJProcessSearcher:
                 break
 
         # Se for busca ampla por marca/grupo (BROAD_BRAND), faz varredura complementar no TST
+        # Executa APENAS na primeira página (start_page == 1) para não reconsultar TST em cada lote subsequente
         if (
-            (search_strategy.get("is_broad_brand", False) or search_strategy.get("mode") == "BROAD_BRAND")
+            start_page == 1
+            and (search_strategy.get("is_broad_brand", False) or search_strategy.get("mode") == "BROAD_BRAND")
             and not rate_limited
             and not had_http_error
         ):
@@ -1025,7 +1041,7 @@ class CNJProcessSearcher:
                     "nomeParte": query_term,
                     "siglaTribunal": "TST",
                     "pagina": 1,
-                    "itensPorPagina": 50,
+                    "itensPorPagina": itens_por_pagina,
                 }
                 resp_tst = self._request_gov("GET", self.COMUNICA_URL, params=params_tst, timeout=timeout)
                 if resp_tst.ok:
@@ -1061,13 +1077,15 @@ class CNJProcessSearcher:
             not hit_max_pages
             and not rate_limited
             and not had_http_error
-            and (motivo in (
-                "FIM_NATURAL_MENOS_DE_50_ITENS",
-                "FIM_NATURAL_LISTA_VAZIA",
-                "TOTAL_PAGINAS_METADADOS_ATINGIDO",
-                "REPETICAO_EXATA_IDS_COMUNICACAO",
-                "3_PAGINAS_CONSECUTIVAS_SEM_NOVOS_CNJS",
-            ) or anti_loop_triggered)
+            and (
+                motivo.startswith("FIM_NATURAL")
+                or motivo in (
+                    "TOTAL_PAGINAS_METADADOS_ATINGIDO",
+                    "REPETICAO_EXATA_IDS_COMUNICACAO",
+                    "3_PAGINAS_CONSECUTIVAS_SEM_NOVOS_CNJS",
+                )
+                or anti_loop_triggered
+            )
         )
         has_more_pages = (not is_completed) and (not hit_max_pages) and (not rate_limited) and (not had_http_error)
         next_page = page if has_more_pages else (page if rate_limited else None)
