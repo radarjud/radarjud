@@ -200,3 +200,49 @@ def test_l1_database_cache_serves_browser_partial_without_external_calls(client,
     mock_analyze.assert_not_called()
     mock_econ.assert_not_called()
     mock_ai.assert_not_called()
+
+
+def test_ai_analyzer_and_json_safe_handle_date_objects(monkeypatch):
+    import datetime
+    from decimal import Decimal
+    from app.routes.api import _compact_raw_metadata
+    from app.services.ai_analyzer import LegalAIAnalyzer
+    from app.utils.crypto import make_json_safe
+
+    analyzer = LegalAIAnalyzer()
+    analyzer.gemini_api_key = "fake-gemini-key-for-serialization-test"
+    captured_prompts: list[str] = []
+
+    def fake_gemini(prompt: str):
+        captured_prompts.append(prompt)
+        return {"perfil_risco_consolidado": "Moderado", "resumo_executivo": "OK"}
+
+    monkeypatch.setattr(analyzer, "_call_adk_agent", lambda *_a, **_kw: None)
+    monkeypatch.setattr(analyzer, "_call_gemini_api", fake_gemini)
+
+    summary = {
+        "empresa": "SOSERVI LTDA",
+        "total_processos": 2,
+        "desfechos_sentencas": {"condenacoes": 1, "acordos": 0, "improcedentes": 1, "em_aberto": 0},
+        "processos": [
+            {
+                "numero_processo": "00001234520245060001",
+                "data_distribuicao": datetime.date(2024, 5, 10),
+                "ultima_consulta": datetime.datetime(2026, 11, 27, 13, 0, 0),
+                "valor": Decimal("15000.50"),
+            }
+        ],
+    }
+
+    res = analyzer.analyze_company(summary)
+    assert res["resumo_executivo"] == "OK"
+    assert len(captured_prompts) == 1
+    assert "2024-05-10" in captured_prompts[0]
+
+    safe_meta = _compact_raw_metadata({
+        "data_distribuicao": datetime.date(2024, 5, 10),
+        "publicacoes_texto": ["<b>html</b>"],
+        "valor": Decimal("10.25"),
+    })
+    assert safe_meta == {"data_distribuicao": "2024-05-10", "valor": 10.25}
+    assert make_json_safe({"d": datetime.date(2026, 1, 2)}) == {"d": "2026-01-02"}

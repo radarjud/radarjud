@@ -12,7 +12,7 @@ import requests
 
 from app.utils.http_client import request_gov_br_with_fallback
 from app.utils.sanitizer import sanitize_company_name, is_cnpj, fetch_cnpj_brasilapi, remove_accents, extract_brand_search_term
-from app.utils.crypto import generate_movements_hash
+from app.utils.crypto import generate_movements_hash, make_json_safe
 from app.utils.rate_limiter import RateLimiter
 from app.services.ai_analyzer import LegalAIAnalyzer
 from app.services.prediction_engine import BayesianRiskPredictor, safe_int
@@ -758,15 +758,15 @@ class CNJMetadataOrchestrator:
                             if proc.get("valor_causa") is not None:
                                 rec.valor_causa = proc.get("valor_causa")
                             if proc.get("raw_metadata"):
-                                rec.raw_metadata = proc.get("raw_metadata")
+                                rec.raw_metadata = make_json_safe(proc.get("raw_metadata"))
                             if "has_subsidiary_liability" in proc:
                                 rec.has_subsidiary_liability = bool(proc.get("has_subsidiary_liability", False))
                             if "subsidiary_contractors" in proc:
-                                rec.subsidiary_contractors_json = proc.get("subsidiary_contractors") or []
+                                rec.subsidiary_contractors_json = make_json_safe(proc.get("subsidiary_contractors") or [])
                     else:
                         # Insere novo processo
                         has_sub = bool(proc.get("has_subsidiary_liability", False))
-                        sub_contractors = proc.get("subsidiary_contractors") or []
+                        sub_contractors = make_json_safe(proc.get("subsidiary_contractors") or [])
                         new_record = ProcessRecord(
                             company_search_id=company_search_id,
                             numero_processo=p_num,
@@ -775,7 +775,7 @@ class CNJMetadataOrchestrator:
                             nivel_sigilo=proc.get("nivelSigilo", 0),
                             primary_subject=proc.get("primary_subject"),
                             primary_subject_code=proc.get("primary_subject_code"),
-                            subjects_json=proc.get("subjects"),
+                            subjects_json=make_json_safe(proc.get("subjects")),
                             observation=proc.get("observation"),
                             sentence_outcome=proc.get("sentence_outcome", "em_aberto"),
                             has_expert_report=proc.get("has_expert_report", False),
@@ -783,7 +783,7 @@ class CNJMetadataOrchestrator:
                             subsidiary_contractors_json=sub_contractors,
                             data_distribuicao=proc.get("data_distribuicao"),
                             valor_causa=proc.get("valor_causa"),
-                            raw_metadata=proc.get("raw_metadata"),
+                            raw_metadata=make_json_safe(proc.get("raw_metadata")),
                         )
                         db.session.add(new_record)
                         existing_map[norm_num] = new_record
