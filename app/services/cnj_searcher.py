@@ -1061,10 +1061,16 @@ class CNJProcessSearcher:
             not hit_max_pages
             and not rate_limited
             and not had_http_error
-            and (motivo != "LOTE_CURTO_CONCLUIDO")
+            and (motivo in (
+                "FIM_NATURAL_MENOS_DE_50_ITENS",
+                "FIM_NATURAL_LISTA_VAZIA",
+                "TOTAL_PAGINAS_METADADOS_ATINGIDO",
+                "REPETICAO_EXATA_IDS_COMUNICACAO",
+                "3_PAGINAS_CONSECUTIVAS_SEM_NOVOS_CNJS",
+            ) or anti_loop_triggered)
         )
         has_more_pages = (not is_completed) and (not hit_max_pages) and (not rate_limited) and (not had_http_error)
-        next_page = (page + 1) if has_more_pages else (page if rate_limited else None)
+        next_page = page if has_more_pages else (page if rate_limited else None)
 
         logger.info(
             "paginate_comunica_pje_standard('%s') finalizada: %d páginas lidas, %d processos únicos (hit_max_pages=%s, anti_loop=%s, rate_limited=%s, is_completed=%s, motivo=%s).",

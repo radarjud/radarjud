@@ -1774,6 +1774,7 @@ def deep_scan_batch(search_id: int):
             "status": "RATE_LIMITED",
             "search_id": search_id,
             "next_page": page,
+            "has_more": True,
             "retry_after_seconds": scan_res.get("retry_after_seconds", 3),
             "total_acumulado": search.total_processes,
             "is_completed": False,
@@ -1795,16 +1796,20 @@ def deep_scan_batch(search_id: int):
             "status": "COMPLETED",
             "search_id": search_id,
             "next_page": None,
+            "has_more": False,
             "total_acumulado": search.total_processes,
             "is_completed": True,
             "data": search.to_dict(),
         }), 200
 
     next_p = scan_res.get("next_page") or (page + scan_res.get("pages_read", batch_size))
+    search.scan_status = "IN_PROGRESS"
+    db.session.commit()
     return jsonify({
-        "status": "SCANNING",
+        "status": "IN_PROGRESS",
         "search_id": search_id,
         "next_page": next_p,
+        "has_more": True,
         "total_acumulado": search.total_processes,
         "is_completed": False,
     }), 200

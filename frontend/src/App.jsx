@@ -1222,7 +1222,7 @@ export default function App() {
 
   // Polling automático para atualizar tela quando o Deep Scan em segundo plano finalizar
   useEffect(() => {
-    if (scanProgress?.running || !data?.searchId || !['PARTIAL_FAST_PATH', 'SCANNING_BACKGROUND', 'BROWSER_PENDING'].includes(data?.scanStatus)) return;
+    if (scanProgress?.running || !data?.searchId || !['PARTIAL_FAST_PATH', 'SCANNING_BACKGROUND', 'BROWSER_PENDING', 'IN_PROGRESS'].includes(data?.scanStatus)) return;
     let active = true;
     const intervalId = setInterval(async () => {
       try {
@@ -1294,39 +1294,72 @@ export default function App() {
       navigate('overview', normalized.searchId);
       setBusy(false);
       setAnalyzing('');
-      if (!validSearchId(normalized.searchId) || normalized.scanStatus !== 'BROWSER_PENDING') return;
-      setScanProgress({ running: true, message: `Consolidando varredura: ${first.items.length}/${Math.min(first.count, 1000)} comunicações...` });
-      try {
-        const scan = await runBrowserDeepScan(pjeTerm, cnpj, first.count, progress => {
-          if (current()) setScanProgress({ running: true, message: `Consolidando varredura: ${progress.received}/${progress.total} comunicações...` });
-        }, { signal, page1Items: first.items });
-        if (!current()) return;
-        {
-          const isFinal = scan.failedPages.length === 0;
-          await request('/ingest-deep-scan', {
-            method: 'POST', signal, body: JSON.stringify({
-              search_id: Number(normalized.searchId),
-              items: scan.items,
-              browser_scan_finished: true,
-              is_final_batch: isFinal,
-            }),
-          });
-          if (!current()) return;
-          const updated = normalize(await request(`/history/${normalized.searchId}`, { signal }));
-          if (current() && validSearchId(updated?.searchId) === validSearchId(normalized.searchId)) {
-            setData(prev => validSearchId(prev?.searchId) === validSearchId(normalized.searchId) ? updated : prev);
+      if (!validSearchId(normalized.searchId)) return;
+      // Se a busca tiver mais páginas pendentes, executa varredura profunda em lotes curtos
+      if (['PARTIAL_FAST_PATH', 'IN_PROGRESS', 'BROWSER_PENDING'].includes(normalized.scanStatus)) {
+        setScanProgress({ running: true, message: `Varrendo processos em lotes: ${normalized.totalProcesses || 50} identificados...` });
+        try {
+          let currentPage = 2;
+          let isDone = false;
+          while (!isDone && current()) {
+            let batchRes;
+            try {
+              batchRes = await request(`/deep-scan-batch/${normalized.searchId}`, {
+                method: 'POST',
+                signal,
+                body: JSON.stringify({ page: currentPage, batch_size: 2 }),
+              });
+            } catch (batchErr) {
+              if (batchErr?.status === 429) {
+                const retrySec = Number(batchErr?.headers?.get?.('Retry-After') || 3);
+                setScanProgress({ running: true, message: `Aguardando ${retrySec}s por limite judicial (retomando na página ${currentPage})...` });
+                await new Promise(r => setTimeout(r, retrySec * 1000));
+                continue;
+              }
+              throw batchErr;
+            }
+
+            if (!current()) break;
+
+            if (batchRes?.status === 'RATE_LIMITED') {
+              const waitSec = Number(batchRes?.retry_after_seconds || 3);
+              setScanProgress({ running: true, message: `Aguardando ${waitSec}s por limite judicial (retomando na página ${currentPage})...` });
+              await new Promise(r => setTimeout(r, waitSec * 1000));
+              continue;
+            }
+
+            const currentTotal = batchRes?.total_acumulado ?? batchRes?.data?.total_processos ?? 0;
+            if (current()) {
+              setScanProgress({
+                running: true,
+                message: `Varrendo processos em lotes: ${currentTotal} identificados (página ${currentPage})...`,
+              });
+              if (batchRes?.data) {
+                const liveUpdate = normalize(batchRes.data);
+                if (liveUpdate && current()) {
+                  setData(prev => validSearchId(prev?.searchId) === validSearchId(normalized.searchId) ? liveUpdate : prev);
+                }
+              }
+            }
+
+            if (batchRes?.is_completed || batchRes?.status === 'COMPLETED' || batchRes?.has_more === false) {
+              isDone = true;
+              break;
+            }
+
+            currentPage = Number(batchRes?.next_page) || (currentPage + 2);
           }
+
+          if (current()) {
+            const finalData = normalize(await request(`/history/${normalized.searchId}`, { signal }));
+            if (current() && validSearchId(finalData?.searchId) === validSearchId(normalized.searchId)) {
+              setData(prev => validSearchId(prev?.searchId) === validSearchId(normalized.searchId) ? finalData : prev);
+            }
+            setScanProgress({ running: false, message: 'Varredura concluída com sucesso.' });
+          }
+        } catch {
+          if (current()) setScanProgress({ running: false, message: 'Varredura parcial concluída: os dados acumulados foram preservados.' });
         }
-        if (current()) {
-          setScanProgress({
-            running: false,
-            message: scan.failedPages.length
-              ? 'Varredura parcial: nem todas as comunicações foram coletadas.'
-              : 'Varredura concluída com sucesso.',
-          });
-        }
-      } catch {
-        if (current()) setScanProgress({ running: false, message: 'Não foi possível consolidar toda a varredura. Os resultados iniciais foram preservados.' });
       }
     } catch (failure) {
       if (current()) setError(failure.message || 'Não foi possível pesquisar a empresa.');

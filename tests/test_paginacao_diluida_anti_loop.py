@@ -588,6 +588,180 @@ def test_deep_scan_batch_endpoint_short_batches(client, app):
             assert resp.status_code == 200
             data = resp.get_json()
             assert data["search_id"] == search_id
+            assert data["status"] == "IN_PROGRESS"
+            assert data["has_more"] is True
+            assert data["next_page"] == 3
             assert data["total_acumulado"] >= 50
+
+
+def test_deep_scan_batch_10_pages_multi_batch_flow(client, app):
+    """
+    Cenário Crítico Multi-Lote:
+    Simula uma empresa com 10 páginas (465 processos ao todo: 9 págs x 50 + 1 pág x 15).
+    O front-end dispara sucessivos lotes de 3 páginas (batch_size=3):
+      - Lote 1: lê págs 2, 3, 4 -> retorna IN_PROGRESS, next_page=5, has_more=True.
+      - Lote 2: lê págs 5, 6, 7 -> retorna IN_PROGRESS, next_page=8, has_more=True.
+      - Lote 3: lê págs 8, 9, 10 -> pág 10 tem 15 itens (<50), encerra naturalmente:
+                retorna COMPLETED, next_page=None, has_more=False, is_completed=True.
+    Valida:
+      - Persistência contínua sem queima de memória.
+      - Total acumulado exato de 465 processos no banco.
+      - Transição perfeita de status IN_PROGRESS -> COMPLETED sem interrupção precoce.
+    """
+    with app.app_context():
+        # Cria a busca inicial simulando que a página 1 (50 itens) já foi processada no fast path
+        p1_records = [
+            ProcessRecord(
+                numero_processo=f"10000000120245020{i:03d}",
+                tribunal="TRT02",
+                sentence_outcome="em_aberto",
+            )
+            for i in range(50)
+        ]
+        search = CompanySearch(
+            company_name="EMPRESA GIGANTE MULTIPAGINAS S.A.",
+            normalized_name="EMPRESA GIGANTE MULTIPAGINAS S A",
+            total_processes=50,
+            scan_status="PARTIAL_FAST_PATH",
+            processes=p1_records,
+        )
+        db.session.add(search)
+        db.session.commit()
+        search_id = search.id
+
+        # Mapeia 10 páginas:
+        # Páginas 2 a 9 com 50 processos cada
+        # Página 10 com 15 processos
+        pages_dict = {}
+        for p in range(2, 10):
+            pages_dict[p] = [_build_dummy_item(f"{p}0000000120245020{i:03d}") for i in range(50)]
+        pages_dict[10] = [_build_dummy_item(f"99000000120245020{i:03d}") for i in range(15)]
+
+        def mock_request(method, url, params=None, **kwargs):
+            resp = MagicMock()
+            resp.ok = True
+            resp.status_code = 200
+            p = params.get("pagina", 1) if params else 1
+            resp.json.return_value = {"items": pages_dict.get(p, [])}
+            return resp
+
+        with patch("app.services.cnj_searcher.CNJProcessSearcher._request_gov", side_effect=mock_request):
+            # LOTE 1: lê páginas 2, 3, 4
+            resp1 = client.post(f"/api/v1/deep-scan-batch/{search_id}", json={"page": 2, "batch_size": 3})
+            assert resp1.status_code == 200
+            data1 = resp1.get_json()
+            assert data1["status"] == "IN_PROGRESS"
+            assert data1["has_more"] is True
+            assert data1["is_completed"] is False
+            assert data1["next_page"] == 5
+            assert data1["total_acumulado"] == 200  # 50 iniciais + 3 páginas x 50
+
+            # LOTE 2: lê páginas 5, 6, 7
+            resp2 = client.post(f"/api/v1/deep-scan-batch/{search_id}", json={"page": data1["next_page"], "batch_size": 3})
+            assert resp2.status_code == 200
+            data2 = resp2.get_json()
+            assert data2["status"] == "IN_PROGRESS"
+            assert data2["has_more"] is True
+            assert data2["is_completed"] is False
+            assert data2["next_page"] == 8
+            assert data2["total_acumulado"] == 350  # 200 + 3 páginas x 50
+
+            # LOTE 3: lê páginas 8, 9, 10 (página 10 tem 15 itens < 50, encerra naturalmente)
+            resp3 = client.post(f"/api/v1/deep-scan-batch/{search_id}", json={"page": data2["next_page"], "batch_size": 3})
+            assert resp3.status_code == 200
+            data3 = resp3.get_json()
+            assert data3["status"] == "COMPLETED"
+            assert data3["has_more"] is False
+            assert data3["is_completed"] is True
+            assert data3["next_page"] is None
+            assert data3["total_acumulado"] == 465  # 350 + 50 + 50 + 15
+
+        # Verifica persistência final no banco
+        db.session.refresh(search)
+        assert search.scan_status == "COMPLETED"
+        assert search.total_processes == 465
+        assert len(search.processes) == 465
+
+
+def test_deep_scan_batch_rate_limit_resumption(client, app):
+    """
+    Valida comportamento de resiliência a rate limit (HTTP 429) no meio dos lotes:
+      - Lote 1 (página 2): processa com sucesso.
+      - Lote 2 (página 3): recebe HTTP 429, retorna RATE_LIMITED com retry_after_seconds e next_page=3.
+      - Lote 2 retry (página 3): após retry, processa normalmente e conclui.
+    """
+    with app.app_context():
+        search = CompanySearch(
+            company_name="EMPRESA RATE LIMIT RECOVERY LTDA",
+            normalized_name="EMPRESA RATE LIMIT RECOVERY LTDA",
+            total_processes=10,
+            scan_status="PARTIAL_FAST_PATH",
+        )
+        db.session.add(search)
+        db.session.commit()
+        search_id = search.id
+
+        rate_limit_tested = False
+
+        def mock_request(method, url, params=None, **kwargs):
+            nonlocal rate_limit_tested
+            p = params.get("pagina", 1) if params else 1
+            sigla = params.get("siglaTribunal") if params else None
+            if sigla == "TST":
+                resp = MagicMock()
+                resp.ok = True
+                resp.status_code = 200
+                resp.json.return_value = {"items": []}
+                return resp
+
+            if p == 2:
+                resp = MagicMock()
+                resp.ok = True
+                resp.status_code = 200
+                resp.json.return_value = {"items": [_build_dummy_item(f"44000000120245020{i:03d}") for i in range(50)]}
+                return resp
+            elif p == 3 and not rate_limit_tested:
+                rate_limit_tested = True
+                resp = MagicMock()
+                resp.ok = False
+                resp.status_code = 429
+                resp.headers = {"Retry-After": "2"}
+                return resp
+            elif p == 3 and rate_limit_tested:
+                resp = MagicMock()
+                resp.ok = True
+                resp.status_code = 200
+                resp.json.return_value = {"items": [_build_dummy_item(f"55000000120245020{i:03d}") for i in range(10)]}
+                return resp
+
+            resp = MagicMock()
+            resp.ok = True
+            resp.status_code = 200
+            resp.json.return_value = {"items": []}
+            return resp
+
+        with patch("app.services.cnj_searcher.CNJProcessSearcher._request_gov", side_effect=mock_request):
+            # Lote 1: página 2 (1 página)
+            r1 = client.post(f"/api/v1/deep-scan-batch/{search_id}", json={"page": 2, "batch_size": 1})
+            d1 = r1.get_json()
+            assert d1["status"] == "IN_PROGRESS"
+            assert d1["next_page"] == 3
+
+            # Lote 2: página 3 (recebe 429)
+            r2 = client.post(f"/api/v1/deep-scan-batch/{search_id}", json={"page": 3, "batch_size": 1})
+            d2 = r2.get_json()
+            assert d2["status"] == "RATE_LIMITED"
+            assert d2["next_page"] == 3  # Mantém a mesma página para retry!
+            assert d2["has_more"] is True
+            assert d2["retry_after_seconds"] >= 2
+
+            # Lote 2 retry: página 3 (sucesso)
+            r3 = client.post(f"/api/v1/deep-scan-batch/{search_id}", json={"page": 3, "batch_size": 1})
+            d3 = r3.get_json()
+            assert d3["status"] == "COMPLETED"
+            assert d3["is_completed"] is True
+            assert d3["has_more"] is False
+            assert d3["next_page"] is None
+
 
 
