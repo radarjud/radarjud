@@ -68,6 +68,11 @@ def create_app(config_name: str = None, seed_catalog: bool = True) -> Flask:
         from app.routes.api import get_search_processes
         return get_search_processes(company_search_id=company_search_id)
 
+    @app.route("/api/auth/logout", methods=["POST", "GET"])
+    def _api_auth_logout():
+        from app.routes.auth import logout
+        return logout()
+
     # Rota raiz informativa
     @app.route("/", methods=["GET"])
     def index():

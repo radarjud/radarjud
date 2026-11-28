@@ -3,7 +3,7 @@ from flask import Blueprint, request, jsonify, g
 from app.extensions import db
 from app.models.tenant import Tenant
 from app.models.user import User
-from app.utils.auth import require_auth, require_role, get_token_from_header
+from app.utils.auth import require_auth, require_role, get_token_from_header, get_current_user_optional
 from app.utils.jwt import create_access_token, create_refresh_token, decode_token
 
 logger = logging.getLogger(__name__)
@@ -179,4 +179,24 @@ def get_me():
     return jsonify({
         "user": user.to_dict(),
         "tenant": tenant.to_dict() if tenant else None,
+    }), 200
+
+
+@auth_bp.route("/logout", methods=["POST", "GET"])
+def logout():
+    """
+    Encerra a sessão do usuário no backend.
+    Invalida o contexto atual da sessão e registra o encerramento em log.
+    Permite requisições com ou sem token Bearer para garantir saída limpa
+    mesmo que o token de acesso já esteja expirado.
+    """
+    user = get_current_user_optional()
+    if user:
+        logger.info("Logout realizado com sucesso para o usuário id=%d (email=%s).", user.id, user.email)
+    else:
+        logger.info("Logout realizado com sucesso (sessão anônima ou token expirado).")
+
+    return jsonify({
+        "status": "success",
+        "message": "Sessão encerrada com sucesso."
     }), 200

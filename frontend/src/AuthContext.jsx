@@ -10,6 +10,7 @@ import {
 import {
   AUTH_KEY,
   EVENTS,
+  apiFetch,
   apiRequest,
   clearAuth,
   clearReturnTo,
@@ -219,15 +220,21 @@ export function AuthProvider({ children }) {
   );
 
   // Logout do usuário.
-  const logout = useCallback(() => {
-    clearAuth();
-    clearReturnTo();
-    setNotice('');
+  const logout = useCallback(async () => {
+    try {
+      await apiFetch('/auth/logout', { method: 'POST' });
+    } catch {
+      // Ignora falhas de rede para não impedir a saída do usuário
+    } finally {
+      clearAuth();
+      clearReturnTo();
+      setNotice('');
 
-    // Redireciona para o login.
-    window.location.hash = '#/login';
+      // Redireciona para o login.
+      window.location.hash = '#/login';
 
-    setState(anonymousState());
+      setState(anonymousState());
+    }
   }, []);
 
   // Atualiza os dados do perfil e as cotas.

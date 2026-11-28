@@ -17,7 +17,7 @@ export const EVENTS = {
   quota: 'radarjus:quota',
 };
 
-const AUTH_PATHS = ['/auth/login', '/auth/register', '/auth/refresh'];
+const AUTH_PATHS = ['/auth/login', '/auth/register', '/auth/refresh', '/auth/logout'];
 
 /* ------------------------------ armazenamento ------------------------------ */
 
