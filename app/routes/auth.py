@@ -200,3 +200,138 @@ def logout():
         "status": "success",
         "message": "Sessão encerrada com sucesso."
     }), 200
+
+
+# =============================================================================
+# ADMIN BOARD: Gestão de Usuários e Planos (Restrito a Perfil ADMIN)
+# =============================================================================
+
+@auth_bp.route("/admin/users", methods=["GET"])
+@require_role(User.ROLE_ADMIN)
+def admin_list_users():
+    """
+    Lista todos os usuários pertencentes ao tenant do administrador logado,
+    incluindo detalhes do plano da organização e histórico de cotas.
+    Protegido contra IDOR: apenas usuários do mesmo tenant_id são retornados.
+    Nenhum campo de senha ou credencial é exposto.
+    """
+    admin_user = g.current_user
+    tenant = admin_user.tenant
+    if not tenant:
+        return jsonify({"error": "Organização não localizada para o administrador."}), 404
+
+    users = (
+        User.query.filter_by(tenant_id=tenant.id)
+        .order_by(User.role.asc(), User.name.asc())
+        .all()
+    )
+
+    from app.services.quota_service import QuotaService
+    quota_info = QuotaService.check_quota(tenant)
+
+    user_list = []
+    for u in users:
+        u_data = u.to_dict()
+        # Garantia explícita de sanitização de segurança (segurança em profundidade)
+        u_data.pop("password", None)
+        u_data.pop("password_hash", None)
+        u_data["tenant_name"] = tenant.name
+        u_data["tenant_plan"] = tenant.plan
+        user_list.append(u_data)
+
+    return jsonify({
+        "status": "success",
+        "total": len(user_list),
+        "users": user_list,
+        "tenant": tenant.to_dict(),
+        "quota": quota_info,
+        "available_plans": [
+            {
+                "id": Tenant.PLAN_ESSENCIAL,
+                "label": "Essencial",
+                "quota": Tenant.DEFAULT_QUOTAS[Tenant.PLAN_ESSENCIAL],
+                "description": "Até 30 consultas mensais e monitoramento padrão."
+            },
+            {
+                "id": Tenant.PLAN_PRO,
+                "label": "Pro",
+                "quota": Tenant.DEFAULT_QUOTAS[Tenant.PLAN_PRO],
+                "description": "Até 150 consultas mensais com inteligência recursal TST avançada."
+            },
+            {
+                "id": Tenant.PLAN_ENTERPRISE,
+                "label": "Enterprise",
+                "quota": "Ilimitado",
+                "description": "Consultas ilimitadas, relatórios executivos customizados e SLA dedicado."
+            },
+        ],
+    }), 200
+
+
+@auth_bp.route("/admin/users/<int:user_id>/plan", methods=["PUT", "PATCH"])
+@require_role(User.ROLE_ADMIN)
+def admin_update_user_plan(user_id: int):
+    """
+    Atualiza o plano da organização do usuário.
+    Permitido apenas para administradores do mesmo tenant (Anti-IDOR).
+    Atualiza o plano do Tenant e recalcula os limites de cotas mensais.
+    """
+    admin_user = g.current_user
+    target_user = db.session.get(User, user_id)
+    if not target_user:
+        return jsonify({"error": "Usuário não encontrado."}), 404
+
+    # Trava Anti-IDOR: O administrador só pode alterar planos do seu próprio Tenant
+    if target_user.tenant_id != admin_user.tenant_id:
+        logger.warning(
+            "Tentativa de violação IDOR bloqueada: Admin id=%d (tenant=%d) tentou alterar plano do user id=%d (tenant=%d)",
+            admin_user.id, admin_user.tenant_id, target_user.id, target_user.tenant_id
+        )
+        return jsonify({"error": "Acesso não autorizado para gerenciar usuários de outra organização."}), 403
+
+    data = request.get_json(silent=True) or {}
+    new_plan = str(data.get("plan") or "").strip().upper()
+    valid_plans = {Tenant.PLAN_ESSENCIAL, Tenant.PLAN_PRO, Tenant.PLAN_ENTERPRISE}
+
+    if new_plan not in valid_plans:
+        return jsonify({
+            "error": f"Plano inválido '{new_plan}'. Planos válidos: {list(valid_plans)}",
+            "valid_plans": list(valid_plans)
+        }), 400
+
+    target_tenant = target_user.tenant
+    old_plan = target_tenant.plan
+    target_tenant.plan = new_plan
+    target_tenant.limite_mensal_consultas = Tenant.DEFAULT_QUOTAS.get(new_plan)
+
+    # Suporte adicional opcional: alteração de role (ex: promover para ADMIN ou ANALISTA)
+    new_role = data.get("role")
+    if new_role and str(new_role).strip().upper() in User.VALID_ROLES:
+        target_user.role = str(new_role).strip().upper()
+
+    # Suporte adicional opcional: ativação/desativação de usuário
+    if "is_active" in data:
+        target_user.is_active = bool(data["is_active"])
+
+    try:
+        db.session.commit()
+        logger.info(
+            "Plano atualizado com sucesso pelo Admin id=%d: Tenant id=%d alterado de %s para %s (Limite: %s)",
+            admin_user.id, target_tenant.id, old_plan, new_plan, target_tenant.limite_mensal_consultas
+        )
+
+        from app.services.quota_service import QuotaService
+        quota_info = QuotaService.check_quota(target_tenant)
+
+        return jsonify({
+            "status": "success",
+            "message": f"Plano atualizado com sucesso para '{new_plan}'.",
+            "user": target_user.to_dict(),
+            "tenant": target_tenant.to_dict(),
+            "quota": quota_info,
+        }), 200
+
+    except Exception as exc:
+        db.session.rollback()
+        logger.exception("Erro ao atualizar plano do usuário/tenant: %s", exc)
+        return jsonify({"error": "Falha interna ao atualizar plano do usuário."}), 500

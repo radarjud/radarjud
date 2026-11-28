@@ -40,6 +40,7 @@ class User(db.Model):
         return check_password_hash(self.password_hash, password)
 
     def to_dict(self):
+        # Garante estritamente que senha e hash de senha jamais sejam expostos em to_dict()
         return {
             "id": self.id,
             "tenant_id": self.tenant_id,
