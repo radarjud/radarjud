@@ -96,7 +96,12 @@ def login():
     if not email or not password:
         return jsonify({"error": "Email e senha são obrigatórios."}), 400
 
-    user = User.query.filter_by(email=email).first()
+    try:
+        user = User.query.filter_by(email=email).first()
+    except Exception as db_exc:
+        logger.error("Falha ao consultar usuário no banco durante o login: %s", db_exc)
+        return jsonify({"error": "Banco de dados temporariamente indisponível. Tente novamente em instantes."}), 503
+
     if not user or not user.check_password(password):
         return jsonify({"error": "Credenciais inválidas."}), 401
 

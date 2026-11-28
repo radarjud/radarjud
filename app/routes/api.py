@@ -2128,7 +2128,7 @@ def get_search_history():
         }), 200
     except Exception as exc:
         logger.error("Erro ao listar histórico de pesquisas: %s", exc)
-        return jsonify({"error": "Não foi possível carregar o histórico."}), 500
+        return jsonify({"total": 0, "items": []}), 200
 
 
 @api_bp.route("/history/<int:search_id>", methods=["GET", "DELETE"])
@@ -2138,7 +2138,11 @@ def get_search_detail(search_id: int):
     GET: Retorna os dados detalhados e a lista de processos de uma análise específica.
     DELETE: Remove um registro específico do histórico.
     """
-    search = db.session.get(CompanySearch, search_id)
+    try:
+        search = db.session.get(CompanySearch, search_id)
+    except Exception as db_exc:
+        logger.error("Falha ao recuperar search_id %d do banco: %s", search_id, db_exc)
+        return jsonify({"error": "Registro não encontrado."}), 404
     if not search:
         return jsonify({"error": "Registro não encontrado."}), 404
 
