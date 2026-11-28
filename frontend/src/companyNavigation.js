@@ -1,6 +1,6 @@
 const COMPANY_PAGES = new Set(['overview', 'processes', 'predictions']);
 const AUTH_PAGES = new Set(['login', 'register']);
-const PAGES = new Set(['search', 'catalog', 'overview', 'processes', 'predictions', 'history', 'compare', 'login', 'register']);
+const PAGES = new Set(['search', 'catalog', 'overview', 'processes', 'predictions', 'history', 'compare', 'users', 'login', 'register']);
 
 export function isCompanyPage(page) {
   return COMPANY_PAGES.has(page);

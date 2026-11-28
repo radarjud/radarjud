@@ -17,13 +17,14 @@ import {
   Search, LayoutDashboard, FileText, ChartNoAxesCombined, History,
   Menu, X, ArrowRight, RefreshCw, AlertCircle, AlertTriangle, ShieldCheck, ShieldAlert,
   Info, ChevronRight, Building2, TrendingUp, Filter, CheckCircle2,
-  Check, Activity, BarChart3, Radar, Share2, Download, Library, ArrowLeftRight
+  Check, Activity, BarChart3, Radar, Share2, Download, Library, ArrowLeftRight, Users
 } from 'lucide-react';
 import { companyHash, companyShareUrl, isCompanyPage, parseRoute, validSearchId } from './companyNavigation.js';
 import { CompanyLogo } from "./CompanyLogo.jsx";
 import { fetchPjePage, runBrowserDeepScan } from './services/pjeBrowserScanner.js';
 import CatalogPage, { normalizeCatalog, onlyDigits } from './CatalogPage.jsx';
 import ComparePage from './ComparePage.jsx';
+import AdminUsersPage from './AdminUsersPage.jsx';
 import { useAuth } from './AuthContext.jsx';
 import LoginPage from './LoginPage.jsx';
 import RegisterPage from './RegisterPage.jsx';
@@ -34,13 +35,14 @@ import { apiFetch, apiRequest, consumeReturnTo, saveReturnTo } from './apiClient
 
 const PAGE_LABELS = {
   search: 'Pesquisar empresas', catalog: 'Catálogo de empresas', overview: 'Visão geral', processes: 'Processos',
-  predictions: 'Estimativas', history: 'Histórico', compare: 'Comparar empresas',
+  predictions: 'Estimativas', history: 'Histórico', compare: 'Comparar empresas', users: 'Gestão de usuários',
 };
 const NAV_ITEMS = [
   { id: 'search', icon: Search }, { id: 'catalog', icon: Library }, { id: 'overview', icon: LayoutDashboard },
   { id: 'processes', icon: FileText }, { id: 'predictions', icon: ChartNoAxesCombined },
   { id: 'compare', icon: ArrowLeftRight },
   { id: 'history', icon: History },
+  { id: 'users', icon: Users, adminOnly: true },
 ];
 const OUTCOME_LABELS = {
   condenacoes: 'Condenações (Impacto Confirmado)',
@@ -261,6 +263,9 @@ function Tag({ children, type = 'blue' }) {
 }
 
 function Sidebar({page,navigate,mobileOpen,setMobileOpen,showCatalog}) {
+  const { user } = useAuth();
+  const isAdmin = String(user?.role || '').toUpperCase() === 'ADMIN';
+
   useEffect(() => {
     if (typeof document !== 'undefined') {
       document.body.style.overflow = mobileOpen ? 'hidden' : '';
@@ -289,7 +294,11 @@ function Sidebar({page,navigate,mobileOpen,setMobileOpen,showCatalog}) {
         <div className="nav-label">PLATAFORMA</div>
         <nav aria-label="Navegação principal">
          {NAV_ITEMS
-        .filter(({ id }) => id !== 'catalog' || showCatalog)
+        .filter(({ id, adminOnly }) => {
+          if (id === 'catalog' && !showCatalog) return false;
+          if (adminOnly && !isAdmin) return false;
+          return true;
+        })
         .map(({ id, icon: Icon }) => (
             <button
               key={id}
@@ -1730,6 +1739,7 @@ function AppShell() {
             />
           )}
           {page === 'history' && <HistoryPage history={history} busy={historyBusy} error={historyError} onOpen={openHistory} onReload={loadHistory} />}
+          {page === 'users' && <AdminUsersPage />}
         </main>
         <footer className="footer">RadarJus · Inteligência Preditiva</footer>
       </div>
