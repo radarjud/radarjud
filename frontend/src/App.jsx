@@ -391,12 +391,15 @@ function Overview({ data, navigate, catalogTerm }) {
   const isCompleted = data?.scanStatus === 'COMPLETED';
   const tstCount = data?.tstCount != null
     ? data.tstCount
-    : (data?.processes || []).filter(p => (
-        p.is_tst_recurso ||
-        String(p.tribunal || '').toUpperCase() === 'TST' ||
-        String(p.grau || '').toUpperCase().includes('TST') ||
-        /\.5\.00\./.test(String(p.numero_processo || ''))
-      )).length;
+    : (data?.comparativoInstancias?.tst?.total_processos != null
+        ? data.comparativoInstancias.tst.total_processos
+        : (data?.processes || []).filter(p => (
+            p.is_tst_recurso ||
+            String(p.tribunal || '').toUpperCase() === 'TST' ||
+            String(p.grau || '').toUpperCase().includes('TST') ||
+            /\.5\.00\./.test(String(p.numero_processo || '')) ||
+            /recurso de revista|airr|tst/i.test(String(p.primary_subject || p.primarySubject || p.observation || ''))
+          )).length);
 
   return (
     <div className="stack">

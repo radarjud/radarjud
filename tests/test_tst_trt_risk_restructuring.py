@@ -175,3 +175,57 @@ def test_non_imperative_recommendations_and_shielding():
     assert any(k in recs_list.lower() for k in ("provisão", "caixa reserva", "conta vinculada"))
     assert any(k in recs_list.lower() for k in ("folhas de ponto", "horas extras", "fgts"))
     assert any(k in recs_list.lower() for k in ("retenção de faturas", "seguro-garantia", "direito de regresso"))
+
+
+def test_tst_detection_via_recurso_de_revista_and_airr():
+    """Valida detecção de processos no TST via Recurso de Revista e AIRR mesmo com numeração de TRT."""
+    from app.services.cnj_searcher import is_tst_process as cnj_is_tst
+    from app.services.prediction_engine import is_tst_process as pred_is_tst
+
+    # Processo originário do TRT2 com Recurso de Revista
+    proc_rr = {
+        "numero_processo": "0001234-56.2021.5.02.0001",
+        "tribunal": "TRT2",
+        "grau": "G1",
+        "primary_subject": "Recurso de Revista - Horas Extras",
+        "observation": "Assunto identificado via publicação PJe: 'Recurso de Revista'.",
+    }
+    assert pred_is_tst(proc_rr) is True
+    assert cnj_is_tst(
+        numero_processo=proc_rr["numero_processo"],
+        tribunal=proc_rr["tribunal"],
+        grau=proc_rr["grau"],
+        primary_subject=proc_rr["primary_subject"],
+        observation=proc_rr["observation"],
+    ) is True
+
+    # Processo com Agravo de Instrumento em Recurso de Revista (AIRR)
+    proc_airr = {
+        "numero_processo": "0010999-88.2022.5.15.0001",
+        "tribunal": "TRT15",
+        "grau": "G2",
+        "primary_subject": "Agravo de Instrumento em Recurso de Revista (AIRR)",
+    }
+    assert pred_is_tst(proc_airr) is True
+    assert cnj_is_tst(
+        numero_processo=proc_airr["numero_processo"],
+        tribunal=proc_airr["tribunal"],
+        primary_subject=proc_airr["primary_subject"],
+    ) is True
+
+    # Processo padrão de 1º grau sem recurso ao TST
+    proc_trt_only = {
+        "numero_processo": "0005555-12.2023.5.02.0010",
+        "tribunal": "TRT2",
+        "grau": "G1",
+        "primary_subject": "Adicional de Insalubridade",
+        "observation": "Aviso de audiência",
+    }
+    assert pred_is_tst(proc_trt_only) is False
+    assert cnj_is_tst(
+        numero_processo=proc_trt_only["numero_processo"],
+        tribunal=proc_trt_only["tribunal"],
+        grau=proc_trt_only["grau"],
+        primary_subject=proc_trt_only["primary_subject"],
+        observation=proc_trt_only["observation"],
+    ) is False

@@ -589,7 +589,7 @@ class LegalAIAnalyzer:
 
             if cenario_tipo == "CENARIO_A":
                 rec_homologacao = "Baixa Exposição Trabalhista"
-                perfil_risco = f"Baixa Exposição ({risco_subsidiario:.1f}%)"
+                perfil_risco = f"Baixo Risco / Baixa Exposição ({risco_subsidiario:.1f}%)"
                 resumo = (
                     f"A empresa {empresa} possui {total} processo(s) em tramitação ({motivos_str}) e solidez "
                     f"patrimonial declarada (Capital Social de {capital_fmt}). O Risco Subsidiário apurado é de {risco_subsidiario:.1f}%, "
@@ -600,7 +600,7 @@ class LegalAIAnalyzer:
                 perfil_risco = "Amostra Inicial (Em Andamento)"
                 resumo = (
                     f"A empresa {empresa} possui {total} processo(s) em tramitação ({motivos_str}), porém "
-                    f"sem desfecho anterior transitado em julgado. Recomenda-se diligência e blindagem contratual preventiva.{exec_note}"
+                    f"nenhum desfecho anterior transitado em julgado. Recomenda-se diligência e blindagem contratual preventiva.{exec_note}"
                 )
 
             return {
@@ -663,12 +663,20 @@ class LegalAIAnalyzer:
         )
 
         # Diagnóstico integrado de risco conforme as 3 faixas de exposição (Súmula 331 TST)
-        if risco_subsidiario <= 30.0:
+        if cenario_tipo == "CENARIO_A":
             rec_homologacao = "Baixa Exposição Trabalhista"
-            perfil_risco = f"Baixa Exposição ({risco_subsidiario:.1f}%)"
+            perfil_risco = f"Baixo Risco / Baixa Exposição ({risco_subsidiario:.1f}%)"
+            parecer_resumo = (
+                f"A empresa {empresa} apresenta plena higidez econômico-financeira ({capital_fmt}) e taxa de "
+                f"exposição subsidiária ponderada de {risco_subsidiario:.1f}% perante a Súmula 331 do TST, com passivo em grau controlado. "
+                f"As condenações identificadas incidem sobre {motivos_str}, enquadrando a prestadora em faixa de baixa exposição para fins de terceirização."
+            )
+        elif risco_subsidiario <= 30.0:
+            rec_homologacao = "Baixa Exposição Trabalhista"
+            perfil_risco = f"Baixo Risco / Baixa Exposição ({risco_subsidiario:.1f}%)"
             parecer_resumo = (
                 f"A empresa {empresa} apresenta taxa de exposição subsidiária ponderada de {risco_subsidiario:.1f}% "
-                f"com desfechos favoráveis e passivo em grau controlado. As condenações identificadas incidem sobre {motivos_str}, "
+                f"com desfechos favoráveis e passivo em grau controlado perante a Súmula 331 do TST. As condenações identificadas incidem sobre {motivos_str}, "
                 f"enquadrando a prestadora em faixa de baixa exposição para fins de terceirização."
             )
         elif risco_subsidiario < 60.0:

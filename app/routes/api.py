@@ -334,11 +334,25 @@ def _deep_scan_background_worker(
                         primary_code = assuntos[0].get("codigo") if assuntos else None
                         dist_date = parse_iso_date(pdata.get("dataUltimaPublicacao"))
 
+                        from app.services.cnj_searcher import is_tst_process
+                        raw_trib = str(pdata.get("siglaTribunal") or pdata.get("tribunal") or "")[:50]
+                        is_tst_flag = is_tst_process(
+                            numero_processo=cnj,
+                            tribunal=raw_trib,
+                            grau="TST (Recursal)" if pdata.get("is_tst_recurso") else "G1",
+                            is_tst_recurso=bool(pdata.get("is_tst_recurso")),
+                            primary_subject=primary_name,
+                            observation=primary_name,
+                            classes_pje=classes_list,
+                            texts=raw_texts,
+                        )
+                        trib_val = "TST" if is_tst_flag else raw_trib
+
                         rec = ProcessRecord(
                             company_search_id=search_id,
                             numero_processo=cnj,
-                            tribunal=str(pdata.get("siglaTribunal") or pdata.get("tribunal") or "")[:50],
-                            grau="TST (Recursal)" if pdata.get("is_tst_recurso") else "G1",
+                            tribunal=trib_val,
+                            grau="TST (Recursal)" if is_tst_flag else "G1",
                             nivel_sigilo=0,
                             primary_subject=primary_name,
                             primary_subject_code=primary_code,
@@ -745,7 +759,10 @@ def search_company():
         and type(browser_count) is int and browser_count >= 0
         and isinstance(client_prefetched_items, list)
         and 0 < len(client_prefetched_items) <= 100
-        and len(client_prefetched_items) == min(browser_count, 100)
+        and (
+            len(client_prefetched_items) == browser_count
+            or len(client_prefetched_items) >= min(browser_count, 50)
+        )
         and all(isinstance(item, dict) and orchestrator.searcher.normalize_cnj(
             item.get("numero_processo") or item.get("numeroProcesso") or item.get("numeroprocessocommascara")
         ) for item in client_prefetched_items)
@@ -1018,7 +1035,7 @@ def search_company():
         new_hash = fast_results.get("movements_hash")
         initial_status = fast_results.get("scan_status", "COMPLETED")
         if browser_owned and fast_results.get("total_processos", 0) > 0:
-            initial_status = "BROWSER_PENDING" if browser_count > 100 else "COMPLETED"
+            initial_status = "BROWSER_PENDING" if browser_count > len(client_prefetched_items) else "COMPLETED"
         else:
             browser_owned = False
 
@@ -1887,6 +1904,8 @@ def _recalculate_search_metrics(search: CompanySearch):
             ProcessRecord.subjects_json,
             ProcessRecord.has_subsidiary_liability,
             ProcessRecord.subsidiary_contractors_json,
+            ProcessRecord.grau,
+            ProcessRecord.observation,
         )
         .filter(ProcessRecord.company_search_id == search_id)
         .all()
@@ -1902,6 +1921,8 @@ def _recalculate_search_metrics(search: CompanySearch):
             "subjects": r[5] or ([r[4]] if r[4] else []),
             "has_subsidiary_liability": r[6],
             "subsidiary_contractors": r[7],
+            "grau": r[8] or "G1",
+            "observation": r[9],
         }
         for r in procs_raw
     ]
@@ -2088,6 +2109,10 @@ def deep_scan_batch(search_id: int):
                 numero_processo=cnj,
                 tribunal=raw_trib,
                 is_tst_recurso=bool(pdata.get("is_tst_recurso")),
+                primary_subject=primary_name,
+                observation=primary_name,
+                classes_pje=classes_list,
+                texts=raw_texts,
             )
             trib_val = "TST" if is_tst_flag else str(raw_trib or "")[:50]
 
@@ -2667,6 +2692,11 @@ def get_search_processes(company_search_id: int):
                         ProcessRecord.tribunal.ilike("%TST%"),
                         ProcessRecord.numero_processo.ilike("%.5.00.%"),
                         ProcessRecord.grau.ilike("%TST%"),
+                        ProcessRecord.primary_subject.ilike("%recurso de revista%"),
+                        ProcessRecord.primary_subject.ilike("%airr%"),
+                        ProcessRecord.observation.ilike("%recurso de revista%"),
+                        ProcessRecord.observation.ilike("%airr%"),
+                        ProcessRecord.observation.ilike("%(TST)%"),
                     )
                 )
             elif inst in ("trts", "trt", "instancias_ordinarias", "ordinarias"):
@@ -2676,6 +2706,11 @@ def get_search_processes(company_search_id: int):
                             ProcessRecord.tribunal.ilike("%TST%"),
                             ProcessRecord.numero_processo.ilike("%.5.00.%"),
                             ProcessRecord.grau.ilike("%TST%"),
+                            ProcessRecord.primary_subject.ilike("%recurso de revista%"),
+                            ProcessRecord.primary_subject.ilike("%airr%"),
+                            ProcessRecord.observation.ilike("%recurso de revista%"),
+                            ProcessRecord.observation.ilike("%airr%"),
+                            ProcessRecord.observation.ilike("%(TST)%"),
                         )
                     )
                 )

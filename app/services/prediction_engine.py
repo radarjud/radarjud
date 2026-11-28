@@ -196,7 +196,17 @@ def normalize_execution_phase_payload(
         }
 
     # Normalização do Risco Subsidiário estruturado (sem peso de solvência)
+    econ_obj = payload.get("idoneidade_economica") if isinstance(payload.get("idoneidade_economica"), dict) else {}
     raw_risco = payload.get("risco_subsidiario")
+    if (
+        (raw_risco is None or raw_risco == payload.get("score_risco_terceirizacao") or raw_risco == payload.get("overall_risk_score"))
+        and econ_obj.get("risco_calote_subsidiario") is not None
+        and (
+            "CENARIO_A" in str(econ_obj.get("cenario_tipo") or "").upper()
+            or "CENARIO_A" in str(payload.get("cenario") or "").upper()
+        )
+    ):
+        raw_risco = econ_obj.get("risco_calote_subsidiario")
     if isinstance(raw_risco, dict) and "percentual" in raw_risco:
         pct_risco = round(float(raw_risco.get("percentual", 0.0) or 0.0), 1)
         faixa = raw_risco.get("faixa_exposicao") or ("BAIXA" if pct_risco <= 30.0 else ("MODERADA" if pct_risco < 60.0 else "ALTA"))
@@ -686,12 +696,9 @@ def build_condenacao_por_motivo(processes: List[Dict[str, Any]]) -> List[Dict[st
 
         results.append({
             "motivo": motivo,
-            "processos_mapeados": total_proc,
             "total_processos": total_proc,
             "condenacoes": condenacoes,
             "taxa_condenacao": taxa_cond,
-            "faixa_variacao_min": lo_val,
-            "faixa_variacao_max": hi_val,
             "faixa_variacao": faixa_var,
         })
 
@@ -714,6 +721,28 @@ def is_tst_process(p: Dict[str, Any]) -> bool:
     num = str(p.get("numero_processo") or p.get("numeroProcesso") or p.get("numero_cnj") or "").strip()
     if ".5.00." in num:
         return True
+    digits = re.sub(r"\D", "", num)
+    if len(digits) == 20 and digits[13:16] == "500":
+        return True
+
+    corpus = []
+    if p.get("primary_subject"):
+        corpus.append(str(p["primary_subject"]))
+    if p.get("observation"):
+        corpus.append(str(p["observation"]))
+    if p.get("subjects"):
+        corpus.extend(str(s) for s in p["subjects"] if s)
+    if p.get("classes_pje"):
+        corpus.extend(str(c) for c in p["classes_pje"] if c)
+    if p.get("publicacoes_texto"):
+        corpus.extend(str(t) for t in p["publicacoes_texto"][:3] if t)
+
+    search_text = " ".join(corpus).lower()
+    if search_text:
+        for pat in (r"\brecurso\s+de\s+revista\b", r"\bairr\b", r"\btribunal\s+superior\s+do\s+trabalho\b", r"\btst\b"):
+            if re.search(pat, search_text):
+                return True
+
     return False
 
 
@@ -1892,22 +1921,32 @@ def build_sector_benchmark(
         r_sub_candidate = p.get("risco_subsidiario")
         if isinstance(r_sub_candidate, dict):
             r_sub_candidate = r_sub_candidate.get("percentual")
+        if (
+            (r_sub_candidate is None or r_sub_candidate == p.get("score_risco_terceirizacao") or r_sub_candidate == p.get("overall_risk_score"))
+            and econ.get("risco_calote_subsidiario") is not None
+            and cenario_clean == "CENARIO_A"
+        ):
+            r_sub_candidate = econ.get("risco_calote_subsidiario")
         r_sub_raw = (
             r_sub_candidate
             if r_sub_candidate is not None
             else (
-                p.get("score_risco_terceirizacao")
-                if p.get("score_risco_terceirizacao") is not None
+                econ.get("risco_calote_subsidiario")
+                if econ.get("risco_calote_subsidiario") is not None
                 else (
-                    econ.get("risco_calote_subsidiario")
-                    if econ.get("risco_calote_subsidiario") is not None
+                    econ.get("risco_exposicao_subsidiaria")
+                    if econ.get("risco_exposicao_subsidiaria") is not None
                     else (
-                        p.get("indice_exposicao_financeira")
-                        if p.get("indice_exposicao_financeira") is not None
+                        p.get("score_risco_terceirizacao")
+                        if p.get("score_risco_terceirizacao") is not None
                         else (
-                            econ.get("indice_exposicao_financeira")
-                            if econ.get("indice_exposicao_financeira") is not None
-                            else p.get("overall_risk_score", 0.0)
+                            p.get("indice_exposicao_financeira")
+                            if p.get("indice_exposicao_financeira") is not None
+                            else (
+                                econ.get("indice_exposicao_financeira")
+                                if econ.get("indice_exposicao_financeira") is not None
+                                else p.get("overall_risk_score", 0.0)
+                            )
                         )
                     )
                 )
