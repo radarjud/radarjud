@@ -13,8 +13,8 @@ import logging
 import threading
 from pathlib import Path
 import gc
-from datetime import datetime, timezone
-from typing import List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Blueprint, Response, request, jsonify, current_app, g
 from sqlalchemy import text
@@ -67,6 +67,29 @@ CNPJ_REGEX = re.compile(r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b")
 SEARCH_CACHE = {}  # {brand_term.upper(): (timestamp, dict_result)}
 CACHE_TTL = 900    # 15 minutos
 MAX_CACHE_ENTRIES = 200  # Proteção estrita de memória para Render Free (512 MB RAM)
+LABOR_SCOPE_VERSION = "LABOR_ONLY_V1"
+
+
+def _is_valid_labor_cache(search: CompanySearch) -> bool:
+    """
+    Impede reaproveitamento de buscas antigas que contenham processos não trabalhistas
+    (TJs/TRFs) antes da introdução do escopo estrito Justiça do Trabalho.
+    """
+    econ = search.economic_standing if isinstance(search.economic_standing, dict) else {}
+    if econ.get("scan_scope_version") == LABOR_SCOPE_VERSION:
+        return True
+
+    from app.services.cnj_searcher import is_labor_process
+    procs = list(search.processes or [])
+    if not procs:
+        return True
+    return all(
+        is_labor_process(
+            numero_processo=getattr(p, "numero_processo", None),
+            tribunal=getattr(p, "tribunal", None),
+        )
+        for p in procs
+    )
 
 
 def _prune_search_cache_if_needed(max_entries: int = MAX_CACHE_ENTRIES) -> None:
@@ -85,6 +108,68 @@ def _prune_search_cache_if_needed(max_entries: int = MAX_CACHE_ENTRIES) -> None:
 ACTIVE_SEARCH_LOCK = threading.Lock()
 ACTIVE_SEARCH_JOB_ID = None
 CANCELLED_JOB_IDS = set()
+_LAST_PRUNE_TS = 0.0
+
+
+def _bulk_upsert_process_rows(rows: List[Dict[str, Any]]) -> None:
+    """
+    Persiste um lote de processos em uma única query SQL (INSERT ... ON CONFLICT DO NOTHING),
+    eliminando overhead de ORM e duplicatas por (company_search_id, numero_processo).
+    """
+    if not rows:
+        return
+    now_utc = get_utc_now()
+    for row in rows:
+        row.setdefault("created_at", now_utc)
+
+    dialect_name = ""
+    try:
+        dialect_name = db.session.get_bind().dialect.name
+    except Exception:
+        dialect_name = ""
+
+    if dialect_name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        stmt = pg_insert(ProcessRecord).values(rows).on_conflict_do_nothing(
+            index_elements=["company_search_id", "numero_processo"]
+        )
+        db.session.execute(stmt)
+        return
+
+    if dialect_name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+        stmt = sqlite_insert(ProcessRecord).values(rows).on_conflict_do_nothing(
+            index_elements=["company_search_id", "numero_processo"]
+        )
+        db.session.execute(stmt)
+        return
+
+    db.session.bulk_insert_mappings(ProcessRecord, rows)
+
+
+def prune_old_searches(retention_days: Optional[int] = None) -> int:
+    """
+    Expurga buscas antigas do PostgreSQL/SQLite (com cascata em process_records)
+    para evitar estouro da cota de disco gratuito no Render.
+    """
+    if retention_days is None:
+        try:
+            retention_days = max(0, int(os.getenv("SEARCH_RETENTION_DAYS", "30") or 30))
+        except ValueError:
+            retention_days = 30
+    if retention_days <= 0:
+        return 0
+
+    cutoff = get_utc_now() - timedelta(days=retention_days)
+    old_searches = CompanySearch.query.filter(CompanySearch.updated_at < cutoff).all()
+    if not old_searches:
+        return 0
+    count = len(old_searches)
+    for item in old_searches:
+        db.session.delete(item)
+    db.session.commit()
+    logger.info("[PRUNE_DB] %d buscas anteriores a %d dias removidas para higiene de disco.", count, retention_days)
+    return count
 
 
 def fast_extract_cnpjs_from_texts(processes_dict: dict) -> list:
@@ -644,7 +729,12 @@ def search_company():
             # Se o cache em memória tiver homônimo INAPTO antigo para empresa ativa, invalida o cache
             if econ_entry.get("situacao_cadastral") == "INAPTA" and (cached_data.get("total_processos") or 0) >= 25:
                 SEARCH_CACHE.pop(cache_key, None)
-            elif time.time() - ts < CACHE_TTL and (cached_data.get("total_processos") or 0) > 0:
+            elif (
+                time.time() - ts < CACHE_TTL
+                and (cached_data.get("total_processos") or 0) > 0
+                and cached_data.get("scan_status") == "COMPLETED"
+                and cached_data.get("scan_scope_version") == LABOR_SCOPE_VERSION
+            ):
                 logger.info("Cache em memória (TTL 15 min) ativado para '%s'. Resposta instantânea em 0.05s.", cache_key)
                 res_copy = dict(cached_data)
                 res_copy["cached"] = True
@@ -671,13 +761,18 @@ def search_company():
                 .order_by(CompanySearch.updated_at.desc())
                 .first()
             )
-            # Só retorna cache se houver processos (> 0), for recente e varredura COMPLETA.
-            # Evita que uma busca vazia anterior ou preliminar congele o sistema por 24 horas.
+            # Só retorna cache se houver processos (> 0), for recente (SEARCH_CACHE_TTL_HOURS) e varredura COMPLETA.
+            # Buscas PARTIAL nunca são usadas como cache completo para pular novas varreduras.
+            try:
+                cache_ttl_hours = max(1, int(os.getenv("SEARCH_CACHE_TTL_HOURS", "24") or 24))
+            except ValueError:
+                cache_ttl_hours = 24
             if (
                 cached_search
                 and (cached_search.total_processes or 0) > 0
-                and cached_search.is_recent(hours=24)
+                and cached_search.is_recent(hours=cache_ttl_hours)
                 and cached_search.scan_status == "COMPLETED"
+                and _is_valid_labor_cache(cached_search)
                 and (not browser_requested or ((cached_search.economic_standing or {})
                      .get("browser_search_strategy", {}).get("cache_key") == cache_key))
             ):
@@ -879,8 +974,31 @@ def search_company():
             discovered_entities=fast_results.get("discovered_entities", []),
             search_strategy=search_strategy,
         )
+        from app.services.cnj_searcher import build_labor_courts_queue, is_labor_process
+        company_uf = (
+            (econ_data.get("uf") if isinstance(econ_data, dict) else None)
+            or (econ_data.get("estado") if isinstance(econ_data, dict) else None)
+            or (search_strategy.get("uf") if isinstance(search_strategy, dict) else None)
+        )
+        courts_queue = build_labor_courts_queue(company_uf)
+        if not isinstance(econ_data, dict):
+            econ_data = {}
+        econ_data = {
+            **econ_data,
+            "scan_scope_version": LABOR_SCOPE_VERSION,
+            "labor_scan_cursor": {
+                "courts_queue": courts_queue,
+                "layer": 1,
+                "layer2_queue": [],
+                "court_index": 0,
+                "page": 1,
+                "consecutive_court_errors": 0,
+                "partial_courts": [],
+            },
+        }
         if browser_owned:
-            econ_data = {**econ_data, "browser_search_strategy": search_strategy}
+            econ_data["browser_search_strategy"] = search_strategy
+        fast_results["scan_scope_version"] = LABOR_SCOPE_VERSION
         fast_results["idoneidade_economica"] = econ_data
         fast_results["logo"] = econ_data.get("logo", {})
         fast_results["capital_social_consolidado"] = econ_data.get("valor_formatado") or econ_data.get("capital_social_formatado")
@@ -946,12 +1064,16 @@ def search_company():
             search_id = search_entry.id
             fast_results["search_id"] = search_id
 
-            # Persiste os processos identificados
+            # Persiste apenas processos estritamente trabalhistas identificados no fast-path
             for proc in fast_results.get("processos", []):
+                proc_num = proc.get("numero_processo")
+                proc_trib = proc.get("tribunal")
+                if not is_labor_process(numero_processo=proc_num, tribunal=proc_trib):
+                    continue
                 record = ProcessRecord(
                     company_search_id=search_entry.id,
-                    numero_processo=proc.get("numero_processo"),
-                    tribunal=str(proc.get("tribunal") or "")[:50],
+                    numero_processo=proc_num,
+                    tribunal=str(proc_trib or "")[:50],
                     grau=str(proc.get("grau") or "G1")[:50],
                     nivel_sigilo=proc.get("nivelSigilo", 0),
                     primary_subject=proc.get("primary_subject"),
@@ -967,24 +1089,20 @@ def search_company():
                 )
                 db.session.add(record)
             db.session.commit()
+
+            # Expurgo oportunista (no máximo 1x/hora) para proteger o limite de disco no Render Free
+            global _LAST_PRUNE_TS
+            now_ts = time.time()
+            if (now_ts - _LAST_PRUNE_TS) >= 3600:
+                _LAST_PRUNE_TS = now_ts
+                try:
+                    prune_old_searches()
+                except Exception as prune_err:
+                    db.session.rollback()
+                    logger.debug("Expurgo oportunista ignorado: %s", prune_err)
         except Exception as db_exc:
             db.session.rollback()
             logger.debug("Persistência no DB ignorada ou indisponível: %s", db_exc)
-
-        # =====================================================================
-        # DEEP SCAN (Background): Dispara apenas se ainda existirem mais páginas
-        # =====================================================================
-        if search_id and initial_status == "PARTIAL_FAST_PATH" and not current_app.config.get("TESTING"):
-            app_ref = current_app._get_current_object()
-            background_executor.submit(
-                _deep_scan_background_worker,
-                app_ref,
-                search_id,
-                display_title,
-                search_strategy,
-                current_job_id,
-                fast_results.get("processos", []),
-            )
 
         fast_results["scan_status"] = (
             "BROWSER_PARTIAL" if browser_owned and not search_id else initial_status
@@ -1801,22 +1919,23 @@ def deep_scan_batch(search_id: int):
 
     payload = request.get_json(silent=True) or {}
 
-    # Encerramento antecipado a pedido do usuário: calcula métricas com os dados já coletados
-    if payload.get("finalize") is True:
-        search.scan_status = "COMPLETED"
+    # Encerramento antecipado a pedido do usuário: grava PARTIAL (nunca COMPLETED)
+    # e recalcula métricas sobre 100% dos processos já coletados até o momento.
+    if payload.get("finalize") is True or payload.get("manual_stop") is True or payload.get("interrupted_by_user") is True:
+        search.scan_status = "PARTIAL"
         _recalculate_search_metrics(search)
         return jsonify({
-            "status": "COMPLETED",
+            "status": "PARTIAL",
             "search_id": search_id,
             "next_page": None,
             "has_more": False,
             "total_acumulado": search.total_processes,
-            "is_completed": True,
+            "is_completed": False,
             "data": search.to_dict(),
         }), 200
 
     page = int(payload.get("page") or 2)
-    batch_size = max(1, min(int(payload.get("batch_size") or 3), 5))
+    batch_size = max(1, min(int(payload.get("batch_size") or 5), 10))
 
     known_numbers = {
         r[0]
@@ -1842,7 +1961,8 @@ def deep_scan_batch(search_id: int):
             strat = saved_strat
 
     def _on_batch_persist(page_num: int, batch_processes: dict, new_count: int):
-        batch_records = []
+        batch_rows = []
+        now_utc = get_utc_now()
         for cnj, pdata in (batch_processes or {}).items():
             if not cnj or cnj in known_numbers:
                 continue
@@ -1878,64 +1998,160 @@ def deep_scan_batch(search_id: int):
                     evaluated_company=search.company_name,
                 )
 
-            rec = ProcessRecord(
-                company_search_id=search_id,
+            from app.services.cnj_searcher import is_labor_process, is_tst_process
+            raw_trib = pdata.get("siglaTribunal") or pdata.get("tribunal")
+            if not is_labor_process(numero_processo=cnj, tribunal=raw_trib):
+                continue
+            is_tst_flag = is_tst_process(
                 numero_processo=cnj,
-                tribunal=str(pdata.get("siglaTribunal") or pdata.get("tribunal") or "")[:50],
-                grau="TST (Recursal)" if pdata.get("is_tst_recurso") else "G1",
-                nivel_sigilo=0,
-                primary_subject=primary_name,
-                primary_subject_code=primary_code,
-                subjects_json=[a["nome"] for a in assuntos if a.get("nome")],
-                observation=f"Assunto identificado via publicação PJe: '{primary_name}'." if primary_name else None,
-                sentence_outcome=outcome,
-                has_expert_report=bool(pdata.get("has_expert_report", False)),
-                has_subsidiary_liability=has_sub,
-                subsidiary_contractors_json=subsidiary_contractors,
-                data_distribuicao=dist_date,
-                raw_metadata=None,
+                tribunal=raw_trib,
+                is_tst_recurso=bool(pdata.get("is_tst_recurso")),
             )
-            batch_records.append(rec)
+            trib_val = "TST" if is_tst_flag else str(raw_trib or "")[:50]
 
-        if batch_records:
-            for i in range(0, len(batch_records), 50):
-                db.session.bulk_save_objects(batch_records[i:i + 50])
-                db.session.commit()
-            del batch_records
+            batch_rows.append({
+                "company_search_id": search_id,
+                "numero_processo": cnj,
+                "tribunal": trib_val,
+                "grau": "TST (Recursal)" if is_tst_flag else "G1",
+                "nivel_sigilo": 0,
+                "primary_subject": primary_name,
+                "primary_subject_code": primary_code,
+                "subjects_json": [a["nome"] for a in assuntos if a.get("nome")],
+                "observation": f"Assunto identificado via publicação PJe: '{primary_name}'." if primary_name else None,
+                "sentence_outcome": outcome,
+                "has_expert_report": bool(pdata.get("has_expert_report", False)),
+                "has_subsidiary_liability": has_sub,
+                "subsidiary_contractors_json": subsidiary_contractors,
+                "data_distribuicao": dist_date,
+                "raw_metadata": None,
+                "created_at": now_utc,
+            })
+
+        if batch_rows:
+            _bulk_upsert_process_rows(batch_rows)
+            del batch_rows
 
         s = db.session.get(CompanySearch, search_id)
         if s:
             s.total_processes = len(known_numbers)
-            s.last_checked_at = get_utc_now()
-            db.session.commit()
+            s.last_checked_at = now_utc
+        db.session.commit()
 
         if is_render_env:
             gc.collect()
 
-    scan_res = orchestrator.searcher.paginate_comunica_pje_standard(
+    # No modo em lotes a RAM é limitada por requisição (time-box + upsert por página), então o teto
+    # global SCAN_MAX_PAGES (pensado para o worker que acumula tudo em memória) não se aplica aqui.
+    # SCAN_BATCH_MAX_PAGES permite um teto explícito por ambiente; 0 = sem teto.
+    try:
+        batch_max_pages = max(0, int(os.getenv("SCAN_BATCH_MAX_PAGES", "0") or 0))
+    except ValueError:
+        batch_max_pages = 0
+
+    prev_signature = payload.get("prev_page_signature")
+    if not isinstance(prev_signature, str) or len(prev_signature) != 40:
+        prev_signature = None
+
+    econ_dict = dict(search.economic_standing) if isinstance(search.economic_standing, dict) else {}
+    labor_cursor = econ_dict.get("labor_scan_cursor") if isinstance(econ_dict.get("labor_scan_cursor"), dict) else None
+    from app.services.cnj_searcher import build_labor_courts_queue
+    if not labor_cursor:
+        company_uf = econ_dict.get("uf") or econ_dict.get("estado")
+        labor_cursor = {
+            "courts_queue": build_labor_courts_queue(company_uf),
+            "layer": 1,
+            "layer2_queue": [],
+            "court_index": 0,
+            "page": 1,
+            "consecutive_court_errors": 0,
+            "partial_courts": [],
+        }
+
+    courts_queue = list(labor_cursor.get("courts_queue") or build_labor_courts_queue())
+    cur_layer = int(labor_cursor.get("layer") or 1)
+    cur_l2_queue = list(labor_cursor.get("layer2_queue") or [])
+    cur_idx = int(labor_cursor.get("court_index") or 0)
+    cur_page = int(labor_cursor.get("page") or 1)
+    cur_err_streak = int(labor_cursor.get("consecutive_court_errors") or 0)
+    cur_partials = list(labor_cursor.get("partial_courts") or [])
+    since_date_val = payload.get("since_date") or labor_cursor.get("since_date")
+
+    try:
+        max_per_court_override = max(0, int(os.getenv("SCAN_BATCH_MAX_PAGES", "0") or 0)) or None
+    except ValueError:
+        max_per_court_override = None
+
+    scan_res = orchestrator.searcher.paginate_labor_courts_batch(
         search_strategy=strat,
-        start_page=page,
-        max_pages=scan_cfg["max_pages"],
-        max_pages_per_call=batch_size,
+        courts_queue=courts_queue,
+        court_index=cur_idx,
+        start_page=cur_page,
+        consecutive_court_errors=cur_err_streak,
+        partial_courts=cur_partials,
+        layer=cur_layer,
+        layer2_queue=cur_l2_queue,
+        max_pages_per_court=max_per_court_override,
         on_batch_persist=_on_batch_persist,
-        timeout=5.0,
+        timeout=8.0 if is_render_env else 10.0,
         known_cnjs=known_numbers,
         batch_delay=scan_cfg["batch_delay"],
-        itens_por_pagina=100,
+        itens_por_pagina=scan_cfg.get("page_size", 100),
         time_budget_seconds=time_budget,
+        prev_page_signature=prev_signature,
+        since_date=since_date_val,
     )
 
-    if scan_res.get("rate_limited"):
-        search.scan_status = "RATE_LIMITED"
+    updated_cursor = {
+        "courts_queue": courts_queue,
+        "layer": scan_res["layer"],
+        "layer2_queue": scan_res["layer2_queue"],
+        "court_index": scan_res["court_index"],
+        "page": scan_res["next_page"] or 1,
+        "consecutive_court_errors": scan_res["consecutive_court_errors"],
+        "partial_courts": scan_res["partial_courts"],
+    }
+    if since_date_val:
+        updated_cursor["since_date"] = since_date_val
+    search.economic_standing = {
+        **econ_dict,
+        "scan_scope_version": LABOR_SCOPE_VERSION,
+        "labor_scan_cursor": updated_cursor,
+    }
+
+    last_signature = scan_res.get("last_page_signature")
+    logger.info(
+        "[LABOR_SCAN_BATCH] search_id=%d L%d court=%s (%d/%d) pagina=%s paginas_lidas=%d total=%d motivo=%s",
+        search_id,
+        scan_res.get("layer", 1),
+        scan_res.get("current_court"),
+        scan_res.get("courts_completed", 0),
+        scan_res.get("total_courts", 25),
+        scan_res.get("next_page"),
+        scan_res.get("pages_read", 0),
+        search.total_processes or 0,
+        scan_res.get("motivo_encerramento"),
+    )
+
+    if scan_res.get("rate_limited") or scan_res.get("had_http_error"):
+        is_rate_limited = bool(scan_res.get("rate_limited"))
+        search.scan_status = "RATE_LIMITED" if is_rate_limited else "IN_PROGRESS"
         db.session.commit()
         return jsonify({
-            "status": "RATE_LIMITED",
+            "status": "RATE_LIMITED" if is_rate_limited else "UPSTREAM_RETRY",
             "search_id": search_id,
-            "next_page": page,
+            "layer": scan_res.get("layer", 1),
+            "next_page": scan_res.get("next_page") or cur_page,
+            "current_court": scan_res.get("current_court"),
+            "courts_completed": scan_res.get("courts_completed", 0),
+            "total_courts": scan_res.get("total_courts", 25),
+            "partial_courts": scan_res.get("partial_courts", []),
             "has_more": True,
-            "retry_after_seconds": scan_res.get("retry_after_seconds", 3),
+            "retry_after_seconds": scan_res.get("retry_after_seconds") or (3 if is_rate_limited else 5),
             "total_acumulado": search.total_processes,
             "is_completed": False,
+            "motivo_encerramento": scan_res.get("motivo_encerramento"),
+            "last_page_signature": last_signature,
         }), 200
 
     if scan_res.get("is_completed"):
@@ -1944,23 +2160,54 @@ def deep_scan_batch(search_id: int):
         return jsonify({
             "status": "COMPLETED",
             "search_id": search_id,
+            "layer": scan_res.get("layer", 2),
             "next_page": None,
+            "current_court": None,
+            "courts_completed": scan_res.get("total_courts", 25),
+            "total_courts": scan_res.get("total_courts", 25),
+            "partial_courts": [],
             "has_more": False,
             "total_acumulado": search.total_processes,
             "is_completed": True,
+            "motivo_encerramento": scan_res.get("motivo_encerramento"),
             "data": search.to_dict(),
         }), 200
 
-    next_p = scan_res.get("next_page") or (page + scan_res.get("pages_read", batch_size))
+    if scan_res.get("is_partial_done"):
+        search.scan_status = "PARTIAL"
+        _recalculate_search_metrics(search)
+        return jsonify({
+            "status": "PARTIAL",
+            "search_id": search_id,
+            "layer": scan_res.get("layer", 2),
+            "next_page": None,
+            "current_court": None,
+            "courts_completed": scan_res.get("total_courts", 25),
+            "total_courts": scan_res.get("total_courts", 25),
+            "partial_courts": scan_res.get("partial_courts", []),
+            "has_more": False,
+            "total_acumulado": search.total_processes,
+            "is_completed": False,
+            "motivo_encerramento": scan_res.get("motivo_encerramento"),
+            "data": search.to_dict(),
+        }), 200
+
     search.scan_status = "IN_PROGRESS"
     db.session.commit()
     return jsonify({
         "status": "IN_PROGRESS",
         "search_id": search_id,
-        "next_page": next_p,
+        "layer": scan_res.get("layer", 1),
+        "next_page": scan_res.get("next_page") or 1,
+        "current_court": scan_res.get("current_court"),
+        "courts_completed": scan_res.get("courts_completed", 0),
+        "total_courts": scan_res.get("total_courts", 25),
+        "partial_courts": scan_res.get("partial_courts", []),
         "has_more": True,
         "total_acumulado": search.total_processes,
         "is_completed": False,
+        "motivo_encerramento": scan_res.get("motivo_encerramento"),
+        "last_page_signature": last_signature,
     }), 200
 
 

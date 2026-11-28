@@ -172,6 +172,7 @@ function normalize(raw) {
     logo: logo,
     processes: Array.isArray(payload.processos) ? payload.processos
       : Array.isArray(payload.process_records) ? payload.process_records : [],
+    tstCount: payload.tst_count != null ? Number(payload.tst_count) : null,
     searchId: payload.search_id ?? payload.id ?? null,
     searchedAt: payload.updated_at || payload.created_at || null,
     scanStatus: payload.scan_status || 'COMPLETED',
@@ -357,8 +358,16 @@ function Overview({ data, navigate, catalogTerm }) {
   const ai = data?.aiAnalysis;
 
   const isFastPath = ['PARTIAL_FAST_PATH', 'BROWSER_PENDING', 'SCANNING_BACKGROUND'].includes(data?.scanStatus);
+  const isPartial = ['PARTIAL', 'PARTIAL_MAX_PAGES', 'BROWSER_PARTIAL'].includes(data?.scanStatus);
   const isCompleted = data?.scanStatus === 'COMPLETED';
-  const tstCount = (data?.processes || []).filter(p => p.is_tst_recurso || p.tribunal === 'tst' || String(p.grau || '').includes('TST')).length;
+  const tstCount = data?.tstCount != null
+    ? data.tstCount
+    : (data?.processes || []).filter(p => (
+        p.is_tst_recurso ||
+        String(p.tribunal || '').toUpperCase() === 'TST' ||
+        String(p.grau || '').toUpperCase().includes('TST') ||
+        /\.5\.00\./.test(String(p.numero_processo || ''))
+      )).length;
 
   return (
     <div className="stack">
@@ -387,7 +396,7 @@ function Overview({ data, navigate, catalogTerm }) {
               Fast-Path ativo (&lt; 3s) · Varrendo em 2º plano
             </Tag>
           )}
-          {data?.scanStatus === 'BROWSER_PARTIAL' && <Tag type="amber">Varredura parcial encerrada</Tag>}
+          {isPartial && <Tag type="amber">Varredura Parcial</Tag>}
           {isCompleted && <Tag type="green"><Check size={13} style={{ display: 'inline', marginRight: '4px' }} /> Varredura Completa</Tag>}
           {tstCount > 0 && (
             <Tag type="purple">
@@ -1301,8 +1310,24 @@ export default function App() {
       if (['PARTIAL_FAST_PATH', 'IN_PROGRESS', 'BROWSER_PENDING'].includes(normalized.scanStatus)) {
         setScanProgress({ running: true, message: `Varrendo processos em lotes: ${normalized.totalProcesses || 50} identificados...` });
         try {
+          // Sem teto de páginas ou de lotes: o loop só termina quando o backend devolve fim real
+          // (COMPLETED / has_more=false), quando o usuário pede para calcular, ou após falhas
+          // consecutivas que não se recuperam com espera progressiva.
+          const MAX_CONSECUTIVE_FAILURES = 6;
+          const MAX_WAIT_SECONDS = 60;
           let currentPage = 2;
+          let prevSignature = null;
           let isDone = false;
+          let finalStatus = null;
+          let consecutiveFailures = 0;
+
+          const waitWithBackoff = async (baseSeconds, reason) => {
+            consecutiveFailures += 1;
+            const waitSec = Math.min(MAX_WAIT_SECONDS, Math.max(1, Number(baseSeconds) || 3) * consecutiveFailures);
+            setScanProgress({ running: true, message: `${reason}: aguardando ${waitSec}s e retomando na página ${currentPage}...` });
+            await new Promise(r => setTimeout(r, waitSec * 1000));
+          };
+
           while (!isDone && current()) {
             if (stopRequestedRef.current) break;
             let batchRes;
@@ -1310,13 +1335,15 @@ export default function App() {
               batchRes = await request(`/deep-scan-batch/${normalized.searchId}`, {
                 method: 'POST',
                 signal,
-                body: JSON.stringify({ page: currentPage, batch_size: 2 }),
+                body: JSON.stringify({ page: currentPage, batch_size: 10, prev_page_signature: prevSignature }),
               });
             } catch (batchErr) {
-              if (batchErr?.status === 429) {
-                const retrySec = Number(batchErr?.headers?.get?.('Retry-After') || 3);
-                setScanProgress({ running: true, message: `Aguardando ${retrySec}s por limite judicial (retomando na página ${currentPage})...` });
-                await new Promise(r => setTimeout(r, retrySec * 1000));
+              if (!current()) break;
+              const status = batchErr?.status;
+              // 429, 5xx (inclui timeout do Render) e falha de rede são transitórios: espera e retoma.
+              const transient = status === undefined || status === 429 || status >= 500;
+              if (transient && consecutiveFailures < MAX_CONSECUTIVE_FAILURES) {
+                await waitWithBackoff(3, status === 429 ? 'Limite de requisições' : 'Instabilidade temporária');
                 continue;
               }
               throw batchErr;
@@ -1324,18 +1351,24 @@ export default function App() {
 
             if (!current() || stopRequestedRef.current) break;
 
-            if (batchRes?.status === 'RATE_LIMITED') {
-              const waitSec = Number(batchRes?.retry_after_seconds || 3);
-              setScanProgress({ running: true, message: `Aguardando ${waitSec}s por limite judicial (retomando na página ${currentPage})...` });
-              await new Promise(r => setTimeout(r, waitSec * 1000));
+            if (batchRes?.status === 'RATE_LIMITED' || batchRes?.status === 'UPSTREAM_RETRY') {
+              if (batchRes?.last_page_signature) prevSignature = batchRes.last_page_signature;
+              currentPage = Number(batchRes?.next_page) || currentPage;
+              const reason = batchRes.status === 'RATE_LIMITED' ? 'Limite judicial (429)' : 'Tribunal instável';
+              await waitWithBackoff(batchRes?.retry_after_seconds, reason);
               continue;
             }
 
+            consecutiveFailures = 0;
             const currentTotal = batchRes?.total_acumulado ?? batchRes?.data?.total_processos ?? 0;
             if (current()) {
+              const layerLabel = batchRes?.layer === 2 ? 'Camada 2 · ' : 'Camada 1 · ';
+              const progressMessage = batchRes?.current_court && batchRes?.total_courts
+                ? `Varrendo Justiça do Trabalho (${layerLabel}${batchRes.current_court} — ${Math.min((batchRes.courts_completed ?? 0) + 1, batchRes.total_courts)}/${batchRes.total_courts} tribunais): ${currentTotal} processos trabalhistas identificados...`
+                : `Varrendo processos em lotes: ${currentTotal} identificados (página ${currentPage})...`;
               setScanProgress({
                 running: true,
-                message: `Varrendo processos em lotes: ${currentTotal} identificados (página ${currentPage})...`,
+                message: progressMessage,
               });
               if (batchRes?.data) {
                 const liveUpdate = normalize(batchRes.data);
@@ -1346,11 +1379,17 @@ export default function App() {
             }
 
             if (batchRes?.is_completed || batchRes?.status === 'COMPLETED' || batchRes?.has_more === false) {
+              finalStatus = batchRes?.status;
               isDone = true;
               break;
             }
 
-            currentPage = Number(batchRes?.next_page) || (currentPage + 2);
+            if (batchRes?.last_page_signature) prevSignature = batchRes.last_page_signature;
+            const nextPage = Number(batchRes?.next_page);
+            // No modo por tribunal, next_page volta para 1 ao avançar de TRT; no legado nunca retrocede.
+            currentPage = batchRes?.total_courts
+              ? (nextPage >= 1 ? nextPage : 1)
+              : (nextPage > currentPage ? nextPage : currentPage + 1);
           }
 
           if (current()) {
@@ -1360,8 +1399,9 @@ export default function App() {
                 const finalBatchRes = await request(`/deep-scan-batch/${normalized.searchId}`, {
                   method: 'POST',
                   signal,
-                  body: JSON.stringify({ finalize: true }),
+                  body: JSON.stringify({ finalize: true, manual_stop: true }),
                 });
+                if (finalBatchRes?.status) finalStatus = finalBatchRes.status;
                 if (finalBatchRes?.data) {
                   const finalLive = normalize(finalBatchRes.data);
                   if (finalLive && current()) {
@@ -1374,7 +1414,17 @@ export default function App() {
             if (current() && validSearchId(finalData?.searchId) === validSearchId(normalized.searchId)) {
               setData(prev => validSearchId(prev?.searchId) === validSearchId(normalized.searchId) ? finalData : prev);
             }
-            setScanProgress({ running: false, message: 'Varredura concluída com sucesso.' });
+            const isPartialResult = (
+              stopRequestedRef.current ||
+              ['PARTIAL', 'PARTIAL_MAX_PAGES', 'BROWSER_PARTIAL'].includes(finalStatus) ||
+              ['PARTIAL', 'PARTIAL_MAX_PAGES', 'BROWSER_PARTIAL'].includes(finalData?.scanStatus)
+            );
+            setScanProgress({
+              running: false,
+              message: isPartialResult
+                ? 'Varredura parcial concluída com os dados coletados até o momento (interrompida antes do fim).'
+                : 'Varredura concluída com sucesso.',
+            });
           }
         } catch {
           if (current()) setScanProgress({ running: false, message: 'Varredura parcial concluída: os dados acumulados foram preservados.' });

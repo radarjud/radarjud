@@ -57,12 +57,13 @@ def test_browser_owns_pagination_without_server_worker(client, scan_mocks):
 
 
 def test_mismatched_term_rejects_prefetch_and_keeps_server_fallback(client, scan_mocks):
-    first, analyze, submit = scan_mocks
+    first, analyze, _submit = scan_mocks
     response = _start(client, first, "OUTRA EMPRESA LTDA")
     assert response.status_code == 200
-    assert response.get_json()["scan_status"] == "PARTIAL_FAST_PATH"
+    payload = response.get_json()
+    assert payload["scan_status"] == "PARTIAL_FAST_PATH"
     assert analyze.call_args.kwargs["client_prefetched_items"] == []
-    submit.assert_called_once()
+    assert payload.get("idoneidade_economica", {}).get("labor_scan_cursor", {}).get("layer") == 1
 
 
 @pytest.mark.parametrize("complete,expected", [(True, "COMPLETED"), (False, "BROWSER_PARTIAL")])

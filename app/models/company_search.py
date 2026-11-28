@@ -179,12 +179,15 @@ class CompanySearch(db.Model):
                 "mensagem": "Nenhum contrato público localizado nas bases consultadas",
             }
 
+        tst_count = self._count_tst_processes()
+
         return {
             "id": self.id,
             "tenant_id": self.tenant_id,
             "company_name": self.company_name,
             "normalized_name": self.normalized_name,
             "total_processes": self.total_processes,
+            "tst_count": tst_count,
             "secrecy_count": self.secrecy_count,
             "secrecy_rate": self.secrecy_rate,
             "niveis_sigilo": niveis_sigilo,
@@ -220,6 +223,41 @@ class CompanySearch(db.Model):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+    def _count_tst_processes(self) -> int:
+        """Conta processos no TST diretamente sobre 100% dos registros persistidos no banco."""
+        from app.services.cnj_searcher import is_tst_process
+
+        rows = None
+        if self.id is not None:
+            try:
+                from app.models.process_record import ProcessRecord
+                rows = (
+                    db.session.query(
+                        ProcessRecord.numero_processo,
+                        ProcessRecord.tribunal,
+                        ProcessRecord.grau,
+                    )
+                    .filter(ProcessRecord.company_search_id == self.id)
+                    .all()
+                )
+            except Exception:
+                rows = None
+
+        if rows is not None:
+            return sum(
+                1 for num, trib, grau in rows
+                if is_tst_process(numero_processo=num, tribunal=trib, grau=grau)
+            )
+
+        return sum(
+            1 for p in (self.processes or [])
+            if is_tst_process(
+                numero_processo=getattr(p, "numero_processo", None),
+                tribunal=getattr(p, "tribunal", None),
+                grau=getattr(p, "grau", None),
+            )
+        )
 
     @staticmethod
     def _sanitize_logo_for_export(logo_obj):

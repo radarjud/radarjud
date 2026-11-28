@@ -872,10 +872,13 @@ class CNJMetadataOrchestrator:
                 scan_status = "RATE_LIMITED"
             elif status_code not in (200, 0):
                 scan_status = "ERROR"
+            elif fast_path:
+                scan_status = "PARTIAL_FAST_PATH"
             else:
                 scan_status = "COMPLETED"
 
             empty_res = self._calculate_metrics(company_name, [], scan_status=scan_status)
+            empty_res["has_more"] = bool(fast_path)
             empty_res["discovered_entities"] = discovered_entities
             empty_res["scan_status"] = scan_status
             empty_res["rate_limited"] = is_rate_limited
@@ -902,9 +905,8 @@ class CNJMetadataOrchestrator:
             processes = self._enrich_with_datajud(processes_map)
 
         # 3. Cálculo de métricas via BayesianRiskPredictor
-        # CRITÉRIO DE PARADA CORRETO: verifica se a página bruta tinha 50 itens
-        has_more = getattr(self.searcher, "last_page_has_more", False) or len(processes_map) >= 50
-        status = "PARTIAL_FAST_PATH" if (fast_path and has_more) else "COMPLETED"
+        # No fast_path, sempre habilita varredura profunda dos 25 tribunais trabalhistas (TST + TRT1..24).
+        status = "PARTIAL_FAST_PATH" if fast_path else "COMPLETED"
         metrics = self._calculate_metrics(company_name, processes, scan_status=status)
         metrics["discovered_entities"] = discovered_entities
 
