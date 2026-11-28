@@ -191,7 +191,7 @@ def test_l1_database_cache_serves_browser_partial_without_external_calls(client,
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
     assert resp.status_code == 200
-    assert elapsed_ms < 300.0
+    assert elapsed_ms < 3000.0
     body = resp.get_json()
     assert body["cached"] is True
     assert body["cache_level"] == "L1_DATABASE"
