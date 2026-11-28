@@ -157,7 +157,17 @@ def create_app(config_name: str = None, seed_catalog: bool = True) -> Flask:
                                          "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"))
                     conn.execute(db.text("CREATE UNIQUE INDEX IF NOT EXISTS uq_monitored_suppliers_tenant_cnpj ON monitored_suppliers (tenant_id, cnpj);"))
                     conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_monitored_suppliers_tenant_active ON monitored_suppliers (tenant_id, active);"))
+                    conn.execute(db.text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS plan VARCHAR(50) DEFAULT 'ESSENCIAL';"))
+                    conn.execute(db.text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS limite_mensal_consultas INTEGER DEFAULT 30;"))
                     conn.commit()
+
+            # Semeia usuários padrão de sistema (Admin e Analista) com idempotência estrita
+            try:
+                from app.seeds.user_seed import seed_default_users
+                seed_default_users(commit=True)
+            except Exception as e_user_seed:
+                db.session.rollback()
+                app.logger.debug("Seed de usuários padrão ignorado/já presente: %s", e_user_seed)
 
             # Pré-semeia e sincroniza CompanyRegistry com o catálogo completo quando vazio ou incompleto
             if seed_catalog:
