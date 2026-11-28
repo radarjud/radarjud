@@ -1088,7 +1088,7 @@ table.motive-table {
   border-radius: 12px;
   display: flex;
   flex-direction: column;
-  justify-content: space-between;
+  justify-content: flex-start;
 }
 
 .instancia-card-header {
