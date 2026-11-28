@@ -70,17 +70,19 @@ const isRecord = (value) => value !== null && typeof value === 'object' && !Arra
 function normalize(raw) {
   if (!isRecord(raw)) return null;
   const payload = isRecord(raw.data) ? raw.data : raw;
-  const riskScore = payload.indice_exposicao_financeira != null
-    ? Number(payload.indice_exposicao_financeira)
-    : payload.idoneidade_economica?.indice_exposicao_financeira != null
-      ? Number(payload.idoneidade_economica.indice_exposicao_financeira)
-      : payload.score_risco_terceirizacao != null
-        ? Number(payload.score_risco_terceirizacao)
-        : payload.overall_risk_score != null
-          ? Number(payload.overall_risk_score)
-          : payload.probabilidade_condenacao_geral_pct != null
-            ? Number(payload.probabilidade_condenacao_geral_pct)
-            : null;
+  const subRiskRaw = payload.risco_subsidiario?.percentual != null
+    ? Number(payload.risco_subsidiario.percentual)
+    : payload.score_risco_terceirizacao != null
+      ? Number(payload.score_risco_terceirizacao)
+      : payload.overall_risk_score != null
+        ? Number(payload.overall_risk_score)
+        : null;
+
+  const riskScore = subRiskRaw != null
+    ? subRiskRaw
+    : payload.probabilidade_condenacao_geral_pct != null
+      ? Number(payload.probabilidade_condenacao_geral_pct)
+      : null;
 
   const companyName = payload.empresa || payload.company_name || 'Empresa consultada';
   const total = Number(payload.total_processos ?? payload.total_processes ?? 0);
@@ -125,7 +127,8 @@ function normalize(raw) {
     : isRecord(payload.outcomes_summary) ? payload.outcomes_summary : {};
   const numCondenacoes = Number(outcomesObj.condenacoes ?? 0);
   const isPrevisaoBloqueada = Boolean(payload.previsao_bloqueada) || (numCondenacoes === 0 && total > 0);
-  const effectiveRiskScore = (total === 0 || isPrevisaoBloqueada) ? 0.0 : riskScore;
+  const effectiveRiskScore = (total === 0 || isPrevisaoBloqueada) ? 0.0 : (subRiskRaw ?? riskScore ?? 0.0);
+  const effectiveSubRisk = effectiveRiskScore;
 
   const subCount = Number(payload.condenacoes_subsidiarias_tomadoras_count ?? payload.condenacoes_subsidiarias_count ?? 0);
   const subTomadoras = Array.isArray(payload.tomadoras_subsidiarias_pj) ? payload.tomadoras_subsidiarias_pj : [];
@@ -176,7 +179,15 @@ function normalize(raw) {
     reasons: sepExec.rankingMotivos,
     rankingCondenacoes: sepExec.rankingCondenacoes,
     condenacaoPorMotivo: sepExec.condenacaoPorMotivo,
+    motivosProcesso: Array.isArray(payload.motivos_processo) ? payload.motivos_processo : sepExec.condenacaoPorMotivo,
     executionPhaseSummary: sepExec.executionPhaseSummary,
+    faseExecucao: isRecord(payload.fase_execucao) ? payload.fase_execucao : {
+      total_processos: sepExec.executionPhaseSummary?.total_processos ?? 0,
+      percentual_base: sepExec.executionPhaseSummary?.percentual_total ?? 0,
+      rotulo: 'Processos em Fase de Execução / Sentença Aplicada',
+      descricao: 'Processos já concluídos na fase de conhecimento e em etapa de cumprimento de sentença.',
+    },
+    comparativoInstancias: isRecord(payload.comparativo_instancias) ? payload.comparativo_instancias : null,
     outcomes: outcomesObj,
     secrecy: isRecord(payload.niveis_sigilo) ? payload.niveis_sigilo : null,
     predictions: Array.isArray(payload.plus_previsao_condenacao) ? payload.plus_previsao_condenacao : [],
@@ -184,7 +195,16 @@ function normalize(raw) {
     motivoBloqueioPrevisao: payload.motivo_bloqueio_previsao || (isPrevisaoBloqueada ? 'Previsão de condenação desativada por ausência de passivo condenatório prévio na amostra (presunção de conformidade e integridade probatória - Súmula 331 TST).' : null),
     idoneidadeEconomica: econ,
     sinaisSolvenciaPublica: payload.sinais_solvencia_publica || econ?.sinais_solvencia_publica || null,
-    subsidiaryRisk: subsidiaryRisk(rawEcon),
+    subsidiaryRisk: effectiveSubRisk,
+    riscoSubsidiario: isRecord(payload.risco_subsidiario) ? {
+      ...payload.risco_subsidiario,
+      percentual: effectiveSubRisk,
+    } : {
+      percentual: effectiveSubRisk,
+      faixa_exposicao: effectiveSubRisk <= 30.0 ? 'BAIXA' : (effectiveSubRisk < 60.0 ? 'MODERADA' : 'ALTA'),
+      rotulo_exposicao: effectiveSubRisk <= 30.0 ? 'Baixa Exposição Trabalhista' : (effectiveSubRisk < 60.0 ? 'Exposição Moderada — Blindagem Contratual Recomendada' : 'Alta Exposição — Provisionamento e Diligência Rigorosa'),
+      agravante_tst_aplicado: false,
+    },
     hasEconomicData: Boolean(rawEcon),
     logo: logo,
     processes: Array.isArray(payload.processos) ? payload.processos
@@ -355,12 +375,11 @@ function Overview({ data, navigate, catalogTerm }) {
     totalProcessos: data?.total,
   });
   const reasons = overviewExec.rankingMotivos;
-  const motiveTableRows = (
-    overviewExec.condenacaoPorMotivo.length
-      ? overviewExec.condenacaoPorMotivo
-      : overviewExec.rankingCondenacoes
-  ).filter((item) => !isExecutionPhaseLabel(item?.motivo));
-  const execPhase = overviewExec.executionPhaseSummary;
+  const motiveSource = (data?.motivosProcesso && data.motivosProcesso.length)
+    ? data.motivosProcesso
+    : (overviewExec.condenacaoPorMotivo.length ? overviewExec.condenacaoPorMotivo : overviewExec.rankingCondenacoes);
+  const motiveTableRows = motiveSource.filter((item) => !isExecutionPhaseLabel(item?.motivo));
+  const execPhase = data?.faseExecucao || overviewExec.executionPhaseSummary;
   const outcomes = data?.outcomes || {};
   const hasData = Boolean(data);
   const classified = Object.values(outcomes).reduce((sum, value) => sum + Number(value || 0), 0);
@@ -368,7 +387,7 @@ function Overview({ data, navigate, catalogTerm }) {
 
   const isFastPath = ['PARTIAL_FAST_PATH', 'BROWSER_PENDING', 'SCANNING_BACKGROUND'].includes(data?.scanStatus);
   const isCompleted = data?.scanStatus === 'COMPLETED';
-  const tstCount = (data?.processes || []).filter(p => p.is_tst_recurso || p.tribunal === 'tst' || String(p.grau || '').includes('TST')).length;
+  const tstCount = (data?.processes || []).filter(p => p.is_tst_recurso || p.tribunal === 'tst' || p.tribunal === 'TST' || String(p.grau || '').toUpperCase().includes('TST') || String(p.numero_processo || p.numero_cnj || '').includes('.5.00.')).length;
 
   return (
     <div className="stack">
@@ -414,58 +433,101 @@ function Overview({ data, navigate, catalogTerm }) {
 
       {hasData && <section className="prescriptive-hero" aria-label="Decisão e prescrição">
         <div className="prescriptive-decision">
-          <div><div className="eyebrow">RECOMENDAÇÃO DE CONTRATAÇÃO</div>
-          <h2>{businessText(ai?.recomendacao_homologacao || ai?.recomendacao || 'Recomendação não disponível')}</h2>
-          <p>{data.hasEconomicData ? businessText(data.idoneidadeEconomica?.cenario_badge || data.idoneidadeEconomica?.cenario_titulo || '') : 'Dados de solvência indisponíveis'}</p></div>
-          <div className="prescriptive-risk"><small>RISCO SUBSIDIÁRIO</small><strong>{data.subsidiaryRisk == null ? '—' : formatPercent(data.subsidiaryRisk)}</strong><span>Estimativa de risco ao contratante · Súmula 331 TST</span></div>
+          <div><div className="eyebrow">EXPOSIÇÃO DE RISCO SUBSIDIÁRIO</div>
+          <h2>{businessText(data.riscoSubsidiario?.rotulo_exposicao || ai?.recomendacao_homologacao || 'Baixa Exposição Trabalhista')}</h2>
+          <p>{data.hasEconomicData ? businessText(data.idoneidadeEconomica?.cenario_badge || data.idoneidadeEconomica?.cenario_titulo || '') : 'Dados cadastrais da Receita Federal'}</p></div>
+          <div className="prescriptive-risk">
+            <small>RISCO SUBSIDIÁRIO</small>
+            <strong>{data.subsidiaryRisk == null ? '—' : formatPercent(data.subsidiaryRisk)}</strong>
+            <span title="Cálculo estritamente jurídico, ponderado por fase processual (condenações no TST e em execução possuem peso integral; dados financeiros não reduzem o risco).">
+              Cálculo estritamente jurídico, ponderado por fase processual (condenações no TST e em execução possuem peso integral; dados financeiros não reduzem o risco).
+            </span>
+          </div>
         </div>
-        <h3>O que fazer</h3>
-        {Array.isArray(ai?.recomendacoes_compliance) && ai.recomendacoes_compliance.length ? <ul>{ai.recomendacoes_compliance.map((item,i)=><li key={i}>{businessText(item)}</li>)}</ul> : <p>Prescrições ainda não disponibilizadas. Consulte o parecer antes de decidir.</p>}
+        <h3>O que fazer (Blindagem da Contratante)</h3>
+        {Array.isArray(ai?.recomendacoes_compliance) && ai.recomendacoes_compliance.length ? (
+          <ul>{ai.recomendacoes_compliance.map((item,i)=><li key={i}>{businessText(item)}</li>)}</ul>
+        ) : (
+          <ul>
+            <li>Constituir aporte de caixa reserva / provisão financeira ou conta vinculada para cobrir eventuais passivos caso a empresa opte por seguir com a contratação.</li>
+            <li>Exigir mensalmente folhas de ponto, comprovantes de pagamento de horas extras, holerites e guias de recolhimento de FGTS/INSS dos colaboradores alocados.</li>
+            <li>Incluir cláusulas contratuais de retenção de faturas em caso de inadimplência trabalhista, seguro-garantia e direito de regresso.</li>
+          </ul>
+        )}
       </section>}
-      {/* Condenações por Motivo do Processo (US-18) */}
+
+      {/* Bloco dedicado para Processos em Fase de Execução / Sentença Aplicada (Seção 4.2) */}
+      {((data?.faseExecucao && data.faseExecucao.total_processos > 0) || (execPhase && execPhase.total_processos > 0)) && (
+        <section className="card panel execution-phase-card" aria-label="Processos em Fase de Execução / Sentença Aplicada">
+          <div className="execution-phase-header">
+            <div className="execution-phase-copy">
+              <h3>{data?.faseExecucao?.rotulo || 'Processos em Fase de Execução / Sentença Aplicada'}</h3>
+              <p>Processos já concluídos na fase de conhecimento e em etapa de cumprimento de sentença, separados dos motivos de origem para não distorcer a análise de causas trabalhistas.</p>
+            </div>
+            <div className="execution-phase-kpi">
+              <strong>{formatNumber(data?.faseExecucao?.total_processos ?? execPhase.total_processos)} processo(s)</strong>
+              <span>{formatPercent(data?.faseExecucao?.percentual_base ?? execPhase.percentual_total)} do total analisado</span>
+            </div>
+          </div>
+          {Array.isArray(execPhase?.rotulos) && execPhase.rotulos.length > 0 && (
+            <div className="execution-phase-badges">
+              {execPhase.rotulos.map((rotulo, idx) => (
+                <span key={`${rotulo}-${idx}`} className="tag gray execution-phase-badge">
+                  {rotulo}
+                </span>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* Condenações por Motivo do Processo (Seção 4.3 - Sem Execução e Sem Scroll Horizontal) */}
       {motiveTableRows.length > 0 && (
         <Panel
           title="Condenações por Motivo do Processo"
-          subtitle="Histórico de condenações por assunto e faixa provável de variação"
+          subtitle="Histórico de condenações por assunto e faixa provável de variação (excluídas execuções)"
         >
-          <div className="table-scroll">
-            <table className="responsive-table">
+          <div className="motive-table-container">
+            <table className="motive-table">
               <thead>
                 <tr>
-                  <th>Motivo / Assunto do Processo</th>
-                  <th style={{ textAlign: 'right' }}>Processos Mapeados</th>
-                  <th style={{ textAlign: 'right' }}>Condenações</th>
-                  <th style={{ textAlign: 'right' }}>Taxa de Condenação</th>
-                  <th style={{ textAlign: 'right' }}>Faixa de Variação</th>
+                  <th style={{ width: '36%' }}>Motivo do Processo</th>
+                  <th style={{ width: '14%', textAlign: 'right' }}>Mapeados</th>
+                  <th style={{ width: '15%', textAlign: 'right' }}>Condenações</th>
+                  <th style={{ width: '15%', textAlign: 'right' }}>Taxa</th>
+                  <th style={{ width: '20%', textAlign: 'right' }}>Faixa Provável</th>
                 </tr>
               </thead>
               <tbody>
                 {motiveTableRows.map((item, index) => {
-                  const totalProc = item.total_processos ?? item.total ?? item.count ?? null;
+                  const totalProc = item.processos_mapeados ?? item.total_processos ?? item.total ?? item.count ?? null;
                   const condenacoes = item.condenacoes ?? item.quantidade_condenacoes ?? item.quantidade ?? 0;
-                  const taxa = item.taxa_condenacao ?? item.taxa_no_motivo ?? item.taxa_condenacao_no_motivo ?? item.taxa_perda_no_motivo ?? null;
-                  const faixa = item.faixa_variacao || "—";
+                  const taxa = item.taxa_condenacao ?? item.taxa_no_motivo ?? item.taxa_condenacao_no_motivo ?? null;
+                  const faixa = item.faixa_variacao || (item.faixa_variacao_min != null && item.faixa_variacao_max != null ? `${formatPercent(item.faixa_variacao_min)} a ${formatPercent(item.faixa_variacao_max)}` : "—");
                   const isBlockedZero = condenacoes === 0;
 
                   return (
-                    <tr key={`${item.motivo}-${index}`}>
-                      <td data-label="Motivo / Assunto" className="full-width">
+                    <tr key={`${item.motivo}-${index}`} className="motive-table-row">
+                      <td className="col-motivo">
                         <b>{item.motivo}</b>
                       </td>
-                      <td data-label="Processos Mapeados" style={{ textAlign: 'right' }}>
+                      <td className="col-mapeados" style={{ textAlign: 'right' }}>
+                        <span className="mobile-col-label">Mapeados: </span>
                         <span>{totalProc == null ? "—" : formatNumber(totalProc)}</span>
                       </td>
-                      <td data-label="Condenações" style={{ textAlign: 'right' }}>
+                      <td className="col-condenacoes" style={{ textAlign: 'right' }}>
+                        <span className="mobile-col-label">Condenações: </span>
                         <span style={{ fontWeight: 600, color: condenacoes > 0 ? '#c34a4a' : '#25865a' }}>
                           {formatNumber(condenacoes)}
                         </span>
                       </td>
-                      <td data-label="Taxa de Condenação" style={{ textAlign: 'right' }}>
+                      <td className="col-taxa" style={{ textAlign: 'right' }}>
                         <Tag type={taxa == null ? 'gray' : isBlockedZero ? 'green' : taxa >= 60 ? 'red' : taxa >= 35 ? 'amber' : 'green'}>
                           {taxa == null ? "—" : formatPercent(taxa)}
                         </Tag>
                       </td>
-                      <td data-label="Faixa de Variação" style={{ textAlign: 'right' }}>
+                      <td className="col-faixa" style={{ textAlign: 'right' }}>
+                        <span className="mobile-col-label">Faixa: </span>
                         <span style={{ fontSize: '12px', color: '#556677', fontWeight: 500 }}>
                           {faixa}
                         </span>
@@ -477,34 +539,75 @@ function Overview({ data, navigate, catalogTerm }) {
             </table>
           </div>
           <div className="muted-note" style={{ marginTop: '14px' }}>
-            <BarChart3 size={15} /> Taxas por assunto conforme os dados disponíveis. O símbolo — indica informação não disponibilizada.
+            <BarChart3 size={15} /> Estimativas por motivo sem rolagem lateral em desktop, tablet ou mobile. Causas em execução são tratadas em painel exclusivo.
           </div>
         </Panel>
       )}
 
-      {/* Bloco dedicado para Processos em Fase de Execução / Sentença Aplicada */}
-      {execPhase && execPhase.total_processos > 0 && (
-        <section className="card panel execution-phase-card" aria-label="Processos em Fase de Execução / Sentença Aplicada">
-          <div className="execution-phase-header">
-            <div className="execution-phase-copy">
-              <h3>Processos em Fase de Execução / Sentença Aplicada</h3>
-              <p>{EXECUTION_PHASE_DESCRIPTION}</p>
+      {/* Painel Comparativo: Diagnóstico por Instância (TRTs vs. TST) (Seção 4.4) */}
+      {hasData && (
+        <Panel
+          title="Diagnóstico por Instância (TRTs vs. TST)"
+          subtitle="Comportamento da empresa nas instâncias ordinárias e na instância máxima trabalhista"
+        >
+          <div className="instancias-grid">
+            <div className="instancia-card card">
+              <div className="instancia-card-header">
+                <span className="instancia-tag tag blue">TRTs · 1ª e 2ª Instâncias</span>
+                <h4>Instâncias Ordinárias Regionais</h4>
+              </div>
+              <div className="instancia-stats">
+                <div className="instancia-stat-item">
+                  <small>Total Julgados</small>
+                  <strong>{formatNumber(data?.comparativoInstancias?.trt?.julgados ?? (outcomes.condenacoes + outcomes.acordos + outcomes.improcedentes))}</strong>
+                </div>
+                <div className="instancia-stat-item">
+                  <small>Taxa de Condenação nos TRTs</small>
+                  <strong style={{ color: (data?.comparativoInstancias?.trt?.taxa_condenacao ?? 0) >= 50 ? '#c34a4a' : '#245a81' }}>
+                    {formatPercent(data?.comparativoInstancias?.trt?.taxa_condenacao ?? (outcomes.condenacoes > 0 && (outcomes.condenacoes + outcomes.acordos + outcomes.improcedentes) > 0 ? (outcomes.condenacoes / (outcomes.condenacoes + outcomes.acordos + outcomes.improcedentes)) * 100 : 0))}
+                  </strong>
+                </div>
+                <div className="instancia-stat-item">
+                  <small>Acordos / Favoráveis</small>
+                  <strong style={{ color: '#25865a' }}>
+                    {formatNumber((data?.comparativoInstancias?.trt?.acordos ?? outcomes.acordos) + (data?.comparativoInstancias?.trt?.favoraveis ?? outcomes.improcedentes))}
+                  </strong>
+                </div>
+              </div>
             </div>
-            <div className="execution-phase-kpi">
-              <strong>{formatNumber(execPhase.total_processos)} processo(s)</strong>
-              <span>{formatPercent(execPhase.percentual_total)} do total identificado</span>
+
+            <div className="instancia-card card">
+              <div className="instancia-card-header">
+                <span className="instancia-tag tag purple">TST · Instância Máxima</span>
+                <h4>Tribunal Superior do Trabalho</h4>
+              </div>
+              <div className="instancia-stats">
+                <div className="instancia-stat-item">
+                  <small>Processos Finalizados no TST</small>
+                  <strong>{formatNumber(data?.comparativoInstancias?.tst?.finalizados ?? tstCount)}</strong>
+                </div>
+                <div className="instancia-stat-item">
+                  <small>Taxa de Condenação Mantida</small>
+                  <strong style={{ color: (data?.comparativoInstancias?.tst?.taxa_condenacao ?? 0) >= 50 ? '#c34a4a' : '#245a81' }}>
+                    {formatPercent(data?.comparativoInstancias?.tst?.taxa_condenacao ?? 0)}
+                  </strong>
+                </div>
+                <div className="instancia-stat-item">
+                  <small>Taxa de Reversão Recursal</small>
+                  <strong style={{ color: '#25865a' }}>
+                    {formatPercent(data?.comparativoInstancias?.tst?.taxa_reversao_recurso ?? 0)}
+                  </strong>
+                </div>
+              </div>
+              {(data?.comparativoInstancias?.tst?.amostra_reduzida ?? (tstCount < 10)) && (
+                <div className="amostra-reduzida-alert">
+                  <AlertTriangle size={14} style={{ display: 'inline', marginRight: '6px', verticalAlign: '-2px' }} />
+                  Amostra reduzida no TST (menos de 10 julgados) — indicador apenas informativo.
+                </div>
+              )}
             </div>
           </div>
-          {Array.isArray(execPhase.rotulos) && execPhase.rotulos.length > 0 && (
-            <div className="execution-phase-badges">
-              {execPhase.rotulos.map((rotulo, idx) => (
-                <span key={`${rotulo}-${idx}`} className="tag gray execution-phase-badge">
-                  {rotulo}
-                </span>
-              ))}
-            </div>
-          )}
-        </section>
+        </Panel>
       )}
 
 
@@ -852,9 +955,14 @@ function ProcessResults({ data }) {
                   <tr key={process.id || process.numero_processo || index}>
                     <td data-label="Processo" className="mono full-width">
                       <div className="process-cell-content">
-                        <span className="process-number-text">{formatProcessNumber(process.numero_processo || process.process_number)}</span>
-                        {(process.is_tst_recurso || String(process.tribunal || '').toUpperCase() === 'TST' || String(process.grau || '').includes('TST')) && (
+                        <span className="process-number-text">{formatProcessNumber(process.numero_processo || process.process_number || process.numero_cnj)}</span>
+                        {process.instancia_maxima_finalizado ? (
+                          <Tag type="purple">Não cabem mais recursos (Instância Máxima — TST)</Tag>
+                        ) : (process.is_tst_recurso || String(process.tribunal || '').toUpperCase() === 'TST' || String(process.grau || '').includes('TST') || String(process.numero_processo || '').includes('.5.00.')) ? (
                           <Tag type="purple">Instância Superior TST</Tag>
+                        ) : null}
+                        {process.fase_processual === 'EXECUCAO' && (
+                          <Tag type="amber">Fase de Execução</Tag>
                         )}
                       </div>
                     </td>

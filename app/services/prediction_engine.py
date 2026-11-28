@@ -105,9 +105,10 @@ def normalize_execution_phase_payload(
 
     total_processos = safe_int(payload.get("total_processos"), default=0) or 0
     existing_exec = payload.get("execution_phase_summary")
+    existing_fase_exec = payload.get("fase_execucao")
     ranking = payload.get("ranking_motivos") or []
     ranking_cond = payload.get("ranking_motivos_condenacao") or []
-    cpm = payload.get("condenacao_por_motivo") or []
+    cpm = payload.get("condenacao_por_motivo") or payload.get("motivos_processo") or []
 
     def _item_label(item: Any) -> str:
         if isinstance(item, dict):
@@ -178,10 +179,92 @@ def normalize_execution_phase_payload(
             "descricao": EXECUTION_PHASE_DESCRIPTION,
         }
 
+    # Normalização de fase_execucao padronizada pelo contrato novo
+    if isinstance(existing_fase_exec, dict) and "total_processos" in existing_fase_exec:
+        fase_exec_dict = {
+            "total_processos": safe_int(existing_fase_exec.get("total_processos"), default=0) or 0,
+            "percentual_base": round(float(existing_fase_exec.get("percentual_base", 0.0) or 0.0), 1),
+            "rotulo": existing_fase_exec.get("rotulo") or "Processos em Fase de Execução / Sentença Aplicada",
+            "descricao": existing_fase_exec.get("descricao") or "Processos já concluídos na fase de conhecimento e em etapa de cumprimento de sentença.",
+        }
+    else:
+        fase_exec_dict = {
+            "total_processos": summary["total_processos"],
+            "percentual_base": summary["percentual_total"],
+            "rotulo": "Processos em Fase de Execução / Sentença Aplicada",
+            "descricao": "Processos já concluídos na fase de conhecimento e em etapa de cumprimento de sentença.",
+        }
+
+    # Normalização do Risco Subsidiário estruturado (sem peso de solvência)
+    raw_risco = payload.get("risco_subsidiario")
+    if isinstance(raw_risco, dict) and "percentual" in raw_risco:
+        pct_risco = round(float(raw_risco.get("percentual", 0.0) or 0.0), 1)
+        faixa = raw_risco.get("faixa_exposicao") or ("BAIXA" if pct_risco <= 30.0 else ("MODERADA" if pct_risco < 60.0 else "ALTA"))
+        rotulo = raw_risco.get("rotulo_exposicao") or (
+            "Baixa Exposição Trabalhista" if faixa == "BAIXA"
+            else ("Exposição Moderada — Blindagem Contratual Recomendada" if faixa == "MODERADA"
+                  else "Alta Exposição — Provisionamento e Diligência Rigorosa")
+        )
+        risco_dict = {
+            "percentual": pct_risco,
+            "faixa_exposicao": faixa,
+            "rotulo_exposicao": rotulo,
+            "metodologia_resumo": raw_risco.get("metodologia_resumo") or "Ponderado por definitividade: TST/Execução peso 1.0, TRT recorrível 0.85, Acordo 0.55",
+            "agravante_tst_aplicado": bool(raw_risco.get("agravante_tst_aplicado", False)),
+        }
+    else:
+        try:
+            pct_risco = round(float(raw_risco if raw_risco is not None else (payload.get("score_risco_terceirizacao") or payload.get("overall_risk_score") or 0.0)), 1)
+        except (ValueError, TypeError):
+            pct_risco = 0.0
+        faixa = "BAIXA" if pct_risco <= 30.0 else ("MODERADA" if pct_risco < 60.0 else "ALTA")
+        rotulo = (
+            "Baixa Exposição Trabalhista" if faixa == "BAIXA"
+            else ("Exposição Moderada — Blindagem Contratual Recomendada" if faixa == "MODERADA"
+                  else "Alta Exposição — Provisionamento e Diligência Rigorosa")
+        )
+        risco_dict = {
+            "percentual": pct_risco,
+            "faixa_exposicao": faixa,
+            "rotulo_exposicao": rotulo,
+            "metodologia_resumo": "Ponderado por definitividade: TST/Execução peso 1.0, TRT recorrível 0.85, Acordo 0.55",
+            "agravante_tst_aplicado": False,
+        }
+
+    # Normalização de comparativo_instancias
+    comp_inst = payload.get("comparativo_instancias")
+    if not isinstance(comp_inst, dict) or "trt" not in comp_inst or "tst" not in comp_inst:
+        comp_inst = {
+            "trt": {
+                "total_processos": total_processos,
+                "julgados": safe_int(payload.get("total_julgados"), default=0) or 0,
+                "condenacoes": safe_int((payload.get("desfechos_sentencas") or {}).get("condenacoes"), default=0) or 0,
+                "acordos": safe_int((payload.get("desfechos_sentencas") or {}).get("acordos"), default=0) or 0,
+                "favoraveis": safe_int((payload.get("desfechos_sentencas") or {}).get("improcedentes"), default=0) or 0,
+                "em_aberto": safe_int((payload.get("desfechos_sentencas") or {}).get("em_aberto"), default=0) or 0,
+                "taxa_condenacao": float(payload.get("taxa_historica_condenacao_pct") or 0.0),
+            },
+            "tst": {
+                "total_processos": 0,
+                "finalizados": 0,
+                "condenacoes_mantidas": 0,
+                "favoraveis_ou_revertidos": 0,
+                "taxa_condenacao": 0.0,
+                "taxa_reversao_recurso": 0.0,
+                "amostra_reduzida": True,
+            },
+        }
+
     payload["ranking_motivos"] = filtered_ranking
     payload["ranking_motivos_condenacao"] = filtered_ranking_cond
     payload["condenacao_por_motivo"] = filtered_cpm
+    payload["motivos_processo"] = filtered_cpm
     payload["execution_phase_summary"] = summary
+    payload["fase_execucao"] = fase_exec_dict
+    payload["risco_subsidiario"] = risco_dict
+    payload["comparativo_instancias"] = comp_inst
+    payload["score_risco_terceirizacao"] = risco_dict["percentual"]
+    payload["overall_risk_score"] = risco_dict["percentual"]
     return payload
 
 
@@ -477,13 +560,17 @@ def classify_process_canonical_motive(process: Dict[str, Any]) -> str:
     if material_candidates:
         candidates = material_candidates
 
+    # Se houver candidatos materiais, filtra rótulos de execução antes de normalizar
+    non_exec_candidates = [c for c in candidates if not is_execution_phase_label(c)]
+    if non_exec_candidates:
+        candidates = non_exec_candidates
+
     full_normalized = " ".join(normalize_subject_text(c) for c in candidates)
     if not full_normalized.strip() or full_normalized.strip() in ("assunto nao especificado", "nao informado"):
         return "Assunto não especificado"
 
-    # Regras de prioridade determinística para classificação canônica:
-    # 1. Execução / Cumprimento de Sentença
-    if any(k in full_normalized for k in (
+    # 1. Execução / Cumprimento de Sentença (APENAS se não houver temas substantivos identificados)
+    if not non_exec_candidates and any(k in full_normalized for k in (
         "execuc", "cumprimento de senten", "liquidac", "penhora", "sisbajud",
         "bloqueio judicial", "expropriac", "desconsideracao da personalidade",
     )):
@@ -557,9 +644,10 @@ def build_condenacao_por_motivo(processes: List[Dict[str, Any]]) -> List[Dict[st
     Agrupa 100% dos processos mapeados em categorias canônicas de motivo, calculando
     a taxa individual de condenação e a faixa de variação amigável (sem slice arbitrário).
     Invariantes:
-    - sum(item['total_processos'] for item in condenacao_por_motivo) == len(processes)
+    - sum(item['total_processos'] for item in condenacao_por_motivo) == len(substantivos)
     - Regra de bloqueio: condenacoes == 0 -> taxa_condenacao == 0.0 e faixa_variacao == '0,0% a 0,0%'
     - Ordenação determinística por maior incidência de condenações (desempate por total_processos).
+    - Exclusão estrita de 'Execução / Cumprimento de Sentença'.
     """
     if not processes:
         return []
@@ -568,7 +656,7 @@ def build_condenacao_por_motivo(processes: List[Dict[str, Any]]) -> List[Dict[st
     grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for p in processes:
         motive = classify_process_canonical_motive(p)
-        if motive == "Execução / Cumprimento de Sentença":
+        if motive == "Execução / Cumprimento de Sentença" or is_execution_phase_label(motive):
             continue
         grouped[motive].append(p)
 
@@ -581,6 +669,8 @@ def build_condenacao_por_motivo(processes: List[Dict[str, Any]]) -> List[Dict[st
         if condenacoes == 0:
             taxa_cond = 0.0
             faixa_var = "0,0% a 0,0%"
+            lo_val = 0.0
+            hi_val = 0.0
         else:
             taxa_cond = round((condenacoes / total_proc) * 100.0, 1)
             # Prior Dirichlet não-informativo (1/3) na simplex tripartida
@@ -588,20 +678,388 @@ def build_condenacao_por_motivo(processes: List[Dict[str, Any]]) -> List[Dict[st
             b0 = 1.0 / 3.0
             lo = beta_ppf(0.05, condenacoes + a0, (total_proc - condenacoes) + b0) * 100.0
             hi = beta_ppf(0.95, condenacoes + a0, (total_proc - condenacoes) + b0) * 100.0
+            lo_val = round(lo, 1)
+            hi_val = round(hi, 1)
             lo_str = f"{lo:.1f}".replace(".", ",")
             hi_str = f"{hi:.1f}".replace(".", ",")
             faixa_var = f"{lo_str}% a {hi_str}%"
 
         results.append({
             "motivo": motivo,
+            "processos_mapeados": total_proc,
             "total_processos": total_proc,
             "condenacoes": condenacoes,
             "taxa_condenacao": taxa_cond,
+            "faixa_variacao_min": lo_val,
+            "faixa_variacao_max": hi_val,
             "faixa_variacao": faixa_var,
         })
 
     results.sort(key=lambda x: (x["condenacoes"], x["total_processos"]), reverse=True)
     return results
+
+
+def is_tst_process(p: Dict[str, Any]) -> bool:
+    """Verifica se o processo pertence à esfera do TST (Instância Máxima)."""
+    if not isinstance(p, dict):
+        return False
+    if p.get("is_tst_recurso") is True:
+        return True
+    trib = str(p.get("tribunal") or p.get("siglaTribunal") or p.get("sigla_tribunal") or "").strip().upper()
+    if trib == "TST" or "TST" in trib:
+        return True
+    grau = str(p.get("grau") or "").strip().upper()
+    if "TST" in grau:
+        return True
+    num = str(p.get("numero_processo") or p.get("numeroProcesso") or p.get("numero_cnj") or "").strip()
+    if ".5.00." in num:
+        return True
+    return False
+
+
+def is_process_finalized_tst(p: Dict[str, Any]) -> bool:
+    """
+    Verifica se um processo no TST já possui decisão/acórdão finalizado (não cabem mais recursos).
+    Aplica-se independentemente de ter resultado em condenação, acordo ou improcedência.
+    """
+    if not is_tst_process(p):
+        return False
+    if p.get("instancia_maxima_finalizado") is True:
+        return True
+    status_desfecho = str(p.get("statusDesfecho") or "").strip().upper()
+    raw_status = str(p.get("sentence_outcome") or "").strip().lower()
+    fase = str(p.get("fase_processual") or "").strip().upper()
+
+    if fase in ("INSTANCIA_MAXIMA", "FINALIZADO", "TRANSITADO"):
+        return True
+    if status_desfecho in ("CONDENACAO", "ACORDO", "IMPROCEDENTE", "EXTINTO"):
+        return True
+    if raw_status in (
+        "condenacoes", "condenacao", "acordos", "acordo",
+        "improcedentes", "improcedente", "extintos_sem_merito",
+        "baixa_arquivado", "arquivado", "desistencia"
+    ):
+        return True
+    if raw_status == "em_aberto" or status_desfecho == "EM_ABERTO":
+        return False
+    return bool(status_desfecho or raw_status)
+
+
+def is_process_execution_phase(p: Dict[str, Any]) -> bool:
+    """
+    Verifica se o processo se encontra em fase de Execução / Cumprimento de Sentença.
+    """
+    if not isinstance(p, dict):
+        return False
+    fase = str(p.get("fase_processual") or "").strip().upper()
+    if any(k in fase for k in ("EXECU", "CUMPRIMENTO", "LIQUIDA")):
+        return True
+
+    classes_pje = p.get("classes_pje") or []
+    if isinstance(classes_pje, list):
+        for c in classes_pje:
+            c_name = ""
+            if isinstance(c, dict):
+                c_name = str(c.get("nome") or c.get("descricao") or "")
+            elif isinstance(c, str):
+                c_name = c
+            if is_execution_phase_label(c_name):
+                return True
+
+    subjects = p.get("subjects") or []
+    if isinstance(subjects, list):
+        for s in subjects:
+            if is_execution_phase_label(str(s)):
+                return True
+
+    primary = str(p.get("primary_subject") or "")
+    if is_execution_phase_label(primary):
+        return True
+
+    obs = str(p.get("observation") or "").lower()
+    if any(k in obs for k in (
+        "execucao", "execução", "cumprimento de sentenca", "cumprimento de sentença",
+        "liquidacao", "liquidação", "sisbajud", "penhora", "bloqueio judicial"
+    )):
+        return True
+
+    return False
+
+
+def calculate_weighted_subsidiary_risk_and_instances(
+    processes: List[Dict[str, Any]],
+    previsao_bloqueada: bool = False,
+    sub_count: int = 0,
+) -> Dict[str, Any]:
+    """
+    Implementa a Nova Fórmula de Risco Subsidiário Ponderado por Definitividade:
+    Tefetiva = [(1,00 * Cdef) + (0.85 * Crec) + (0.55 * A)] / [Cdef + Crec + A + I] * 100
+
+    Estados Processuais:
+    - Instância Máxima (TST): Processos finalizados no TST. Peso 1,00 se condenado.
+    - Definitivo / Execução (TRTs): Processos nos TRTs em fase de execução. Peso 1,00.
+    - Condenação Recorrível (TRTs): Condenações nos TRTs fora de execução. Peso 0,85.
+    - Acordo Homologado: Processos encerrados por acordo. Peso 0,55.
+    - Improcedente / Favorável: Processos julgados sem condenação. Peso 0,00.
+
+    Agravante por Reincidência no TST (Proteção Amostral):
+    - Volume mínimo confiável: NTST >= 10 processos julgados no TST.
+    - Padrão desfavorável: Taxa de condenação mantida no TST > taxa dos TRTs OU condenação subsidiária mantida no TST.
+    - Quando ambas são verdadeiras: agravante de +10% relativo (teto de 100%).
+    """
+    total_procs = len(processes or [])
+    if total_procs == 0:
+        return {
+            "risco_subsidiario": {
+                "percentual": 0.0,
+                "faixa_exposicao": "BAIXA",
+                "rotulo_exposicao": "Baixa Exposição Trabalhista",
+                "metodologia_resumo": "Ponderado por definitividade: TST/Execução peso 1.0, TRT recorrível 0.85, Acordo 0.55",
+                "agravante_tst_aplicado": False,
+            },
+            "fase_execucao": {
+                "total_processos": 0,
+                "percentual_base": 0.0,
+                "rotulo": "Processos em Fase de Execução / Sentença Aplicada",
+                "descricao": "Processos já concluídos na fase de conhecimento e em etapa de cumprimento de sentença.",
+            },
+            "comparativo_instancias": {
+                "trt": {
+                    "total_processos": 0,
+                    "julgados": 0,
+                    "condenacoes": 0,
+                    "acordos": 0,
+                    "favoraveis": 0,
+                    "em_aberto": 0,
+                    "taxa_condenacao": 0.0,
+                },
+                "tst": {
+                    "total_processos": 0,
+                    "finalizados": 0,
+                    "condenacoes_mantidas": 0,
+                    "favoraveis_ou_revertidos": 0,
+                    "taxa_condenacao": 0.0,
+                    "taxa_reversao_recurso": 0.0,
+                    "amostra_reduzida": True,
+                },
+            },
+            "processos_amostra": [],
+        }
+
+    trt_procs: List[Dict[str, Any]] = []
+    tst_procs: List[Dict[str, Any]] = []
+
+    for p in processes:
+        if is_tst_process(p):
+            tst_procs.append(p)
+        else:
+            trt_procs.append(p)
+
+    # Contabilidade TRT
+    cond_trt = 0
+    acordos_trt = 0
+    fav_trt = 0
+    em_aberto_trt = 0
+
+    # Contabilidade TST
+    cond_tst = 0
+    fav_tst = 0
+    acordos_tst = 0
+    em_aberto_tst = 0
+
+    # Categorias da Fórmula Ponderada
+    c_def = 0.0
+    c_rec = 0.0
+    total_a = 0.0
+    total_i = 0.0
+    total_execucao = 0
+
+    for p in processes:
+        in_tst = is_tst_process(p)
+        in_exec = is_process_execution_phase(p)
+        if in_exec:
+            total_execucao += 1
+
+        raw_status = str(p.get("sentence_outcome") or "em_aberto").strip().lower()
+        status_desfecho = str(p.get("statusDesfecho") or "").strip().upper()
+
+        is_cond = (
+            status_desfecho == "CONDENACAO"
+            or raw_status in ("condenacoes", "condenacao")
+            or is_process_conviction(p)
+        )
+        is_acordo = status_desfecho == "ACORDO" or raw_status in ("acordos", "acordo")
+        is_imp = status_desfecho == "IMPROCEDENTE" or raw_status in (
+            "improcedentes", "improcedente", "extintos_sem_merito", "extinto_sem_merito"
+        )
+        is_open = not (is_cond or is_acordo or is_imp)
+
+        # Atualiza métricas por esfera
+        if in_tst:
+            if is_cond:
+                cond_tst += 1
+            elif is_acordo:
+                acordos_tst += 1
+                fav_tst += 1
+            elif is_imp:
+                fav_tst += 1
+            else:
+                em_aberto_tst += 1
+        else:
+            if is_cond:
+                cond_trt += 1
+            elif is_acordo:
+                acordos_trt += 1
+            elif is_imp:
+                fav_trt += 1
+            else:
+                em_aberto_trt += 1
+
+        # Classificação nos pesos da fórmula de Tefetiva
+        if in_tst:
+            if is_cond:
+                c_def += 1.0  # TST condenado: peso 1.00
+            elif is_acordo:
+                total_a += 1.0  # Acordo: peso 0.55
+            elif is_imp:
+                total_i += 1.0  # Favorável/revertido: peso 0.00
+        else:
+            if in_exec and is_cond:
+                c_def += 1.0  # Execução TRT com condenação: peso 1.00
+            elif in_exec and is_open:
+                # Execução sem status explicitado: sentença já aplicada (peso 1.00)
+                c_def += 1.0
+            elif is_cond:
+                c_rec += 1.0  # TRT recorrível: peso 0.85
+            elif is_acordo:
+                total_a += 1.0  # Acordo: peso 0.55
+            elif is_imp:
+                total_i += 1.0  # Improcedente: peso 0.00
+
+    # Totais consolidados TRT
+    julgados_trt = cond_trt + acordos_trt + fav_trt
+    taxa_cond_trt = round((cond_trt / julgados_trt) * 100.0, 1) if julgados_trt > 0 else 0.0
+
+    # Totais consolidados TST
+    finalizados_tst = cond_tst + fav_tst
+    taxa_cond_tst = round((cond_tst / finalizados_tst) * 100.0, 1) if finalizados_tst > 0 else 0.0
+    taxa_rev_tst = round((fav_tst / finalizados_tst) * 100.0, 1) if finalizados_tst > 0 else 0.0
+    amostra_reduzida_tst = finalizados_tst < 10
+
+    # Cálculo da Tefetiva
+    denominador = c_def + c_rec + total_a + total_i
+    if denominador > 0 and not previsao_bloqueada:
+        t_efetiva = (
+            (1.00 * c_def) + (0.85 * c_rec) + (0.55 * total_a)
+        ) / denominador * 100.0
+    else:
+        t_efetiva = 0.0
+
+    # Aplicação do Agravante por Reincidência no TST (Proteção Amostral)
+    agravante_tst_aplicado = False
+    if not previsao_bloqueada and finalizados_tst >= 10:
+        padrao_desfavoravel = (taxa_cond_tst > taxa_cond_trt) or (sub_count > 0)
+        if padrao_desfavoravel:
+            t_final = min(100.0, t_efetiva * 1.10)
+            agravante_tst_aplicado = True
+        else:
+            t_final = t_efetiva
+    else:
+        t_final = t_efetiva
+
+    percentual_risco = round(t_final, 1)
+
+    if percentual_risco <= 30.0:
+        faixa_exposicao = "BAIXA"
+        rotulo_exposicao = "Baixa Exposição Trabalhista"
+    elif percentual_risco < 60.0:
+        faixa_exposicao = "MODERADA"
+        rotulo_exposicao = "Exposição Moderada — Blindagem Contratual Recomendada"
+    else:
+        faixa_exposicao = "ALTA"
+        rotulo_exposicao = "Alta Exposição — Provisionamento e Diligência Rigorosa"
+
+    pct_base_exec = round((total_execucao / total_procs) * 100.0, 1) if total_procs > 0 else 0.0
+
+    # Amostra formatada de processos
+    processos_amostra = []
+    for p in processes:
+        in_tst = is_tst_process(p)
+        fin_tst = in_tst and is_process_finalized_tst(p)
+        in_exec = is_process_execution_phase(p)
+
+        if in_tst:
+            fase_proc = "INSTANCIA_MAXIMA"
+        elif in_exec:
+            fase_proc = "EXECUCAO"
+        elif p.get("is_recurso") or "RECURS" in str(p.get("fase_processual") or "").upper():
+            fase_proc = "RECURSAL"
+        else:
+            fase_proc = "CONHECIMENTO"
+
+        tag_inst = (
+            "Não cabem mais recursos (Instância Máxima — TST)"
+            if fin_tst
+            else None
+        )
+
+        num_cnj = str(
+            p.get("numero_cnj") or p.get("numero_processo") or p.get("numeroProcesso") or ""
+        ).strip()
+        trib_str = str(
+            p.get("tribunal") or p.get("siglaTribunal") or ("TST" if in_tst else "TRT")
+        ).strip()
+
+        # Enriquecimento in-place
+        p["instancia_maxima_finalizado"] = bool(fin_tst)
+        p["tag_instancia"] = tag_inst
+        p["fase_processual"] = fase_proc
+        p["numero_cnj"] = num_cnj
+
+        processos_amostra.append({
+            "numero_cnj": num_cnj,
+            "tribunal": trib_str,
+            "fase_processual": fase_proc,
+            "instancia_maxima_finalizado": bool(fin_tst),
+            "tag_instancia": tag_inst,
+        })
+
+    return {
+        "risco_subsidiario": {
+            "percentual": percentual_risco,
+            "faixa_exposicao": faixa_exposicao,
+            "rotulo_exposicao": rotulo_exposicao,
+            "metodologia_resumo": "Ponderado por definitividade: TST/Execução peso 1.0, TRT recorrível 0.85, Acordo 0.55",
+            "agravante_tst_aplicado": agravante_tst_aplicado,
+        },
+        "fase_execucao": {
+            "total_processos": total_execucao,
+            "percentual_base": pct_base_exec,
+            "rotulo": "Processos em Fase de Execução / Sentença Aplicada",
+            "descricao": "Processos já concluídos na fase de conhecimento e em etapa de cumprimento de sentença.",
+        },
+        "comparativo_instancias": {
+            "trt": {
+                "total_processos": len(trt_procs),
+                "julgados": julgados_trt,
+                "condenacoes": cond_trt,
+                "acordos": acordos_trt,
+                "favoraveis": fav_trt,
+                "em_aberto": em_aberto_trt,
+                "taxa_condenacao": taxa_cond_trt,
+            },
+            "tst": {
+                "total_processos": len(tst_procs),
+                "finalizados": finalizados_tst,
+                "condenacoes_mantidas": cond_tst,
+                "favoraveis_ou_revertidos": fav_tst,
+                "taxa_condenacao": taxa_cond_tst,
+                "taxa_reversao_recurso": taxa_rev_tst,
+                "amostra_reduzida": amostra_reduzida_tst,
+            },
+        },
+        "processos_amostra": processos_amostra,
+    }
 
 
 class BayesianRiskPredictor:
@@ -1187,24 +1645,20 @@ class BayesianRiskPredictor:
 
             probabilidade_condenacao_geral_pct = round(posterior_cond_rate * 100.0, 1)
 
-        # Fórmula Única Convexa para o Score de Risco de Terceirização (Súmula 331 TST) [0 a 100]:
-        taxa_rescisorias = rescisorias_fgts_count / total
-        taxa_sumula_331_exec = sumula_331_direct_count / total
-
-        overall_risk_score = round(
-            min(
-                100.0,
-                max(
-                    0.0 if previsao_bloqueada else 5.0,
-                    (
-                        posterior_adverse_rate * 65.0
-                        + taxa_rescisorias * 20.0
-                        + taxa_sumula_331_exec * 15.0
-                    ),
-                ),
-            ),
-            1,
+        # Nova Fórmula de Risco Subsidiário e Comparativo por Instância (TST vs TRTs)
+        risk_inst_data = calculate_weighted_subsidiary_risk_and_instances(
+            processes=processes,
+            previsao_bloqueada=previsao_bloqueada,
+            sub_count=sumula_331_direct_count,
         )
+        risco_subsidiario = risk_inst_data["risco_subsidiario"]
+        fase_execucao = risk_inst_data["fase_execucao"]
+        comparativo_instancias = risk_inst_data["comparativo_instancias"]
+        processos_amostra = risk_inst_data["processos_amostra"]
+
+        # O Risco Subsidiário (Súmula 331 TST) passa a ser estritamente Tefetiva ponderada sem variáveis financeiras
+        overall_risk_score = risco_subsidiario["percentual"]
+        taxa_rescisorias = rescisorias_fgts_count / total if total > 0 else 0.0
 
         backtest = self.evaluate_temporal_backtest(processes) if (_run_backtest and not previsao_bloqueada) else None
 
@@ -1225,13 +1679,20 @@ class BayesianRiskPredictor:
             "descricao": EXECUTION_PHASE_DESCRIPTION,
         }
 
+        cpm = build_condenacao_por_motivo(processes)
+
         return {
             "empresa": company_name,
             "total_processos": total,
             "ranking_motivos": ranking,
             "ranking_motivos_condenacao": ranking_condenacoes,
-            "condenacao_por_motivo": build_condenacao_por_motivo(processes),
+            "condenacao_por_motivo": cpm,
+            "motivos_processo": cpm,
             "execution_phase_summary": execution_phase_summary,
+            "fase_execucao": fase_execucao,
+            "comparativo_instancias": comparativo_instancias,
+            "risco_subsidiario": risco_subsidiario,
+            "processos_amostra": processos_amostra,
             "previsao_bloqueada": previsao_bloqueada,
             "motivo_bloqueio_previsao": motivo_bloqueio_previsao,
             "desfechos_sentencas": outcomes,
@@ -1239,12 +1700,13 @@ class BayesianRiskPredictor:
             "niveis_sigilo": dict(secrecy_levels),
             "taxa_sigilo_pct": round(secrecy_rate * 100.0, 1),
             "score_risco_terceirizacao": overall_risk_score,
+            "overall_risk_score": overall_risk_score,
             "probabilidade_condenacao_geral_pct": probabilidade_condenacao_geral_pct,
             "taxa_historica_condenacao_pct": taxa_condenacao_empirica_pct,
             "plus_previsao_condenacao": predictions,
             "alerta_sumula_331_tst": overall_risk_score >= 60.0 or taxa_rescisorias >= 0.35,
             "backtest_temporal": backtest,
-            "modelo_matematico": "Dirichlet-Multinomial Conjugado / Beta-Binomial com IC 90% (Pura matemática estatística bayesiana, sem alucinação de LLM)",
+            "modelo_matematico": "Ponderação por Definitividade / Dirichlet-Multinomial Conjugado / Beta-Binomial com IC 90%",
         }
 
     def build_dashboard_metrics(
@@ -1427,23 +1889,24 @@ def build_sector_benchmark(
             cenario_clean = None
 
         # Risco Subsidiário (Súmula 331)
-        # Prioriza a métrica calibrada de solvência quando disponível (Súmula 331 TST
-        # condiciona a responsabilidade subsidiária do tomador ao inadimplemento da prestadora).
+        r_sub_candidate = p.get("risco_subsidiario")
+        if isinstance(r_sub_candidate, dict):
+            r_sub_candidate = r_sub_candidate.get("percentual")
         r_sub_raw = (
-            p.get("risco_subsidiario")
-            if p.get("risco_subsidiario") is not None
+            r_sub_candidate
+            if r_sub_candidate is not None
             else (
-                econ.get("risco_calote_subsidiario")
-                if econ.get("risco_calote_subsidiario") is not None
+                p.get("score_risco_terceirizacao")
+                if p.get("score_risco_terceirizacao") is not None
                 else (
-                    p.get("indice_exposicao_financeira")
-                    if p.get("indice_exposicao_financeira") is not None
+                    econ.get("risco_calote_subsidiario")
+                    if econ.get("risco_calote_subsidiario") is not None
                     else (
-                        econ.get("indice_exposicao_financeira")
-                        if econ.get("indice_exposicao_financeira") is not None
+                        p.get("indice_exposicao_financeira")
+                        if p.get("indice_exposicao_financeira") is not None
                         else (
-                            p.get("score_risco_terceirizacao")
-                            if p.get("score_risco_terceirizacao") is not None
+                            econ.get("indice_exposicao_financeira")
+                            if econ.get("indice_exposicao_financeira") is not None
                             else p.get("overall_risk_score", 0.0)
                         )
                     )

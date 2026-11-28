@@ -1,4 +1,4 @@
-export const EMPTY_FILTERS = Object.freeze({ search: '', tribunal: '', outcome: '', date_from: '', date_to: '', value_min: '', value_max: '' });
+export const EMPTY_FILTERS = Object.freeze({ search: '', tribunal: '', outcome: '', date_from: '', date_to: '', value_min: '', value_max: '', instancia: '' });
 export const TRIBUNALS = ['TST', ...Array.from({length:24}, (_,i)=>`TRT${i+1}`)];
 export function validateFilters(f) {
   if (f.date_from && f.date_to && f.date_from > f.date_to) return 'A data inicial deve ser anterior ou igual à final.';

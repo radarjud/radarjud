@@ -521,7 +521,7 @@ class LegalAIAnalyzer:
                 "perfil_risco_consolidado": "Sem Processos Localizados",
                 "parecer_governanca": resumo,
                 "resumo_executivo": resumo,
-                "recomendacao_homologacao": "HOMOLOGAR SEM RESTRIÇÕES",
+                "recomendacao_homologacao": "Baixa Exposição Trabalhista",
                 "taxa_historica_vitoria_empresa_pct": None,
                 "taxa_historica_acordos_pct": None,
                 "taxa_historica_condenacao_pct": None,
@@ -538,8 +538,9 @@ class LegalAIAnalyzer:
                 "recomendacoes_compliance": [
                     *(["Exigir certidões negativas atualizadas e balanço patrimonial recente diretamente do fornecedor no processo de homologação."] if alerta_homologacao_privada else []),
                     *(["Exigir comprovação de regularidade fiscal e quitação das restrições identificadas em certidões públicas antes da contratação."] if possui_restricoes else []),
-                    "Manter rotinas preventivas de conformidade trabalhista (CLT e eSocial).",
-                    "Acompanhar periodicamente novas publicações ou eventuais citações judiciais."
+                    "Constituir aporte de caixa reserva / provisão financeira ou conta vinculada para cobrir eventuais passivos caso a empresa opte por seguir com a contratação.",
+                    "Exigir mensalmente folhas de ponto, comprovantes de pagamento de horas extras, holerites e guias de recolhimento de FGTS/INSS dos colaboradores alocados.",
+                    "Incluir cláusulas contratuais de retenção de faturas em caso de inadimplência trabalhista, seguro-garantia e direito de regresso."
                 ],
                 "status": "sucesso"
             }
@@ -583,22 +584,19 @@ class LegalAIAnalyzer:
             )
 
             if cenario_tipo == "CENARIO_A":
-                rec_homologacao = "APROVAR / RISCO MITIGADO"
-                perfil_risco = f"Baixo ({risco_subsidiario:.1f}%)"
+                rec_homologacao = "Baixa Exposição Trabalhista"
+                perfil_risco = f"Baixa Exposição ({risco_subsidiario:.1f}%)"
                 resumo = (
-                    f"A empresa {empresa} possui {total} processo(s) em tramitação ({motivos_str}) e plena solidez "
-                    f"patrimonial comprovada (Capital Social de {capital_fmt} e solvência ativa). O amplo lastro econômico "
-                    f"assegura a quitação autônoma de qualquer contingência, eliminando o risco de redirecionamento "
-                    f"subsidiário ao tomador de serviços nos termos da Súmula 331 do TST.{exec_note}"
+                    f"A empresa {empresa} possui {total} processo(s) em tramitação ({motivos_str}) e solidez "
+                    f"patrimonial declarada (Capital Social de {capital_fmt}). O Risco Subsidiário apurado é de {risco_subsidiario:.1f}%, "
+                    f"classificando a operação em faixa de baixa exposição trabalhista com base na definitividade das decisões.{exec_note}"
                 )
             else:
-                rec_homologacao = "APROVAR COM RETENÇÃO CAUTELAR"
+                rec_homologacao = "Exposição Moderada — Blindagem Contratual Recomendada"
                 perfil_risco = "Amostra Inicial (Em Andamento)"
                 resumo = (
                     f"A empresa {empresa} possui {total} processo(s) em tramitação ({motivos_str}), porém "
-                    f"nenhum desfecho anterior transitado em julgado (sentença ou acordo homologado). "
-                    f"Sem dados pretéritos de julgamento na empresa, as estimativas de probabilidade de vitória "
-                    f"adotam exclusivamente as médias jurisprudenciais basais dos TRTs.{exec_note}"
+                    f"sem desfecho anterior transitado em julgado. Recomenda-se diligência e blindagem contratual preventiva.{exec_note}"
                 )
 
             return {
@@ -625,8 +623,9 @@ class LegalAIAnalyzer:
                 "recomendacoes_compliance": [
                     *(["Exigir certidões negativas atualizadas e balanço patrimonial recente diretamente do fornecedor no processo de homologação."] if alerta_homologacao_privada else []),
                     *(["Exigir comprovação de regularidade fiscal e quitação das restrições identificadas em certidões públicas antes da contratação."] if possui_restricoes else []),
-                    "Estruturar auditoria prévia de provas documentais e testemunhais para os processos em curso.",
-                    "Avaliar viabilidade de conciliação nas primeiras audiências para reduzir custos processuais."
+                    "Constituir aporte de caixa reserva / provisão financeira ou conta vinculada para cobrir eventuais passivos caso a empresa opte por seguir com a contratação.",
+                    "Exigir mensalmente folhas de ponto, comprovantes de pagamento de horas extras, holerites e guias de recolhimento de FGTS/INSS dos colaboradores alocados.",
+                    "Incluir cláusulas contratuais de retenção de faturas em caso de inadimplência trabalhista, seguro-garantia e direito de regresso."
                 ],
                 "status": "sucesso"
             }
@@ -659,48 +658,29 @@ class LegalAIAnalyzer:
             else []
         )
 
-        # Diagnóstico integrado de risco: subordina a recomendação ao lastro patrimonial (Cenário A vs B)
-        if cenario_tipo == "CENARIO_A":
-            perfil_risco = f"Baixo ({risco_subsidiario:.1f}%)"
-            rec_homologacao = "APROVAR / RISCO MITIGADO"
+        # Diagnóstico integrado de risco conforme as 3 faixas de exposição (Súmula 331 TST)
+        if risco_subsidiario <= 30.0:
+            rec_homologacao = "Baixa Exposição Trabalhista"
+            perfil_risco = f"Baixa Exposição ({risco_subsidiario:.1f}%)"
             parecer_resumo = (
-                f"A empresa {empresa} possui plena higidez econômico-financeira comprovada perante a Receita Federal "
-                f"(Capital Social de {capital_fmt} e probabilidade de insolvência de apenas {prob_insolvencia:.1f}%). "
-                f"Embora apresente volume de litígios típico de grandes corporações (com taxa histórica desfavorável de "
-                f"{taxa_condenacao_historica}% dos julgados concentrados em {motivos_str}), o substancial lastro patrimonial "
-                f"garante sua capacidade autônoma de quitação integral, eliminando o risco de condenação subsidiária ou execução "
-                f"contra o contratante nos termos da Súmula 331 do TST (Risco Subsidiário estimado em apenas {risco_subsidiario:.1f}%)."
+                f"A empresa {empresa} apresenta taxa de exposição subsidiária ponderada de {risco_subsidiario:.1f}% "
+                f"com desfechos favoráveis e passivo em grau controlado. As condenações identificadas incidem sobre {motivos_str}, "
+                f"enquadrando a prestadora em faixa de baixa exposição para fins de terceirização."
             )
-        elif cenario_tipo == "CENARIO_B":
-            perfil_risco = "Crítico / Elevado"
-            rec_homologacao = "REPROVAR / BLOQUEAR"
+        elif risco_subsidiario < 60.0:
+            rec_homologacao = "Exposição Moderada — Blindagem Contratual Recomendada"
+            perfil_risco = f"Exposição Moderada ({risco_subsidiario:.1f}%)"
             parecer_resumo = (
-                f"A empresa {empresa} apresenta vulnerabilidade econômico-financeira (P(Insolvência) estimada em {prob_insolvencia:.1f}%) "
-                f"associada a passivo processual relevante ({taxa_condenacao_historica}% de condenações em {motivos_str}). "
-                f"Há risco iminente de inadimplemento das obrigações trabalhistas e redirecionamento da execução contra o tomador "
-                f"de serviços sob a ótica da Súmula 331 do TST."
-            )
-        elif taxa_vitoria_historica >= 50.0:
-            perfil_risco = "Baixo a Moderado"
-            rec_homologacao = "HOMOLOGAR SEM RESTRIÇÕES"
-            parecer_resumo = (
-                f"A empresa {empresa} apresenta histórico favorável com índice de vitória (improcedência) de "
-                f"{taxa_vitoria_historica}% sobre os {total_julgados} processos já julgados, indicando consistência probatória e compliance robusto."
-            )
-        elif taxa_vitoria_historica >= 30.0:
-            perfil_risco = "Moderado"
-            rec_homologacao = "APROVAR COM RETENÇÃO CAUTELAR"
-            parecer_resumo = (
-                f"A empresa {empresa} possui taxa de vitória de {taxa_vitoria_historica}% e adesão a conciliações de "
-                f"{taxa_acordo_historica}%, com demandas concentradas em: {motivos_str}."
+                f"A empresa {empresa} possui nível intermediário de litígios ({taxa_condenacao_historica}% de condenações em {motivos_str}), "
+                f"com índice de risco subsidiário de {risco_subsidiario:.1f}%. Recomenda-se blindagem contratual e monitoramento mensal."
             )
         else:
-            perfil_risco = "Crítico / Elevado"
-            rec_homologacao = "REPROVAR / BLOQUEAR"
+            rec_homologacao = "Alta Exposição — Provisionamento e Diligência Rigorosa"
+            perfil_risco = f"Alta Exposição ({risco_subsidiario:.1f}%)"
             parecer_resumo = (
-                f"A empresa {empresa} apresenta taxa de condenação elevada ({taxa_condenacao_historica}% dos julgados). "
-                f"Os registros apontam vulnerabilidade em pedidos envolvendo {motivos_str}, "
-                f"com risco reflexo direto para tomadores de serviço sob a ótica da Súmula 331 do TST."
+                f"A empresa {empresa} apresenta elevada incidência de condenações definitivas/recorríveis ({taxa_condenacao_historica}% dos julgados), "
+                f"com concentração em {motivos_str} e índice de risco subsidiário de {risco_subsidiario:.1f}%. "
+                f"Caso haja contratação, exige-se provisionamento cautelar e retenção rigorosa para resguardar a contratante sob a Súmula 331 do TST."
             )
 
         recomendacoes = []
@@ -713,10 +693,9 @@ class LegalAIAnalyzer:
                 "Exigir comprovação de regularidade fiscal e quitação das restrições identificadas em certidões públicas antes da contratação."
             )
         recomendacoes.extend([
-            "Auditar cartões de ponto eletrônicos e escalas de descanso para suprimir passivo de jornada.",
-            "Instituir comitê de prevenção e canal de ouvidoria independente para mitigar queixas de assédio/dano moral.",
-            "Fiscalizar guias de recolhimento de FGTS e rescisões contratuais rigorosamente no prazo do art. 477 da CLT.",
-            "Exigir certidões negativas e comprovantes fiscais periódicos de prestadores terceirizados (Súmula 331/TST)."
+            "Constituir aporte de caixa reserva / provisão financeira ou conta vinculada para cobrir eventuais passivos caso a empresa opte por seguir com a contratação.",
+            "Exigir mensalmente folhas de ponto, comprovantes de pagamento de horas extras, holerites e guias de recolhimento de FGTS/INSS dos colaboradores alocados.",
+            "Incluir cláusulas contratuais de retenção de faturas em caso de inadimplência trabalhista, seguro-garantia e direito de regresso."
         ])
 
         return {
@@ -800,9 +779,17 @@ class LegalAIAnalyzer:
                 "'perfil_risco_consolidado', 'resumo_executivo', 'recomendacao_homologacao', "
                 "'taxa_historica_vitoria_empresa_pct', 'principais_vulnerabilidades', "
                 "'alertas_sumula_331', 'recomendacoes_compliance'.\n"
-                "REGRA IMPORTANTE: O campo 'execution_phase_summary' indica processos que já concluíram a fase de "
-                "conhecimento e encontram-se apenas em etapa de execução, cumprimento ou liquidação de sentença; "
-                "NÃO trate a fase de execução ou cumprimento de sentença como causa raiz do litígio nem a inclua em 'principais_vulnerabilidades'.\n"
+                "DIRETRIZES OBRIGATÓRIAS:\n"
+                "1. O campo 'recomendacao_homologacao' deve utilizar exclusivamente uma das três faixas de exposição: "
+                "'Baixa Exposição Trabalhista', 'Exposição Moderada — Blindagem Contratual Recomendada' ou "
+                "'Alta Exposição — Provisionamento e Diligência Rigorosa' (tom estritamente analítico, NUNCA use comandos imperativos como Aprovar, Homologar ou Reprovar).\n"
+                "2. Em 'recomendacoes_compliance', foque estritamente em blindagem contratual da contratante: "
+                "(a) aporte de caixa reserva/provisão financeira ou conta vinculada; "
+                "(b) auditoria mensal de folhas de ponto, comprovantes de horas extras e guias de FGTS/INSS; "
+                "(c) cláusulas de retenção de faturas, seguro-garantia e direito de regresso. "
+                "NÃO recomende ações internas do fornecedor (como criar comitê de assédio ou ouvidoria).\n"
+                "3. O campo 'execution_phase_summary' indica processos em fase de execução/cumprimento de sentença; "
+                "NÃO trate a fase de execução como causa raiz do litígio nem a inclua em 'principais_vulnerabilidades'.\n"
                 f"Metadados: {json.dumps(prompt_payload, ensure_ascii=False, default=str)}"
             )
             cloud_result = self._call_gemini_api(prompt)
