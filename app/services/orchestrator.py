@@ -863,7 +863,10 @@ class CNJMetadataOrchestrator:
 
         if not processes_map:
             if fast_path and query_term:
-                processes_map = self.searcher.fetch_single_comunica_page(query_term, page_num=1, timeout=5.0) or {}
+                fallback_term = search_strategy.get("fallback_query_term") if search_strategy else None
+                processes_map = self.searcher.fetch_single_comunica_page(
+                    query_term, page_num=1, timeout=5.0, fallback_term=fallback_term
+                ) or {}
             else:
                 search_input = query_term or company_name
                 processes_map = self._fetch_comunica_pje(search_input, max_pages=max_pages, fast_path=fast_path) or {}
@@ -872,12 +875,30 @@ class CNJMetadataOrchestrator:
                 discovered_entities = getattr(self, "last_discovered_entities", [])
 
         if not processes_map:
-            empty_res = self._calculate_metrics(company_name, [], scan_status="COMPLETED")
+            # Verifica se foi rate limit ou erro de rede para nunca gravar falso COMPLETED
+            is_rate_limited = getattr(self.searcher, "last_page_rate_limited", False)
+            status_code = getattr(self.searcher, "last_page_status_code", 200)
+            if is_rate_limited or status_code == 429:
+                scan_status = "RATE_LIMITED"
+            elif status_code not in (200, 0):
+                scan_status = "ERROR"
+            elif fast_path:
+                scan_status = "PARTIAL_FAST_PATH"
+            else:
+                scan_status = "COMPLETED"
+
+            empty_res = self._calculate_metrics(company_name, [], scan_status=scan_status)
+            empty_res["has_more"] = bool(fast_path)
             empty_res["discovered_entities"] = discovered_entities
+            empty_res["scan_status"] = scan_status
+            empty_res["rate_limited"] = is_rate_limited
+            if is_rate_limited:
+                empty_res["retry_after_seconds"] = getattr(self.searcher, "last_retry_after", 3)
             empty_res["ai_analysis"] = self.ai_analyzer.analyze_company(
                 {"empresa": company_name, "total_processos": 0}
             )
-            if not fast_path:
+            # NUNCA cacheia busca que falhou por rate limit ou erro como COMPLETED!
+            if not fast_path and scan_status == "COMPLETED":
                 self._cache[cache_key] = empty_res
             return empty_res
 
@@ -894,9 +915,8 @@ class CNJMetadataOrchestrator:
             processes = self._enrich_with_datajud(processes_map)
 
         # 3. Cálculo de métricas via BayesianRiskPredictor
-        # CRITÉRIO DE PARADA CORRETO: verifica se a página bruta tinha 50 itens
-        has_more = getattr(self.searcher, "last_page_has_more", False) or len(processes_map) >= 50
-        status = "PARTIAL_FAST_PATH" if (fast_path and has_more) else "COMPLETED"
+        # No fast_path, sempre habilita varredura profunda dos 25 tribunais trabalhistas (TST + TRT1..24).
+        status = "PARTIAL_FAST_PATH" if fast_path else "COMPLETED"
         metrics = self._calculate_metrics(company_name, processes, scan_status=status)
         metrics["discovered_entities"] = discovered_entities
 

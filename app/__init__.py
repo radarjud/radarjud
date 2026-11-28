@@ -7,6 +7,126 @@ from app.routes import api_bp
 from app.routes.auth import auth_bp
 
 
+logger = logging.getLogger(__name__)
+
+
+def ensure_database_schema(db_instance):
+    """
+    Garante aplicação idempotente de migrações e novas colunas tanto em PostgreSQL quanto em SQLite.
+    Evita falhas do tipo 'no such column' em bancos locais SQLite ou ambientes de desenvolvimento.
+    """
+    dialect = db_instance.engine.dialect.name
+    try:
+        with db_instance.engine.connect() as conn:
+            if dialect == "postgresql":
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS tenant_id INTEGER;"))
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS movements_hash VARCHAR(64);"))
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;"))
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS scan_status VARCHAR(20) DEFAULT 'COMPLETED';"))
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS ai_analysis JSON;"))
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS economic_standing JSON;"))
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS ranking_motivos JSON;"))
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS ranking_motivos_condenacao JSON;"))
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS condenacao_por_motivo JSON;"))
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS predictions_summary JSON;"))
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS cnae_codigo VARCHAR(20);"))
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS cnae_descricao VARCHAR(255);"))
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS condenacoes_subsidiarias_tomadoras_count INTEGER DEFAULT 0;"))
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS tomadoras_subsidiarias_pj JSON;"))
+                conn.execute(db_instance.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS contratos_poder_publico JSON;"))
+                conn.execute(db_instance.text("CREATE INDEX IF NOT EXISTS ix_company_searches_cnae_codigo ON company_searches (cnae_codigo);"))
+                conn.execute(db_instance.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS cnae_codigo VARCHAR(20);"))
+                conn.execute(db_instance.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS cnae_descricao VARCHAR(255);"))
+                conn.execute(db_instance.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS public_contracts JSON;"))
+                conn.execute(db_instance.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS public_contracts_cached_at TIMESTAMP;"))
+                conn.execute(db_instance.text("CREATE INDEX IF NOT EXISTS ix_company_registry_cnae_codigo ON company_registry (cnae_codigo);"))
+                conn.execute(db_instance.text("CREATE TABLE IF NOT EXISTS public_contracts_cache ("
+                                              "id SERIAL PRIMARY KEY, "
+                                              "cnpj VARCHAR(14) NOT NULL UNIQUE, "
+                                              "data JSON NOT NULL, "
+                                              "cached_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+                                              "ttl_seconds INTEGER NOT NULL DEFAULT 86400"
+                                              ");"))
+                conn.execute(db_instance.text("CREATE INDEX IF NOT EXISTS ix_public_contracts_cache_cnpj ON public_contracts_cache (cnpj);"))
+                conn.execute(db_instance.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS observation VARCHAR(500);"))
+                conn.execute(db_instance.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS has_subsidiary_liability BOOLEAN DEFAULT FALSE;"))
+                conn.execute(db_instance.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS subsidiary_contractors_json JSON;"))
+                conn.execute(db_instance.text("ALTER TABLE process_records ALTER COLUMN grau TYPE VARCHAR(50);"))
+                conn.execute(db_instance.text("ALTER TABLE process_records ALTER COLUMN tribunal TYPE VARCHAR(50);"))
+                conn.execute(db_instance.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS data_distribuicao DATE;"))
+                conn.execute(db_instance.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS valor_causa NUMERIC(15, 2);"))
+                conn.execute(db_instance.text("CREATE INDEX IF NOT EXISTS ix_process_records_data_distribuicao ON process_records (data_distribuicao);"))
+                conn.execute(db_instance.text("CREATE INDEX IF NOT EXISTS ix_process_records_tribunal ON process_records (tribunal);"))
+                conn.execute(db_instance.text("CREATE UNIQUE INDEX IF NOT EXISTS uq_process_records_search_numero ON process_records (company_search_id, numero_processo);"))
+                conn.execute(db_instance.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_tribunal_data ON process_records (company_search_id, tribunal, data_distribuicao);"))
+                conn.execute(db_instance.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_valor ON process_records (company_search_id, valor_causa);"))
+                conn.execute(db_instance.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_outcome ON process_records (company_search_id, sentence_outcome);"))
+                conn.execute(db_instance.text("CREATE TABLE IF NOT EXISTS monitored_suppliers ("
+                                              "id SERIAL PRIMARY KEY, "
+                                              "tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, "
+                                              "cnpj VARCHAR(20) NOT NULL, "
+                                              "company_name VARCHAR(255) NOT NULL, "
+                                              "last_movements_hash VARCHAR(64), "
+                                              "last_condenacoes_count INTEGER DEFAULT 0, "
+                                              "last_scenario VARCHAR(20) DEFAULT 'CENARIO_A', "
+                                              "last_rfb_status VARCHAR(50) DEFAULT 'ATIVA', "
+                                              "last_tst_count INTEGER DEFAULT 0, "
+                                              "webhook_url VARCHAR(500), "
+                                              "alert_email VARCHAR(255), "
+                                              "active BOOLEAN DEFAULT TRUE, "
+                                              "last_checked_at TIMESTAMP, "
+                                              "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                                              "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"))
+                conn.execute(db_instance.text("CREATE UNIQUE INDEX IF NOT EXISTS uq_monitored_suppliers_tenant_cnpj ON monitored_suppliers (tenant_id, cnpj);"))
+                conn.execute(db_instance.text("CREATE INDEX IF NOT EXISTS ix_monitored_suppliers_tenant_active ON monitored_suppliers (tenant_id, active);"))
+                conn.commit()
+            elif dialect == "sqlite":
+                def _sqlite_add_missing(table_name, columns_spec):
+                    try:
+                        res = conn.execute(db_instance.text(f"PRAGMA table_info({table_name});")).fetchall()
+                        existing = {r[1].lower() for r in res}
+                        for col_name, col_type in columns_spec:
+                            if col_name.lower() not in existing:
+                                conn.execute(db_instance.text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type};"))
+                    except Exception as e:
+                        logger.debug("Migração SQLite para tabela %s ignorada: %s", table_name, e)
+
+                _sqlite_add_missing("company_searches", [
+                    ("tenant_id", "INTEGER"),
+                    ("movements_hash", "VARCHAR(64)"),
+                    ("last_checked_at", "TIMESTAMP"),
+                    ("scan_status", "VARCHAR(20) DEFAULT 'COMPLETED'"),
+                    ("ai_analysis", "JSON"),
+                    ("economic_standing", "JSON"),
+                    ("ranking_motivos", "JSON"),
+                    ("ranking_motivos_condenacao", "JSON"),
+                    ("condenacao_por_motivo", "JSON"),
+                    ("predictions_summary", "JSON"),
+                    ("cnae_codigo", "VARCHAR(20)"),
+                    ("cnae_descricao", "VARCHAR(255)"),
+                    ("condenacoes_subsidiarias_tomadoras_count", "INTEGER DEFAULT 0"),
+                    ("tomadoras_subsidiarias_pj", "JSON"),
+                    ("contratos_poder_publico", "JSON"),
+                ])
+                _sqlite_add_missing("process_records", [
+                    ("observation", "VARCHAR(500)"),
+                    ("has_subsidiary_liability", "BOOLEAN DEFAULT 0"),
+                    ("subsidiary_contractors_json", "JSON"),
+                    ("data_distribuicao", "DATE"),
+                    ("valor_causa", "NUMERIC(15, 2)"),
+                    ("raw_metadata", "JSON"),
+                ])
+                _sqlite_add_missing("company_registry", [
+                    ("cnae_codigo", "VARCHAR(20)"),
+                    ("cnae_descricao", "VARCHAR(255)"),
+                    ("public_contracts", "JSON"),
+                    ("public_contracts_cached_at", "TIMESTAMP"),
+                ])
+                conn.commit()
+    except Exception as exc:
+        logger.warning("Aviso durante ensure_database_schema: %s", exc)
+
+
 def create_app(config_name: str = None, seed_catalog: bool = True) -> Flask:
     """
     Application Factory para o LexGuard AI.
@@ -103,68 +223,7 @@ def create_app(config_name: str = None, seed_catalog: bool = True) -> Flask:
             from app.models.monitored_supplier import MonitoredSupplier  # noqa: F401
             from app.models.public_contract_cache import PublicContractCache  # noqa: F401
             db.create_all()
-            if db.engine.dialect.name == "postgresql":
-                with db.engine.connect() as conn:
-                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS tenant_id INTEGER;"))
-                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS movements_hash VARCHAR(64);"))
-                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;"))
-                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS scan_status VARCHAR(20) DEFAULT 'COMPLETED';"))
-                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS ai_analysis JSON;"))
-                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS economic_standing JSON;"))
-                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS ranking_motivos_condenacao JSON;"))
-                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS cnae_codigo VARCHAR(20);"))
-                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS cnae_descricao VARCHAR(255);"))
-                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS condenacoes_subsidiarias_tomadoras_count INTEGER DEFAULT 0;"))
-                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS tomadoras_subsidiarias_pj JSON;"))
-                    conn.execute(db.text("ALTER TABLE company_searches ADD COLUMN IF NOT EXISTS contratos_poder_publico JSON;"))
-                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_company_searches_cnae_codigo ON company_searches (cnae_codigo);"))
-                    conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS cnae_codigo VARCHAR(20);"))
-                    conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS cnae_descricao VARCHAR(255);"))
-                    conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS public_contracts JSON;"))
-                    conn.execute(db.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS public_contracts_cached_at TIMESTAMP;"))
-                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_company_registry_cnae_codigo ON company_registry (cnae_codigo);"))
-                    conn.execute(db.text("CREATE TABLE IF NOT EXISTS public_contracts_cache ("
-                                         "id SERIAL PRIMARY KEY, "
-                                         "cnpj VARCHAR(14) NOT NULL UNIQUE, "
-                                         "data JSON NOT NULL, "
-                                         "cached_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, "
-                                         "ttl_seconds INTEGER NOT NULL DEFAULT 86400"
-                                         ");"))
-                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_public_contracts_cache_cnpj ON public_contracts_cache (cnpj);"))
-                    conn.execute(db.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS observation VARCHAR(500);"))
-                    conn.execute(db.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS has_subsidiary_liability BOOLEAN DEFAULT FALSE;"))
-                    conn.execute(db.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS subsidiary_contractors_json JSON;"))
-                    conn.execute(db.text("ALTER TABLE process_records ALTER COLUMN grau TYPE VARCHAR(50);"))
-                    conn.execute(db.text("ALTER TABLE process_records ALTER COLUMN tribunal TYPE VARCHAR(50);"))
-                    conn.execute(db.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS data_distribuicao DATE;"))
-                    conn.execute(db.text("ALTER TABLE process_records ADD COLUMN IF NOT EXISTS valor_causa NUMERIC(15, 2);"))
-                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_data_distribuicao ON process_records (data_distribuicao);"))
-                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_tribunal ON process_records (tribunal);"))
-                    conn.execute(db.text("CREATE UNIQUE INDEX IF NOT EXISTS uq_process_records_search_numero ON process_records (company_search_id, numero_processo);"))
-                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_tribunal_data ON process_records (company_search_id, tribunal, data_distribuicao);"))
-                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_valor ON process_records (company_search_id, valor_causa);"))
-                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_process_records_search_outcome ON process_records (company_search_id, sentence_outcome);"))
-                    conn.execute(db.text("CREATE TABLE IF NOT EXISTS monitored_suppliers ("
-                                         "id SERIAL PRIMARY KEY, "
-                                         "tenant_id INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, "
-                                         "cnpj VARCHAR(20) NOT NULL, "
-                                         "company_name VARCHAR(255) NOT NULL, "
-                                         "last_movements_hash VARCHAR(64), "
-                                         "last_condenacoes_count INTEGER DEFAULT 0, "
-                                         "last_scenario VARCHAR(20) DEFAULT 'CENARIO_A', "
-                                         "last_rfb_status VARCHAR(50) DEFAULT 'ATIVA', "
-                                         "last_tst_count INTEGER DEFAULT 0, "
-                                         "webhook_url VARCHAR(500), "
-                                         "alert_email VARCHAR(255), "
-                                         "active BOOLEAN DEFAULT TRUE, "
-                                         "last_checked_at TIMESTAMP, "
-                                         "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
-                                         "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);"))
-                    conn.execute(db.text("CREATE UNIQUE INDEX IF NOT EXISTS uq_monitored_suppliers_tenant_cnpj ON monitored_suppliers (tenant_id, cnpj);"))
-                    conn.execute(db.text("CREATE INDEX IF NOT EXISTS ix_monitored_suppliers_tenant_active ON monitored_suppliers (tenant_id, active);"))
-                    conn.execute(db.text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS plan VARCHAR(50) DEFAULT 'ESSENCIAL';"))
-                    conn.execute(db.text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS limite_mensal_consultas INTEGER DEFAULT 30;"))
-                    conn.commit()
+            ensure_database_schema(db)
 
             # Semeia usuários padrão de sistema (Admin e Analista) com idempotência estrita
             try:
