@@ -55,9 +55,9 @@ class QuotaService:
         return int(count or 0)
 
     @classmethod
-    def check_quota(cls, tenant: Tenant, now_utc: datetime | None = None) -> dict[str, Any]:
+    def check_quota(cls, tenant: Tenant, now_utc: datetime | None = None, user: Any = None) -> dict[str, Any]:
         """
-        Verifica a cota do tenant.
+        Verifica a cota do tenant ou do usuário específico (se o usuário possuir plano individual).
         Retorna um dicionário com:
         - allowed: bool (se pode realizar nova busca)
         - is_unlimited: bool
@@ -66,10 +66,14 @@ class QuotaService:
         - remaining: Optional[int]
         - header_value: str (para o header X-Quota-Remaining)
         """
-        limit = tenant.limite_mensal_consultas
-        # Se limite_mensal_consultas for None ou <= 0, consideramos ilimitado (ex.: Enterprise)
+        if user and getattr(user, "plan", None) is not None:
+            limit = user.limite_mensal_consultas
+        else:
+            limit = tenant.limite_mensal_consultas if tenant else 30
+
+        # Se limite for None, consideramos ilimitado (ex.: Enterprise)
         if limit is None:
-            used = cls.get_monthly_usage(tenant.id, now_utc)
+            used = cls.get_monthly_usage(tenant.id if tenant else 0, now_utc)
             return {
                 "allowed": True,
                 "is_unlimited": True,
@@ -79,7 +83,7 @@ class QuotaService:
                 "header_value": "unlimited",
             }
 
-        used = cls.get_monthly_usage(tenant.id, now_utc)
+        used = cls.get_monthly_usage(tenant.id if tenant else 0, now_utc)
         remaining = max(0, limit - used)
         allowed = used < limit
 

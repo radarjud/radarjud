@@ -24,10 +24,26 @@ class User(db.Model):
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
     role = db.Column(db.String(50), default=ROLE_ANALISTA, nullable=False)
+    plan = db.Column(db.String(50), nullable=True)  # Plano individual (ESSENCIAL, PRO, ENTERPRISE). Se None, herda do Tenant.
+    limite_mensal_consultas = db.Column(db.Integer, nullable=True)  # Limite individual. Se None, herda do Tenant.
     is_active = db.Column(db.Boolean, default=True, nullable=False)
 
     created_at = db.Column(db.DateTime, default=get_utc_now, nullable=False)
     updated_at = db.Column(db.DateTime, default=get_utc_now, onupdate=get_utc_now, nullable=False)
+
+    @property
+    def effective_plan(self) -> str:
+        """Retorna o plano efetivo do usuário: individual se configurado, caso contrário herda do Tenant."""
+        if self.plan:
+            return self.plan
+        return self.tenant.plan if self.tenant else "ESSENCIAL"
+
+    @property
+    def effective_limit(self) -> int | None:
+        """Retorna o limite de consultas: individual se configurado, caso contrário herda do Tenant."""
+        if self.plan:
+            return self.limite_mensal_consultas
+        return self.tenant.limite_mensal_consultas if self.tenant else 30
 
     def set_password(self, password: str):
         if not password or len(password) < 6:
@@ -40,12 +56,17 @@ class User(db.Model):
         return check_password_hash(self.password_hash, password)
 
     def to_dict(self):
+        # Garante estritamente que senha e hash de senha jamais sejam expostos em to_dict()
+        eff_plan = self.effective_plan
         return {
             "id": self.id,
             "tenant_id": self.tenant_id,
             "name": self.name,
             "email": self.email,
             "role": self.role,
+            "plan": eff_plan,
+            "user_plan": self.plan,
+            "limite_mensal_consultas": self.effective_limit,
             "is_active": self.is_active,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,

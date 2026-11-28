@@ -39,6 +39,8 @@ def ensure_database_schema(db_instance):
                 conn.execute(db_instance.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS cnae_descricao VARCHAR(255);"))
                 conn.execute(db_instance.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS public_contracts JSON;"))
                 conn.execute(db_instance.text("ALTER TABLE company_registry ADD COLUMN IF NOT EXISTS public_contracts_cached_at TIMESTAMP;"))
+                conn.execute(db_instance.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan VARCHAR(50);"))
+                conn.execute(db_instance.text("ALTER TABLE users ADD COLUMN IF NOT EXISTS limite_mensal_consultas INTEGER;"))
                 conn.execute(db_instance.text("CREATE INDEX IF NOT EXISTS ix_company_registry_cnae_codigo ON company_registry (cnae_codigo);"))
                 conn.execute(db_instance.text("CREATE TABLE IF NOT EXISTS public_contracts_cache ("
                                               "id SERIAL PRIMARY KEY, "
@@ -121,6 +123,10 @@ def ensure_database_schema(db_instance):
                     ("cnae_descricao", "VARCHAR(255)"),
                     ("public_contracts", "JSON"),
                     ("public_contracts_cached_at", "TIMESTAMP"),
+                ])
+                _sqlite_add_missing("users", [
+                    ("plan", "VARCHAR(50)"),
+                    ("limite_mensal_consultas", "INTEGER"),
                 ])
                 conn.commit()
     except Exception as exc:
