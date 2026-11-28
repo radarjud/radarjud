@@ -172,13 +172,27 @@ def refresh():
 @require_auth
 def get_me():
     """
-    Retorna os dados do usuário autenticado e da sua organização (tenant).
+    Retorna os dados do usuário autenticado e da sua organização (tenant),
+    incluindo status de cota e plano efetivo do usuário.
     """
     user = g.current_user
     tenant = user.tenant
+
+    from app.services.quota_service import QuotaService
+    quota_info = QuotaService.check_quota(tenant, user=user) if tenant else None
+
+    # Se o usuário possui plano individual definido, refletimos no objeto do tenant retornado
+    tenant_dict = tenant.to_dict() if tenant else None
+    if tenant_dict and getattr(user, "plan", None):
+        tenant_dict["plan"] = user.effective_plan
+        tenant_dict["limite_mensal_consultas"] = user.effective_limit
+    if tenant_dict and quota_info:
+        tenant_dict["quota"] = quota_info
+
     return jsonify({
         "user": user.to_dict(),
-        "tenant": tenant.to_dict() if tenant else None,
+        "tenant": tenant_dict,
+        "quota": quota_info,
     }), 200
 
 

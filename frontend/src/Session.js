@@ -98,15 +98,28 @@ export function normalizeTenant(raw) {
     cnpj: raw.cnpj ?? null,
     plan: String(plan),
     planLabel: planLabel(plan),
+    quota: raw.quota ?? null,
   };
 }
 
 export function normalizeSession(raw) {
   const tenantRaw = isRecord(raw) ? raw.tenant : null;
+  const userRaw = isRecord(raw) ? raw.user : null;
+  const userNorm = normalizeUser(userRaw);
+
+  const tenantNorm = normalizeTenant(tenantRaw);
+  // Se o usuário possui plano individual definido, ele se sobrepõe ao plano default do tenant
+  if (userRaw?.plan && tenantNorm) {
+    tenantNorm.plan = String(userRaw.plan);
+    tenantNorm.planLabel = planLabel(userRaw.plan);
+  }
+
+  const quotaBox = isRecord(raw?.quota) ? raw.quota : tenantRaw;
+
   return {
-    user: normalizeUser(isRecord(raw) ? raw.user : null),
-    tenant: normalizeTenant(tenantRaw),
-    quota: normalizeQuota(tenantRaw),
+    user: userNorm,
+    tenant: tenantNorm,
+    quota: normalizeQuota(quotaBox),
   };
 }
 
