@@ -669,6 +669,29 @@ def test_bradesco_consolidates_multiple_roots_and_capital_over_100_billion(monke
     assert res["cenario_tipo"] == "CENARIO_A"
 
 
+def test_execution_phase_preserves_outcomes_sum_and_zero_blocking():
+    """
+    Invariante de sistema: processos em fase de execução/cumprimento não entram como
+    causa material em ranking_motivos, mas continuam compondo 100% dos desfechos e
+    a regra de bloqueio quando não há condenações materiais nem execuções.
+    """
+    from app.services.prediction_engine import BayesianRiskPredictor
+
+    predictor = BayesianRiskPredictor()
+    procs_with_exec = [
+        {"numero_processo": "1", "primary_subject": "Carta Precatória Executória", "sentence_outcome": "em_aberto"},
+        {"numero_processo": "2", "primary_subject": "Liquidação de Sentença", "sentence_outcome": "condenacoes"},
+        {"numero_processo": "3", "primary_subject": "Execução de Sentença", "subjects": ["Execução de Sentença", "FGTS"], "sentence_outcome": "condenacoes"},
+        {"numero_processo": "4", "primary_subject": "Assédio Moral", "sentence_outcome": "improcedentes"},
+    ]
+    res = predictor.generate_dashboard_metrics("EMPRESA INVARIANTE EXEC LTDA", procs_with_exec)
+    assert sum(res["desfechos_sentencas"].values()) == res["total_processos"] == 4
+    assert res["execution_phase_summary"]["total_processos"] == 2
+    assert {r["motivo"] for r in res["ranking_motivos"]} == {"FGTS", "Assédio Moral"}
+    assert res["desfechos_sentencas"]["condenacoes"] == 3
+    assert res["previsao_bloqueada"] is False
+
+
 
 
 

@@ -8,6 +8,10 @@ import {
   ArrowRight, Sparkles, FileText, BarChart3, HelpCircle
 } from 'lucide-react';
 import { CompanyLogo } from './CompanyLogo.jsx';
+import {
+  separateExecutionPhaseData,
+  EXECUTION_PHASE_DESCRIPTION,
+} from './businessLabels.js';
 import { apiFetch } from './apiClient.js';
 
 /**
@@ -299,6 +303,13 @@ function RankedCompanyCard({ company }) {
 
   const isAtiva = !company.situacao_cadastral || company.situacao_cadastral === 'ATIVA';
   const isPrevisaoBloqueada = Boolean(company.previsao_bloqueada);
+  const { executionPhaseSummary: execPhase } = separateExecutionPhaseData({
+    rankingMotivos: company.ranking_motivos,
+    rankingCondenacoes: company.ranking_motivos_condenacao,
+    condenacaoPorMotivo: company.condenacao_por_motivo,
+    executionPhaseSummary: company.execution_phase_summary,
+    totalProcessos: company.total_processos,
+  });
 
   return (
     <div className={`card ranked-card ${borderToneClass}`}>
@@ -365,6 +376,27 @@ function RankedCompanyCard({ company }) {
       {company.recomendacao && (
         <div className="ranked-card-recommendation">
           <p>{company.recomendacao}</p>
+        </div>
+      )}
+
+      {execPhase && execPhase.total_processos > 0 && (
+        <div className="compare-execution-phase" aria-label="Processos em Fase de Execução / Sentença Aplicada">
+          <div className="compare-execution-top">
+            <strong>Processos em Fase de Execução / Sentença Aplicada</strong>
+            <span className="compare-execution-count">
+              {execPhase.total_processos} ({formatPercent(execPhase.percentual_total)})
+            </span>
+          </div>
+          <p>{EXECUTION_PHASE_DESCRIPTION}</p>
+          {Array.isArray(execPhase.rotulos) && execPhase.rotulos.length > 0 && (
+            <div className="execution-phase-badges">
+              {execPhase.rotulos.map((rotulo, idx) => (
+                <span key={`${rotulo}-${idx}`} className="tag gray execution-phase-badge">
+                  {rotulo}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
