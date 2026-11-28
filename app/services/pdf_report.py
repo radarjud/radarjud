@@ -282,17 +282,25 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
             capital_social=float(econ.get("capital_social_num") or 0.0),
         )
 
+    from app.services.prediction_engine import (
+        build_condenacao_por_motivo,
+        empty_execution_phase_summary,
+        normalize_execution_phase_payload,
+    )
+    from app.services.tpu_constants import is_execution_phase_label
+
+    # Normaliza separação entre causas substantivas e fase de execução/cumprimento
+    pre_norm = normalize_execution_phase_payload({
+        "total_processos": total_processes,
+        "ranking_motivos": data.get("ranking_motivos") or data.get("reasons") or [],
+        "ranking_motivos_condenacao": data.get("ranking_motivos_condenacao") or data.get("rankingCondenacoes") or [],
+        "condenacao_por_motivo": data.get("condenacao_por_motivo") or [],
+        "execution_phase_summary": data.get("execution_phase_summary"),
+    })
+
     # Rankings
-    raw_cond_ranking = (
-        data.get("ranking_motivos_condenacao")
-        or data.get("rankingCondenacoes")
-        or []
-    )
-    raw_motivos_ranking = (
-        data.get("ranking_motivos")
-        or data.get("reasons")
-        or []
-    )
+    raw_cond_ranking = pre_norm.get("ranking_motivos_condenacao") or []
+    raw_motivos_ranking = pre_norm.get("ranking_motivos") or []
 
     def _normalize_ranking(items: Any) -> List[Dict[str, Any]]:
         normalized: List[Dict[str, Any]] = []
@@ -304,6 +312,8 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                     it.get("motivo") or it.get("assunto") or it.get("nome") or it.get("subject"),
                     "Motivo não especificado",
                 )
+                if is_execution_phase_label(nome):
+                    continue
                 qtd = int(
                     it.get("quantidade_condenacoes")
                     or it.get("condenacoes")
@@ -315,6 +325,8 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
                 pct = it.get("percentual") or it.get("pct") or it.get("taxa_condenacao_pct")
                 normalized.append({"motivo": nome, "quantidade": qtd, "percentual": pct, "taxa_no_motivo": next((it[k] for k in ("taxa_no_motivo", "taxa_condenacao_no_motivo", "taxa_perda_no_motivo") if it.get(k) is not None), None)})
             elif isinstance(it, str):
+                if is_execution_phase_label(it):
+                    continue
                 normalized.append({"motivo": it, "quantidade": 0, "percentual": None})
         return normalized
 
@@ -323,21 +335,25 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
     # Condenações por Motivo do Processo (US-18)
     condenacao_por_motivo = []
-    raw_cpm = data.get("condenacao_por_motivo")
+    raw_cpm = pre_norm.get("condenacao_por_motivo")
     if not raw_cpm and (data.get("processes") or data.get("processos")):
-        from app.services.prediction_engine import build_condenacao_por_motivo
         raw_cpm = build_condenacao_por_motivo(data.get("processes") or data.get("processos") or [])
 
     if isinstance(raw_cpm, list):
         for it in raw_cpm:
             if isinstance(it, dict):
+                motivo_lbl = str(it.get("motivo") or "Assunto não especificado")
+                if is_execution_phase_label(motivo_lbl):
+                    continue
                 condenacao_por_motivo.append({
-                    "motivo": str(it.get("motivo") or "Assunto não especificado"),
+                    "motivo": motivo_lbl,
                     "total_processos": int(it.get("total_processos") or 0),
                     "condenacoes": int(it.get("condenacoes") or 0),
                     "taxa_condenacao": float(it.get("taxa_condenacao") or 0.0),
                     "faixa_variacao": str(it.get("faixa_variacao") or "0,0% a 0,0%"),
                 })
+
+    execution_phase_summary = pre_norm.get("execution_phase_summary") or empty_execution_phase_summary()
 
     # Parecer Executivo de Compliance (Súmula 331 TST)
     recomendacao = _safe_str(
@@ -451,6 +467,7 @@ def normalize_report_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         "ranking_condenacoes": ranking_condenacoes,
         "ranking_motivos": ranking_motivos,
         "condenacao_por_motivo": condenacao_por_motivo,
+        "execution_phase_summary": execution_phase_summary,
         "contratos_poder_publico": contratos_dict,
         "compliance": {
             "recomendacao": recomendacao,
@@ -762,6 +779,28 @@ def _generate_pdf_reportlab(report: Dict[str, Any]) -> bytes:
 
     story.append(Spacer(1, 8))
 
+    exec_phase = report.get("execution_phase_summary") or {}
+    if int(exec_phase.get("total_processos") or 0) > 0:
+        story.append(Paragraph("Processos em Fase de Execução / Sentença Aplicada", style_h2))
+        rotulos_txt = ", ".join(exec_phase.get("rotulos") or [])
+        exec_msg = (
+            f"<b>{exec_phase['total_processos']} processo(s)</b> ({exec_phase.get('percentual_total', 0.0):.1f}% do total) "
+            f"— {_xml_escape(exec_phase.get('descricao') or '')}"
+        )
+        if rotulos_txt:
+            exec_msg += f"<br/><b>Classificações identificadas:</b> {_xml_escape(rotulos_txt)}"
+        exec_box = Table([[Paragraph(exec_msg, style_body)]], colWidths=[page_w])
+        exec_box.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f8fafc")),
+            ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#cbd5e1")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(exec_box)
+        story.append(Spacer(1, 8))
+
     # 5. Parecer Executivo de Compliance (Súmula 331 TST)
     story.append(Paragraph("Parecer Executivo &amp; Compliance (Súmula 331 TST)", style_h2))
     rec_upper = comp["recomendacao"].upper()
@@ -944,6 +983,17 @@ def _generate_pdf_pure_python(report: Dict[str, Any]) -> bytes:
         else:
             lines.append("   Nenhuma condenacao ou vetor recorrente mapeado.")
 
+    exec_pure = report.get("execution_phase_summary") or {}
+    if int(exec_pure.get("total_processos") or 0) > 0:
+        lines.extend([
+            "-" * 78,
+            "3B. PROCESSOS EM FASE DE EXECUCAO / SENTENCA APLICADA",
+            f"   Total: {exec_pure['total_processos']} processo(s) ({exec_pure.get('percentual_total', 0.0):.1f}%)",
+            f"   Nota: {exec_pure.get('descricao') or ''}",
+        ])
+        if exec_pure.get("rotulos"):
+            lines.append(f"   Rotulos: {', '.join(exec_pure['rotulos'][:5])}")
+
     sub_count_pure = int(comp.get("condenacoes_subsidiarias_tomadoras_count", 0) or 0)
     sub_msg_pure = comp.get("mensagem_responsabilidade_subsidiaria") or (
         f"Histórico de Responsabilidade Subsidiária: {sub_count_pure} processos com condenação subsidiária atribuída a contratantes anteriores"
@@ -1122,10 +1172,18 @@ def _generate_comparative_pdf_reportlab(companies: List[Dict[str, Any]]) -> byte
     # Detalhes das empresas
     for comp in companies:
         c_name = comp["company_name"]
+        exec_c = comp.get("execution_phase_summary") or {}
+        exec_line = (
+            f"<br/>Processos em Fase de Execução / Sentença Aplicada: "
+            f"{exec_c['total_processos']} ({exec_c.get('percentual_total', 0.0):.1f}%)"
+            if int(exec_c.get("total_processos") or 0) > 0
+            else ""
+        )
         econ_summary = (
             f"<b>{_xml_escape(c_name)}</b> — {comp['cnpj_formatted']}<br/>"
             f"Capital Social: {comp['economic']['capital_fmt']} | Situação RFB: {comp['economic']['situacao_rfb']} | "
-            f"Risco Subsidiário: {comp['economic']['risco_sub'] or 0.0:.1f}% | Grau Confiança: {comp['conf_label']}<br/>"
+            f"Risco Subsidiário: {comp['economic']['risco_sub'] or 0.0:.1f}% | Grau Confiança: {comp['conf_label']}"
+            f"{exec_line}<br/>"
             f"Resumo Executivo: {_xml_escape(comp['compliance']['resumo_executivo'])}"
         )
         story.append(Paragraph(econ_summary, cell_body))

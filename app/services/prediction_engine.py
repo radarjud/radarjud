@@ -4,7 +4,6 @@
 import re
 import math
 import logging
-import unicodedata
 from collections import Counter, defaultdict
 from typing import Dict, List, Any, Optional, Tuple, Union, TypedDict
 
@@ -16,6 +15,11 @@ from app.services.tpu_constants import (
     DEFAULT_TRT_ACORDO_PROBABILITY,
     DEFAULT_TRT_IMP_PROBABILITY,
     BAYESIAN_ALPHA_PRIOR,
+    EXECUTION_PHASE_DESCRIPTION,
+    normalize_subject_text,
+    is_execution_phase_label,
+    extract_class_names,
+    classify_execution_vs_material_labels,
 )
 
 logger = logging.getLogger(__name__)
@@ -36,13 +40,149 @@ def safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
         return default
 
 
-def normalize_subject_text(text: str) -> str:
-    """Normaliza acentos (NFKD), caixa e espaços para matching determinístico."""
-    if not text:
+def empty_execution_phase_summary() -> Dict[str, Any]:
+    """Retorna estrutura padrão vazia para processos em fase de execução/cumprimento."""
+    return {
+        "total_processos": 0,
+        "percentual_total": 0.0,
+        "rotulos": [],
+        "descricao": EXECUTION_PHASE_DESCRIPTION,
+    }
+
+
+def build_execution_phase_summary(processes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Computa execution_phase_summary diretamente de uma lista de processos."""
+    total = len(processes or [])
+    if total == 0:
+        return empty_execution_phase_summary()
+
+    execution_only_count = 0
+    labels_counter: Counter = Counter()
+    display_names: Dict[str, str] = {}
+
+    for p in processes:
+        raw_subjects = p.get("subjects")
+        if isinstance(raw_subjects, list) and raw_subjects:
+            subj_list = [str(s).strip() for s in raw_subjects if str(s).strip()]
+        else:
+            primary = str(p.get("primary_subject") or "").strip()
+            subj_list = [primary] if primary else []
+
+        _mat, exec_labels, is_exec_only = classify_execution_vs_material_labels(
+            subj_list, classes_pje=p.get("classes_pje")
+        )
+        if not is_exec_only:
+            continue
+
+        execution_only_count += 1
+        seen_norm = set()
+        for lbl in exec_labels:
+            norm = normalize_subject_text(lbl)
+            if norm and norm not in seen_norm:
+                seen_norm.add(norm)
+                if norm not in display_names:
+                    display_names[norm] = lbl.strip()
+                labels_counter[norm] += 1
+
+    return {
+        "total_processos": execution_only_count,
+        "percentual_total": round((execution_only_count / total) * 100.0, 1),
+        "rotulos": [display_names[n] for n, _ in labels_counter.most_common()],
+        "descricao": EXECUTION_PHASE_DESCRIPTION,
+    }
+
+
+def normalize_execution_phase_payload(
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Normaliza payload (inclusive registros legados em cache L1/BD) separando
+    eventuais rótulos estritamente de execução/cumprimento das tabelas de motivos
+    e garantindo a presença de 'execution_phase_summary'.
+    """
+    if not isinstance(payload, dict):
+        return payload
+
+    total_processos = safe_int(payload.get("total_processos"), default=0) or 0
+    existing_exec = payload.get("execution_phase_summary")
+    ranking = payload.get("ranking_motivos") or []
+    ranking_cond = payload.get("ranking_motivos_condenacao") or []
+    cpm = payload.get("condenacao_por_motivo") or []
+
+    def _item_label(item: Any) -> str:
+        if isinstance(item, dict):
+            return str(item.get("motivo") or item.get("nome") or "").strip()
         return ""
-    decomposed = unicodedata.normalize("NFKD", str(text))
-    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
-    return " ".join(stripped.lower().split())
+
+    filtered_ranking = [
+        item for item in ranking if not is_execution_phase_label(_item_label(item))
+    ]
+    filtered_ranking_cond = [
+        item for item in ranking_cond if not is_execution_phase_label(_item_label(item))
+    ]
+    filtered_cpm = [
+        item for item in cpm if not is_execution_phase_label(_item_label(item))
+    ]
+
+    if isinstance(existing_exec, dict) and "total_processos" in existing_exec:
+        exec_total = safe_int(existing_exec.get("total_processos"), default=0) or 0
+        pct = existing_exec.get("percentual_total")
+        if pct is None:
+            pct = round((exec_total / total_processos) * 100.0, 1) if total_processos > 0 else 0.0
+        rotulos = [
+            str(r).strip()
+            for r in (existing_exec.get("rotulos") or [])
+            if str(r).strip()
+        ]
+        summary = {
+            "total_processos": exec_total,
+            "percentual_total": round(float(pct or 0.0), 1),
+            "rotulos": rotulos,
+            "descricao": existing_exec.get("descricao") or EXECUTION_PHASE_DESCRIPTION,
+        }
+    else:
+        # Fallback determinístico para payloads antigos em cache/banco
+        exec_rotulos: List[str] = []
+        seen_norm = set()
+        exec_total = 0
+
+        # Preferir condenacao_por_motivo (partição 1:1 de processos) se houver itens de execução nela
+        cpm_exec_items = [item for item in cpm if is_execution_phase_label(_item_label(item))]
+        ranking_exec_items = [item for item in ranking if is_execution_phase_label(_item_label(item))]
+        cond_exec_items = [item for item in ranking_cond if is_execution_phase_label(_item_label(item))]
+
+        source_for_count = cpm_exec_items or ranking_exec_items or cond_exec_items
+        for item in source_for_count:
+            cnt = safe_int(
+                item.get("total_processos")
+                if item.get("total_processos") is not None
+                else (item.get("quantidade") if item.get("quantidade") is not None else item.get("total")),
+                default=0,
+            ) or 0
+            exec_total += cnt
+
+        for item in cpm_exec_items + ranking_exec_items + cond_exec_items:
+            lbl = _item_label(item)
+            norm = normalize_subject_text(lbl)
+            if lbl and norm not in seen_norm:
+                seen_norm.add(norm)
+                exec_rotulos.append(lbl)
+
+        if total_processos > 0 and exec_total > total_processos:
+            exec_total = total_processos
+
+        summary = {
+            "total_processos": exec_total,
+            "percentual_total": round((exec_total / total_processos) * 100.0, 1) if total_processos > 0 else 0.0,
+            "rotulos": exec_rotulos,
+            "descricao": EXECUTION_PHASE_DESCRIPTION,
+        }
+
+    payload["ranking_motivos"] = filtered_ranking
+    payload["ranking_motivos_condenacao"] = filtered_ranking_cond
+    payload["condenacao_por_motivo"] = filtered_cpm
+    payload["execution_phase_summary"] = summary
+    return payload
 
 
 def _tilt_simplex(
@@ -218,14 +358,23 @@ def build_conviction_ranking_and_vectors(processes: list[dict]) -> tuple[list[di
             raw_assuntos = [{"codigo": 0, "nome": s} for s in p.get("subjects") if s]
         if not raw_assuntos and p.get("primary_subject"):
             raw_assuntos = [{"codigo": 0, "nome": p.get("primary_subject")}]
-        if not raw_assuntos:
-            raw_assuntos = [{"codigo": 0, "nome": "Reclamação em Apuração"}]
+
+        raw_names = [
+            ((ass.get("nome") if isinstance(ass, dict) else str(ass)) or "").strip()
+            for ass in raw_assuntos
+        ]
+        raw_names = [n for n in raw_names if n]
+        material_labels, _exec_labels, is_exec_only = classify_execution_vs_material_labels(
+            raw_names, classes_pje=p.get("classes_pje")
+        )
+        if is_exec_only:
+            continue
+
+        effective_names = material_labels if material_labels else (raw_names or ["Reclamação em Apuração"])
 
         # Evita contar o mesmo motivo duas vezes no mesmo processo
         seen_names_in_proc = set()
-        for ass in raw_assuntos:
-            nome = (ass.get("nome") if isinstance(ass, dict) else str(ass)) or ""
-            nome = nome.strip()
+        for nome in effective_names:
             if not nome or nome in seen_names_in_proc:
                 continue
             seen_names_in_proc.add(nome)
@@ -311,7 +460,7 @@ def classify_process_canonical_motive(process: Dict[str, Any]) -> str:
                 elif isinstance(c, str) and c.strip():
                     candidates.append(c.strip())
 
-        texts = process.get("publicacoes_texto") or []
+        texts = process.get("publicacoes_texto") or ([process["resumoPublicacao"]] if process.get("resumoPublicacao") else [])
         if isinstance(texts, list):
             for t in texts[:3]:
                 if t and isinstance(t, str):
@@ -319,6 +468,14 @@ def classify_process_canonical_motive(process: Dict[str, Any]) -> str:
 
     if not candidates:
         return "Assunto não especificado"
+
+    material_candidates, _exec_candidates, is_exec_only = classify_execution_vs_material_labels(
+        candidates, classes_pje=process.get("classes_pje")
+    )
+    if is_exec_only:
+        return "Execução / Cumprimento de Sentença"
+    if material_candidates:
+        candidates = material_candidates
 
     full_normalized = " ".join(normalize_subject_text(c) for c in candidates)
     if not full_normalized.strip() or full_normalized.strip() in ("assunto nao especificado", "nao informado"):
@@ -407,10 +564,12 @@ def build_condenacao_por_motivo(processes: List[Dict[str, Any]]) -> List[Dict[st
     if not processes:
         return []
 
-    # Agrupa todos os processos por motivo canônico (1 processo = exatamente 1 motivo)
+    # Agrupa todos os processos substantivos por motivo canônico (exclui estritamente execução/cumprimento)
     grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for p in processes:
         motive = classify_process_canonical_motive(p)
+        if motive == "Execução / Cumprimento de Sentença":
+            continue
         grouped[motive].append(p)
 
     results: List[Dict[str, Any]] = []
@@ -751,6 +910,7 @@ class BayesianRiskPredictor:
                 "ranking_motivos": [],
                 "ranking_motivos_condenacao": [],
                 "condenacao_por_motivo": [],
+                "execution_phase_summary": empty_execution_phase_summary(),
                 "desfechos_sentencas": outcomes,
                 "desfechos_detalhados": detailed_outcomes,
                 "niveis_sigilo": {},
@@ -764,6 +924,9 @@ class BayesianRiskPredictor:
 
         reasons_counter: Counter = Counter()
         canonical_display_name: Dict[str, str] = {}
+        execution_only_count = 0
+        execution_labels_counter: Counter = Counter()
+        exec_display_names: Dict[str, str] = {}
         secrecy_levels: Counter = Counter()
         tribunal_counter: Counter = Counter()
 
@@ -824,7 +987,7 @@ class BayesianRiskPredictor:
                 for s in subj_list
             )
             if is_all_generic:
-                raw_texts = p.get("publicacoes_texto") or []
+                raw_texts = p.get("publicacoes_texto") or ([p["resumoPublicacao"]] if p.get("resumoPublicacao") else [])
                 classes_pje = p.get("classes_pje") or []
                 if raw_texts or classes_pje:
                     extracted = extract_real_cause_fast([], raw_texts, classes_pje=classes_pje)
@@ -834,9 +997,10 @@ class BayesianRiskPredictor:
             if not subj_list:
                 subj_list = ["Outros Motivos Trabalhistas"]
 
-            # Remove duplicatas no mesmo processo preservando a ordem
-            unique_subjects = list(dict.fromkeys(subj_list))
-            is_multi_subject = len(unique_subjects) > 1
+            material_subjects, exec_labels_in_proc, is_exec_only = classify_execution_vs_material_labels(
+                subj_list, classes_pje=p.get("classes_pje")
+            )
+
             reason_code = safe_int(p.get("primary_subject_code"))
             # Ignora códigos TPU genéricos de raiz (864 = Direito do Trabalho, 899 = Processo do Trabalho, 10000 = Outros)
             # para evitar que múltiplos motivos específicos distintos colapsem sob a chave genérica 'tpu:864'
@@ -845,19 +1009,34 @@ class BayesianRiskPredictor:
 
             # BUG 2: Processos em Execução / Cumprimento de Sentença / Liquidação JÁ POSSUEM CONDENAÇÃO!
             if eff_status == "em_aberto":
-                if any(
-                    k in normalize_subject_text(s)
-                    for s in unique_subjects
-                    for k in ("execuc", "cumprimento de senten", "liquidac", "penhora", "sisbajud")
-                ):
+                if exec_labels_in_proc or any(is_execution_phase_label(s) for s in subj_list):
                     outcomes["em_aberto"] -= 1
                     outcomes["condenacoes"] += 1
                     detailed_outcomes["procedencia_total"] += 1
                     detailed_outcomes["em_aberto"] = max(0, detailed_outcomes["em_aberto"] - 1)
                     eff_status = "condenacoes"
 
-            has_sumula_331_in_proc = False
+            has_sumula_331_in_proc = bool(exec_labels_in_proc)
             has_rescisoria_in_proc = False
+
+            if is_exec_only:
+                execution_only_count += 1
+                seen_exec_norm = set()
+                for exec_label in exec_labels_in_proc:
+                    norm_exec = normalize_subject_text(exec_label)
+                    if norm_exec and norm_exec not in seen_exec_norm:
+                        seen_exec_norm.add(norm_exec)
+                        if norm_exec not in exec_display_names:
+                            exec_display_names[norm_exec] = exec_label.strip()
+                        execution_labels_counter[norm_exec] += 1
+                if has_sumula_331_in_proc:
+                    sumula_331_direct_count += 1
+                continue
+
+            # Remove duplicatas no mesmo processo preservando a ordem (somente assuntos materiais)
+            effective_subjects = material_subjects if material_subjects else subj_list
+            unique_subjects = list(dict.fromkeys(effective_subjects))
+            is_multi_subject = len(unique_subjects) > 1
 
             for idx, reason_label in enumerate(unique_subjects):
                 code_for_sub = reason_code if idx == 0 else None
@@ -1036,12 +1215,23 @@ class BayesianRiskPredictor:
             outcomes["em_aberto"] = max(0, outcomes["em_aberto"] + diff)
             detailed_outcomes["em_aberto"] = max(0, detailed_outcomes["em_aberto"] + diff)
 
+        execution_phase_summary = {
+            "total_processos": execution_only_count,
+            "percentual_total": round((execution_only_count / total) * 100.0, 1) if total > 0 else 0.0,
+            "rotulos": [
+                exec_display_names[norm_lbl]
+                for norm_lbl, _ in execution_labels_counter.most_common()
+            ],
+            "descricao": EXECUTION_PHASE_DESCRIPTION,
+        }
+
         return {
             "empresa": company_name,
             "total_processos": total,
             "ranking_motivos": ranking,
             "ranking_motivos_condenacao": ranking_condenacoes,
             "condenacao_por_motivo": build_condenacao_por_motivo(processes),
+            "execution_phase_summary": execution_phase_summary,
             "previsao_bloqueada": previsao_bloqueada,
             "motivo_bloqueio_previsao": motivo_bloqueio_previsao,
             "desfechos_sentencas": outcomes,
@@ -1184,7 +1374,7 @@ def build_sector_benchmark(
     processed_companies = []
 
     for raw in company_payloads:
-        p = dict(raw) if isinstance(raw, dict) else {}
+        p = normalize_execution_phase_payload(dict(raw)) if isinstance(raw, dict) else {}
 
         empresa_nome = str(
             p.get("empresa")
@@ -1435,6 +1625,9 @@ def build_sector_benchmark(
             "cnae_descricao": str(cnae_desc).strip() if cnae_desc else None,
             "previsao_bloqueada": previsao_bloqueada,
             "total_processos": p.get("total_processos", 0),
+            "execution_phase_summary": p.get("execution_phase_summary") or empty_execution_phase_summary(),
+            "ranking_motivos": p.get("ranking_motivos", []),
+            "condenacao_por_motivo": p.get("condenacao_por_motivo", []),
             "situacao_cadastral": str(econ.get("situacao_cadastral") or p.get("situacao_cadastral") or "ATIVA").upper(),
             "logo": p.get("logo") or econ.get("logo") or {},
             "search_id": p.get("search_id") or p.get("id"),

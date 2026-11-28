@@ -151,13 +151,30 @@ class CompanySearch(db.Model):
                 "sinais_solvencia_publica": None,
             }
 
+        from app.services.prediction_engine import (
+            build_condenacao_por_motivo,
+            build_execution_phase_summary,
+            normalize_execution_phase_payload,
+        )
+
         cond_por_motivo = _safe_list(self.condenacao_por_motivo)
+        proc_dicts_cached = None
         if not cond_por_motivo and self.processes:
             try:
-                from app.services.prediction_engine import build_condenacao_por_motivo
-                cond_por_motivo = build_condenacao_por_motivo([p.to_dict() for p in self.processes])
+                proc_dicts_cached = [p.to_dict() for p in self.processes]
+                cond_por_motivo = build_condenacao_por_motivo(proc_dicts_cached)
             except Exception:
                 cond_por_motivo = []
+
+        exec_phase_summary = (
+            econ_data.get("execution_phase_summary")
+            if isinstance(econ_data, dict)
+            else None
+        )
+        if exec_phase_summary is None and self.processes:
+            if proc_dicts_cached is None:
+                proc_dicts_cached = [p.to_dict() for p in self.processes]
+            exec_phase_summary = build_execution_phase_summary(proc_dicts_cached)
 
         sub_count = int(self.condenacoes_subsidiarias_tomadoras_count or 0)
         sub_tomadoras = _safe_list(self.tomadoras_subsidiarias_pj)
@@ -181,7 +198,7 @@ class CompanySearch(db.Model):
 
         tst_count = self._count_tst_processes()
 
-        return {
+        payload = {
             "id": self.id,
             "tenant_id": self.tenant_id,
             "company_name": self.company_name,
@@ -199,6 +216,7 @@ class CompanySearch(db.Model):
             "ranking_motivos": self.ranking_motivos or [],
             "ranking_motivos_condenacao": self.ranking_motivos_condenacao or [],
             "condenacao_por_motivo": cond_por_motivo or [],
+            "execution_phase_summary": exec_phase_summary,
             "previsao_bloqueada": previsao_bloqueada,
             "motivo_bloqueio_previsao": motivo_bloqueio,
             "plus_previsao_condenacao": plus_previsoes,
@@ -223,6 +241,7 @@ class CompanySearch(db.Model):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+        return normalize_execution_phase_payload(payload)
 
     def _count_tst_processes(self) -> int:
         """Conta processos no TST diretamente sobre 100% dos registros persistidos no banco."""

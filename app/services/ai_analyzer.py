@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 import requests
 
+from app.utils.crypto import make_json_safe
+from app.services.tpu_constants import is_execution_phase_label
+
 logger = logging.getLogger(__name__)
 
 # Cache em memória para pareceres comparativos (proteção Render Free 512 MB RAM)
@@ -385,7 +388,7 @@ class LegalAIAnalyzer:
                 url = f"{self.agent_service_url.rstrip('/')}/analisar-empresa"
                 resp = requests.post(
                     url,
-                    json={"company_name": empresa, "resumo_metricas": summary_data},
+                    json=make_json_safe({"company_name": empresa, "resumo_metricas": summary_data}),
                     timeout=15,
                 )
                 if resp.ok:
@@ -398,6 +401,7 @@ class LegalAIAnalyzer:
         # 2. Execução direta in-process do radarjusAgent (Google ADK)
         if ADK_AGENT_AVAILABLE and _adk_gerar_parecer is not None:
             try:
+                safe_summary = make_json_safe(summary_data)
                 try:
                     loop = asyncio.get_running_loop()
                 except RuntimeError:
@@ -406,11 +410,11 @@ class LegalAIAnalyzer:
                 if loop and loop.is_running():
                     import concurrent.futures
                     def _run_adk_task():
-                        return asyncio.run(_adk_gerar_parecer(empresa, summary_data))
+                        return asyncio.run(_adk_gerar_parecer(empresa, safe_summary))
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                         return pool.submit(_run_adk_task).result(timeout=20)
                 else:
-                    return asyncio.run(_adk_gerar_parecer(empresa, summary_data))
+                    return asyncio.run(_adk_gerar_parecer(empresa, safe_summary))
             except Exception as exc:
                 logger.warning("Erro ao executar radarjusAgent ADK in-process: %s", exc)
 
@@ -457,7 +461,13 @@ class LegalAIAnalyzer:
         improcedentes = outcomes.get("improcedentes", 0)
         em_aberto = outcomes.get("em_aberto", 0)
         total_julgados = condenacoes + improcedentes + acordos
-        ranking = summary_data.get("ranking_motivos", [])
+        raw_ranking = summary_data.get("ranking_motivos", []) or []
+        ranking = [
+            r for r in raw_ranking
+            if isinstance(r, dict) and not is_execution_phase_label(r.get("motivo") or r.get("nome"))
+        ]
+        exec_phase = summary_data.get("execution_phase_summary") or {}
+        exec_phase_count = int(exec_phase.get("total_processos") or 0) if isinstance(exec_phase, dict) else 0
 
         # Dados de Idoneidade Econômica e Solvência Patrimonial
         econ = summary_data.get("idoneidade_economica") or {}
@@ -562,10 +572,19 @@ class LegalAIAnalyzer:
             specific_motivos = [
                 r["motivo"] for r in ranking
                 if r.get("motivo", "").lower() not in generic_ai_terms
+                and not is_execution_phase_label(r.get("motivo"))
             ]
-            chosen_pool = specific_motivos if specific_motivos else [r.get("motivo") for r in ranking if r.get("motivo")]
+            chosen_pool = specific_motivos if specific_motivos else [
+                r.get("motivo") for r in ranking
+                if r.get("motivo") and not is_execution_phase_label(r.get("motivo"))
+            ]
             top_motivos = chosen_pool[:3] if chosen_pool else ["Temas Contratuais Gerais"]
             motivos_str = ", ".join(top_motivos)
+            exec_note = (
+                f" Adicionalmente, {exec_phase_count} processo(s) encontram-se exclusivamente em fase de execução/cumprimento de sentença."
+                if exec_phase_count > 0
+                else ""
+            )
 
             if cenario_tipo == "CENARIO_A":
                 rec_homologacao = "APROVAR / RISCO MITIGADO"
@@ -574,7 +593,7 @@ class LegalAIAnalyzer:
                     f"A empresa {empresa} possui {total} processo(s) em tramitação ({motivos_str}) e plena solidez "
                     f"patrimonial comprovada (Capital Social de {capital_fmt} e solvência ativa). O amplo lastro econômico "
                     f"assegura a quitação autônoma de qualquer contingência, eliminando o risco de redirecionamento "
-                    f"subsidiário ao tomador de serviços nos termos da Súmula 331 do TST."
+                    f"subsidiário ao tomador de serviços nos termos da Súmula 331 do TST.{exec_note}"
                 )
             else:
                 rec_homologacao = "APROVAR COM RETENÇÃO CAUTELAR"
@@ -583,7 +602,7 @@ class LegalAIAnalyzer:
                     f"A empresa {empresa} possui {total} processo(s) em tramitação ({motivos_str}), porém "
                     f"nenhum desfecho anterior transitado em julgado (sentença ou acordo homologado). "
                     f"Sem dados pretéritos de julgamento na empresa, as estimativas de probabilidade de vitória "
-                    f"adotam exclusivamente as médias jurisprudenciais basais dos TRTs."
+                    f"adotam exclusivamente as médias jurisprudenciais basais dos TRTs.{exec_note}"
                 )
 
             return {
@@ -630,10 +649,19 @@ class LegalAIAnalyzer:
         specific_motivos = [
             r["motivo"] for r in ranking
             if r.get("motivo", "").lower() not in generic_ai_terms
+            and not is_execution_phase_label(r.get("motivo"))
         ]
-        chosen_pool = specific_motivos if specific_motivos else [r.get("motivo") for r in ranking if r.get("motivo")]
+        chosen_pool = specific_motivos if specific_motivos else [
+            r.get("motivo") for r in ranking
+            if r.get("motivo") and not is_execution_phase_label(r.get("motivo"))
+        ]
         top_motivos = chosen_pool[:3] if chosen_pool else ["Relações Contratuais Gerais"]
         motivos_str = ", ".join(top_motivos)
+        exec_alert_line = (
+            [f"Fase de Execução / Sentença Aplicada: {exec_phase_count} processo(s) em etapa de cumprimento, liquidação ou cobrança (separados das causas raízes)."]
+            if exec_phase_count > 0
+            else []
+        )
 
         # Diagnóstico integrado de risco: subordina a recomendação ao lastro patrimonial (Cenário A vs B)
         if cenario_tipo == "CENARIO_A":
@@ -710,6 +738,7 @@ class LegalAIAnalyzer:
             "alertas_sumula_331": [
                 f"Assuntos recorrentes: {motivos_str}.",
                 f"Desfechos analisados: {condenacoes} condenações, {acordos} acordos, {improcedentes} improcedentes e {em_aberto} em aberto.",
+                *exec_alert_line,
                 alerta_sub_txt,
             ],
             "historico_responsabilidade_subsidiaria": {
@@ -763,13 +792,22 @@ class LegalAIAnalyzer:
 
         # 2. Se houver chave Gemini REST, monta prompt estruturado
         if self.gemini_api_key:
+            prompt_payload = dict(summary_data)
+            if isinstance(prompt_payload.get("ranking_motivos"), list):
+                prompt_payload["ranking_motivos"] = [
+                    r for r in prompt_payload["ranking_motivos"]
+                    if isinstance(r, dict) and not is_execution_phase_label(r.get("motivo") or r.get("nome"))
+                ]
             prompt = (
                 "Você é um consultor jurídico sênior especialista em passivo trabalhista brasileiro e Súmula 331 do TST. "
                 "Analise os metadados JSON a seguir e retorne um diagnóstico objetivo em formato JSON contendo: "
                 "'perfil_risco_consolidado', 'resumo_executivo', 'recomendacao_homologacao', "
                 "'taxa_historica_vitoria_empresa_pct', 'principais_vulnerabilidades', "
                 "'alertas_sumula_331', 'recomendacoes_compliance'.\n"
-                f"Metadados: {json.dumps(summary_data, ensure_ascii=False)}"
+                "REGRA IMPORTANTE: O campo 'execution_phase_summary' indica processos que já concluíram a fase de "
+                "conhecimento e encontram-se apenas em etapa de execução, cumprimento ou liquidação de sentença; "
+                "NÃO trate a fase de execução ou cumprimento de sentença como causa raiz do litígio nem a inclua em 'principais_vulnerabilidades'.\n"
+                f"Metadados: {json.dumps(prompt_payload, ensure_ascii=False, default=str)}"
             )
             cloud_result = self._call_gemini_api(prompt)
             if cloud_result:
@@ -868,7 +906,7 @@ class LegalAIAnalyzer:
             "Súmula 331 do TST e governança de risco com terceiros (RiskTech).\n"
             "Analise os fornecedores abaixo, já matematicamente ranqueados por menor risco subsidiário e solvência:\n\n"
             f"Segmento: {cnae_str}\n"
-            f"Dados consolidados: {json.dumps(summary_items, ensure_ascii=False, indent=2)}\n\n"
+            f"Dados consolidados: {json.dumps(summary_items, ensure_ascii=False, indent=2, default=str)}\n\n"
             "DIRETRIZES E GUARDRAILS ANTI-ALUCINAÇÃO:\n"
             f"1. A empresa em 1º lugar DEVE SER EXATAMENTE '{vencedora}'. É estritamente proibido alterar o ranking ou trocar a vencedora.\n"
             "2. Não invente números, percentuais ou valores financeiros diferentes dos informados nos dados acima.\n"
@@ -895,7 +933,7 @@ class LegalAIAnalyzer:
                 url = f"{self.agent_service_url.rstrip('/')}/comparar-empresas"
                 resp = requests.post(
                     url,
-                    json={"empresas_ranqueadas": ranked_companies, "cnae_info": cnae_info},
+                    json=make_json_safe({"empresas_ranqueadas": ranked_companies, "cnae_info": cnae_info}),
                     timeout=2.0,
                 )
                 if resp.ok:
@@ -910,7 +948,7 @@ class LegalAIAnalyzer:
                 import agents.clients_agent as _clients_agent
                 if hasattr(_clients_agent, "gerar_parecer_comparativo_adk"):
                     adk_func = getattr(_clients_agent, "gerar_parecer_comparativo_adk")
-                    return asyncio.run(adk_func(ranked_companies, cnae_info))
+                    return asyncio.run(adk_func(make_json_safe(ranked_companies), make_json_safe(cnae_info)))
             except Exception as exc:
                 logger.debug("radarjusAgent comparativo in-process indisponível: %s", exc)
 

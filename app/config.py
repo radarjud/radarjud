@@ -33,6 +33,42 @@ def _database_url() -> str:
             except Exception:
                 db_file = BASE_DIR / "radarjud.db"
                 return f"sqlite:///{db_file}"
+
+        # Se a URL aponta para localhost ou 127.0.0.1 (portas 5432 ou 55432)
+        if any(h in configured_url for h in ("@localhost:", "@127.0.0.1:")):
+            try:
+                import psycopg2
+                test_uri = (
+                    configured_url.replace("postgresql+psycopg2://", "postgresql://")
+                    .replace("@localhost:", "@127.0.0.1:")
+                )
+                conn = psycopg2.connect(test_uri, connect_timeout=1)
+                conn.close()
+                return configured_url
+            except Exception:
+                # Tenta alternar entre as portas 5432 e 55432 (Docker x Local)
+                if ":5432" in configured_url:
+                    alt_url = configured_url.replace(":5432", ":55432")
+                elif ":55432" in configured_url:
+                    alt_url = configured_url.replace(":55432", ":5432")
+                else:
+                    alt_url = None
+
+                if alt_url:
+                    try:
+                        alt_test = (
+                            alt_url.replace("postgresql+psycopg2://", "postgresql://")
+                            .replace("@localhost:", "@127.0.0.1:")
+                        )
+                        conn = psycopg2.connect(alt_test, connect_timeout=1)
+                        conn.close()
+                        return alt_url
+                    except Exception:
+                        pass
+
+                db_file = BASE_DIR / "radarjud.db"
+                return f"sqlite:///{db_file.as_posix()}"
+
         return configured_url
 
     # Fallback para Postgres apenas se credenciais/host foram explicitamente definidos sem DATABASE_URL
@@ -42,10 +78,25 @@ def _database_url() -> str:
         host = os.getenv("POSTGRES_HOST", "localhost")
         port = os.getenv("POSTGRES_PORT", "5432")
         db_name = os.getenv("POSTGRES_DB", "radarjud")
-        return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db_name}"
+        uri = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db_name}"
+        if host in ("localhost", "127.0.0.1") and port == "5432":
+            try:
+                import psycopg2
+                conn = psycopg2.connect(uri.replace("postgresql+psycopg2://", "postgresql://"), connect_timeout=1)
+                conn.close()
+            except Exception:
+                alt_uri = f"postgresql+psycopg2://{user}:{password}@{host}:55432/{db_name}"
+                try:
+                    conn = psycopg2.connect(alt_uri.replace("postgresql+psycopg2://", "postgresql://"), connect_timeout=1)
+                    conn.close()
+                    return alt_uri
+                except Exception:
+                    db_file = BASE_DIR / "radarjud.db"
+                    return f"sqlite:///{db_file.as_posix()}"
+        return uri
 
     db_file = BASE_DIR / "radarjud.db"
-    return f"sqlite:///{db_file}"
+    return f"sqlite:///{db_file.as_posix()}"
 
 
 def _build_engine_options(db_uri: str) -> dict[str, Any]:

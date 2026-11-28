@@ -740,6 +740,7 @@ OFFICIAL_CORPORATE_CNPJ_DIRECTORY: Dict[str, List[str]] = {
     "TIM": ["02421421000111"],
     "CLARO": ["40432544000147"],
     "CORREIOS": ["34028316000103"],
+    "SOSERVI": ["09863853000121", "11572781000105"],
 }
 
 # Metadados oficiais de fallback garantidos para resiliência máxima em consultas de catálogo
@@ -2119,6 +2120,7 @@ def extract_cnpj_from_processes(processes: List[Dict[str, Any]]) -> Optional[str
     for p in processes:
         text_corpus = " ".join([
             str(p.get("observation") or ""),
+            str(p.get("resumoPublicacao") or ""),
             str(p.get("raw_metadata") or ""),
             " ".join(p.get("subjects") or []),
             " ".join(p.get("publicacoes_texto") or []),

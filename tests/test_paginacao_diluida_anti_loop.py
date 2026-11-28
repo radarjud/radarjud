@@ -642,7 +642,7 @@ def test_upstream_http_error_resumes_same_page(client, app):
                 resp.json.return_value = {"items": _comm_page("2600000012024502" + "0", "p2")}
             else:
                 import time as _t
-                _t.sleep(0.05)
+                _t.sleep(0.06)
                 resp.ok = False
                 resp.status_code = 503
             return resp
@@ -652,7 +652,7 @@ def test_upstream_http_error_resumes_same_page(client, app):
             # Simula time_budget curto via paginate_labor_courts_batch para retornar UPSTREAM_RETRY na pág 3
             orig_fn = CNJProcessSearcher.paginate_labor_courts_batch
             def _short_budget(self, *args, **kwargs):
-                kwargs["time_budget_seconds"] = 0.02
+                kwargs["time_budget_seconds"] = 0.05
                 return orig_fn(self, *args, **kwargs)
             with patch.object(CNJProcessSearcher, "paginate_labor_courts_batch", _short_budget):
                 data = client.post(f"/api/v1/deep-scan-batch/{search_id}", json={"page": 2, "batch_size": 3}).get_json()

@@ -12,7 +12,7 @@ import requests
 
 from app.utils.http_client import request_gov_br_with_fallback
 from app.utils.sanitizer import sanitize_company_name, is_cnpj, fetch_cnpj_brasilapi, remove_accents, extract_brand_search_term
-from app.utils.crypto import generate_movements_hash
+from app.utils.crypto import generate_movements_hash, make_json_safe
 from app.utils.rate_limiter import RateLimiter
 from app.services.ai_analyzer import LegalAIAnalyzer
 from app.services.prediction_engine import BayesianRiskPredictor, safe_int
@@ -20,7 +20,11 @@ from app.services.tpu_constants import (
     TPU_OUTCOME_CODES,
     TPU_EXPERT_REPORT_CODES,
 )
-from app.utils.http_client import request_gov_br_with_fallback
+from app.services.cnj_searcher import (
+    SYNC_SCAN_MAX_PAGES,
+    SYNC_SCAN_MAX_RECORDS,
+    SYNC_SCAN_TIME_BUDGET_SECONDS,
+)
 
 import html
 
@@ -515,7 +519,13 @@ class CNJMetadataOrchestrator:
         self.searcher.datajud_key = self.datajud_key
         if fast_path:
             return self.searcher.fetch_single_comunica_page(brand_term, page_num=1, timeout=5.0)
-        procs, disc = self.searcher.fetch_comunica_pje_all_branches(brand_term, max_pages=max_pages if max_pages > 2 else 10)
+        resolved_pages = min(SYNC_SCAN_MAX_PAGES, max_pages) if max_pages > 2 else min(SYNC_SCAN_MAX_PAGES, 10)
+        procs, disc = self.searcher.fetch_comunica_pje_all_branches(
+            brand_term,
+            max_pages=resolved_pages,
+            time_budget_seconds=SYNC_SCAN_TIME_BUDGET_SECONDS,
+            max_records=SYNC_SCAN_MAX_RECORDS,
+        )
         self.last_discovered_entities = list(disc)
         return procs
 
@@ -748,15 +758,15 @@ class CNJMetadataOrchestrator:
                             if proc.get("valor_causa") is not None:
                                 rec.valor_causa = proc.get("valor_causa")
                             if proc.get("raw_metadata"):
-                                rec.raw_metadata = proc.get("raw_metadata")
+                                rec.raw_metadata = make_json_safe(proc.get("raw_metadata"))
                             if "has_subsidiary_liability" in proc:
                                 rec.has_subsidiary_liability = bool(proc.get("has_subsidiary_liability", False))
                             if "subsidiary_contractors" in proc:
-                                rec.subsidiary_contractors_json = proc.get("subsidiary_contractors") or []
+                                rec.subsidiary_contractors_json = make_json_safe(proc.get("subsidiary_contractors") or [])
                     else:
                         # Insere novo processo
                         has_sub = bool(proc.get("has_subsidiary_liability", False))
-                        sub_contractors = proc.get("subsidiary_contractors") or []
+                        sub_contractors = make_json_safe(proc.get("subsidiary_contractors") or [])
                         new_record = ProcessRecord(
                             company_search_id=company_search_id,
                             numero_processo=p_num,
@@ -765,7 +775,7 @@ class CNJMetadataOrchestrator:
                             nivel_sigilo=proc.get("nivelSigilo", 0),
                             primary_subject=proc.get("primary_subject"),
                             primary_subject_code=proc.get("primary_subject_code"),
-                            subjects_json=proc.get("subjects"),
+                            subjects_json=make_json_safe(proc.get("subjects")),
                             observation=proc.get("observation"),
                             sentence_outcome=proc.get("sentence_outcome", "em_aberto"),
                             has_expert_report=proc.get("has_expert_report", False),
@@ -773,7 +783,7 @@ class CNJMetadataOrchestrator:
                             subsidiary_contractors_json=sub_contractors,
                             data_distribuicao=proc.get("data_distribuicao"),
                             valor_causa=proc.get("valor_causa"),
-                            raw_metadata=proc.get("raw_metadata"),
+                            raw_metadata=make_json_safe(proc.get("raw_metadata")),
                         )
                         db.session.add(new_record)
                         existing_map[norm_num] = new_record
@@ -827,14 +837,14 @@ class CNJMetadataOrchestrator:
         """
         Executa a análise da empresa com dados reais completos.
         - Se fast_path=True: busca rápida (< 3s na primeira página).
-        - Se fast_path=False: Deep Scan em segundo plano varrendo em paralelo até 12 páginas (até 600 publicações)
-          para capturar todas as filiais e empresas vinculadas do grupo.
+        - Se fast_path=False: varredura calibrada para Render Free até 15 páginas (1.500 registros /
+          orçamento de 50s) descartando HTML bruto para manter RAM < 380 MB.
         """
         cache_key = company_name.strip().lower()
         if not fast_path and cache_key in self._cache:
             return self._cache[cache_key]
 
-        max_pages = 1 if fast_path else 12
+        max_pages = 1 if fast_path else SYNC_SCAN_MAX_PAGES
         discovered_entities: List[str] = []
 
         query_term = None

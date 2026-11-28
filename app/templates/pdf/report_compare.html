@@ -340,7 +340,14 @@
           </div>
           <p style="font-size: 7.2pt; color: #475569; margin-top: 4px;">
             {{ comp.compliance.resumo_executivo }}
-          </p><p><strong>Mais informações:</strong> Capital declaratório: {{ comp.economic.capital_fmt }} · RFB: {{ comp.economic.situacao_rfb }} · {{ comp.economic.sancoes_texto }}</p>
+          </p>
+          {% set comp_exec = comp.execution_phase_summary or {} %}
+          {% if comp_exec.total_processos and comp_exec.total_processos > 0 %}
+          <p style="font-size: 7.2pt; color: #334155; margin-top: 3px;">
+            <strong>Processos em Fase de Execução / Sentença Aplicada:</strong> {{ comp_exec.total_processos }} ({{ "%.1f"|format(comp_exec.percentual_total|float) }}%)
+          </p>
+          {% endif %}
+          <p><strong>Mais informações:</strong> Capital declaratório: {{ comp.economic.capital_fmt }} · RFB: {{ comp.economic.situacao_rfb }} · {{ comp.economic.sancoes_texto }}</p>
         </div>
       {% endfor %}
     </div>

@@ -8,6 +8,11 @@ import {
   ArrowRight, Sparkles, FileText, BarChart3, HelpCircle
 } from 'lucide-react';
 import { CompanyLogo } from './CompanyLogo.jsx';
+import {
+  separateExecutionPhaseData,
+  EXECUTION_PHASE_DESCRIPTION,
+} from './businessLabels.js';
+import { apiFetch } from './apiClient.js';
 
 /**
  * Utilitários de formatação para apresentação comparativa.
@@ -298,6 +303,13 @@ function RankedCompanyCard({ company }) {
 
   const isAtiva = !company.situacao_cadastral || company.situacao_cadastral === 'ATIVA';
   const isPrevisaoBloqueada = Boolean(company.previsao_bloqueada);
+  const { executionPhaseSummary: execPhase } = separateExecutionPhaseData({
+    rankingMotivos: company.ranking_motivos,
+    rankingCondenacoes: company.ranking_motivos_condenacao,
+    condenacaoPorMotivo: company.condenacao_por_motivo,
+    executionPhaseSummary: company.execution_phase_summary,
+    totalProcessos: company.total_processos,
+  });
 
   return (
     <div className={`card ranked-card ${borderToneClass}`}>
@@ -364,6 +376,27 @@ function RankedCompanyCard({ company }) {
       {company.recomendacao && (
         <div className="ranked-card-recommendation">
           <p>{company.recomendacao}</p>
+        </div>
+      )}
+
+      {execPhase && execPhase.total_processos > 0 && (
+        <div className="compare-execution-phase" aria-label="Processos em Fase de Execução / Sentença Aplicada">
+          <div className="compare-execution-top">
+            <strong>Processos em Fase de Execução / Sentença Aplicada</strong>
+            <span className="compare-execution-count">
+              {execPhase.total_processos} ({formatPercent(execPhase.percentual_total)})
+            </span>
+          </div>
+          <p>{EXECUTION_PHASE_DESCRIPTION}</p>
+          {Array.isArray(execPhase.rotulos) && execPhase.rotulos.length > 0 && (
+            <div className="execution-phase-badges">
+              {execPhase.rotulos.map((rotulo, idx) => (
+                <span key={`${rotulo}-${idx}`} className="tag gray execution-phase-badge">
+                  {rotulo}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -514,7 +547,7 @@ export default function ComparePage({ request, history = [], currentCompany, nav
 
     try {
       // 1. Tenta POST com as empresas já ranqueadas e consolidadas
-      let res = await fetch('/api/v1/export-compare-pdf', {
+      let res = await apiFetch('/export-compare-pdf', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -533,7 +566,7 @@ export default function ComparePage({ request, history = [], currentCompany, nav
           ? `search_ids=${searchIds.join(',')}`
           : `empresas=${encodeURIComponent(result.empresas_ranqueadas.map((c) => c.empresa).join(','))}`;
 
-        res = await fetch(`/api/v1/export-compare-pdf?${queryParams}`, {
+        res = await apiFetch(`/export-compare-pdf?${queryParams}`, {
           method: 'GET',
           headers: { Accept: 'application/pdf, application/json' }
         });

@@ -5,7 +5,10 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   businessText,
   subsidiaryRisk,
-  translateScanStatus
+  translateScanStatus,
+  isExecutionPhaseLabel,
+  separateExecutionPhaseData,
+  EXECUTION_PHASE_DESCRIPTION,
 } from './businessLabels.js';
 import './prescriptive.css';
 import ProcessFiltersBar from './ProcessFiltersBar.jsx';
@@ -21,9 +24,14 @@ import { CompanyLogo } from "./CompanyLogo.jsx";
 import { fetchPjePage, runBrowserDeepScan } from './services/pjeBrowserScanner.js';
 import CatalogPage, { normalizeCatalog, onlyDigits } from './CatalogPage.jsx';
 import ComparePage from './ComparePage.jsx';
+import { useAuth } from './AuthContext.jsx';
+import LoginPage from './LoginPage.jsx';
+import RegisterPage from './RegisterPage.jsx';
+import SessionCard from './SessionCard.jsx';
+import { AuthSplash } from './AuthLayout.jsx';
+import logoHorizontal from './assets/logo-radarjus-horizontal.png';
+import { apiFetch, apiRequest, consumeReturnTo, saveReturnTo } from './apiClient.js';
 
-// Vite encaminha /api ao Flask. Defina VITE_API_BASE_URL se a API estiver em outro host.
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
 const PAGE_LABELS = {
   search: 'Pesquisar empresas', catalog: 'Catálogo de empresas', overview: 'Visão geral', processes: 'Processos',
   predictions: 'Estimativas', history: 'Histórico', compare: 'Comparar empresas',
@@ -142,6 +150,14 @@ function normalize(raw) {
         : `${cpTotal} contrato(s) público(s) identificado(s) nas bases governamentais`)
   );
 
+  const sepExec = separateExecutionPhaseData({
+    rankingMotivos: payload.ranking_motivos,
+    rankingCondenacoes: payload.ranking_motivos_condenacao,
+    condenacaoPorMotivo: payload.condenacao_por_motivo,
+    executionPhaseSummary: payload.execution_phase_summary,
+    totalProcessos: total,
+  });
+
   return {
     name: companyName,
     total: total,
@@ -157,9 +173,10 @@ function normalize(raw) {
     publicContractsValorTotal: cpValorTotal,
     publicContractsValorFormatado: cpValorFormatado,
     publicContractsMensagem: cpMsg,
-    reasons: Array.isArray(payload.ranking_motivos) ? payload.ranking_motivos : [],
-    rankingCondenacoes: Array.isArray(payload.ranking_motivos_condenacao) ? payload.ranking_motivos_condenacao : [],
-    condenacaoPorMotivo: Array.isArray(payload.condenacao_por_motivo) ? payload.condenacao_por_motivo : [],
+    reasons: sepExec.rankingMotivos,
+    rankingCondenacoes: sepExec.rankingCondenacoes,
+    condenacaoPorMotivo: sepExec.condenacaoPorMotivo,
+    executionPhaseSummary: sepExec.executionPhaseSummary,
     outcomes: outcomesObj,
     secrecy: isRecord(payload.niveis_sigilo) ? payload.niveis_sigilo : null,
     predictions: Array.isArray(payload.plus_previsao_condenacao) ? payload.plus_previsao_condenacao : [],
@@ -184,30 +201,8 @@ function normalize(raw) {
   };
 }
 
-async function request(path, options = {}) {
-  let response;
-  const endpoint = `${API_BASE}/api/v1${path}`;
-  try {
-    response = await fetch(endpoint, {
-      ...options,
-      headers: { 'Content-Type': 'application/json', ...options.headers },
-    });
-  } catch {
-    if (!API_BASE && typeof window !== 'undefined' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
-      throw new Error('A variável de ambiente VITE_API_BASE_URL não está configurada na Vercel apontando para o Render.');
-    }
-    throw new Error('Não foi possível conectar à API. Se o serviço no Render for gratuito, aguarde cerca de 1 minuto para inicialização (cold start).');
-  }
-  const body = await response.json().catch(() => null);
-  if (!response.ok) {
-    const failure = new Error(body?.error || body?.message || `Erro HTTP ${response.status}`);
-    failure.status = response.status;
-    failure.hasBody = body !== null;
-    throw failure;
-  }
-  if (body === null) throw new Error('A API não retornou JSON válido.');
-  return body;
-}
+// Cliente central: envia o Bearer, renova o token em 401 e encerra a sessão quando necessário.
+const request = apiRequest;
 
 function Stat({ label, value, hint, icon: Icon, tone }) {
   return (
@@ -262,8 +257,13 @@ function Sidebar({page,navigate,mobileOpen,setMobileOpen,showCatalog}) {
       <div className={`mobile-overlay ${mobileOpen ? 'visible' : ''}`} onClick={() => setMobileOpen(false)} />
       <aside className={`sidebar ${mobileOpen ? 'open' : ''}`}>
         <div className="brand">
-          <div className="brand-mark"><Activity size={26} /></div>
-          <div><strong>Radar<span>Jus</span></strong><small>INTELIGÊNCIA PREDITIVA</small></div>
+          <img
+            src={logoHorizontal}
+            alt="RadarJus - Inteligência Preditiva"
+            width="541"
+            height="173"
+            style={{ display: 'block', width: '100%', maxWidth: 190, height: 'auto' }}
+          />
           <button className="mobile-close" onClick={() => setMobileOpen(false)} aria-label="Fechar menu"><X size={20} /></button>
         </div>
         <div className="nav-label">PLATAFORMA</div>
@@ -287,10 +287,7 @@ function Sidebar({page,navigate,mobileOpen,setMobileOpen,showCatalog}) {
             <ShieldCheck size={19} />
             <div><b>Dados com contexto</b><small>Metadados públicos para auditoria e inteligência preditiva.</small></div>
           </div>
-          <div className="account">
-            <span className="avatar">RJ</span>
-            <div><b>RadarJus</b><small>Inteligência B2B & Previsibilidade</small></div>
-          </div>
+            <SessionCard />
         </div>
       </aside>
     </>
@@ -351,7 +348,20 @@ function Overview({ data, navigate, catalogTerm }) {
   const secrecyEntries = data?.secrecy ? Object.entries(data.secrecy) : [];
   const observed = secrecyEntries.reduce((sum, [, count]) => sum + Number(count || 0), 0);
   const knownSecret = secrecyEntries.reduce((sum, [level, count]) => sum + (Number(level) > 0 ? Number(count || 0) : 0), 0);
-  const reasons = data?.reasons || [];
+  const overviewExec = separateExecutionPhaseData({
+    rankingMotivos: data?.reasons,
+    rankingCondenacoes: data?.rankingCondenacoes,
+    condenacaoPorMotivo: data?.condenacaoPorMotivo,
+    executionPhaseSummary: data?.executionPhaseSummary,
+    totalProcessos: data?.total,
+  });
+  const reasons = overviewExec.rankingMotivos;
+  const motiveTableRows = (
+    overviewExec.condenacaoPorMotivo.length
+      ? overviewExec.condenacaoPorMotivo
+      : overviewExec.rankingCondenacoes
+  ).filter((item) => !isExecutionPhaseLabel(item?.motivo));
+  const execPhase = overviewExec.executionPhaseSummary;
   const outcomes = data?.outcomes || {};
   const hasData = Boolean(data);
   const classified = Object.values(outcomes).reduce((sum, value) => sum + Number(value || 0), 0);
@@ -422,8 +432,7 @@ function Overview({ data, navigate, catalogTerm }) {
         {Array.isArray(ai?.recomendacoes_compliance) && ai.recomendacoes_compliance.length ? <ul>{ai.recomendacoes_compliance.map((item,i)=><li key={i}>{businessText(item)}</li>)}</ul> : <p>Prescrições ainda não disponibilizadas. Consulte o parecer antes de decidir.</p>}
       </section>}
       {/* Condenações por Motivo do Processo (US-18) */}
-      {((Array.isArray(data?.condenacaoPorMotivo) && data.condenacaoPorMotivo.length > 0) ||
-        (Array.isArray(data?.rankingCondenacoes) && data.rankingCondenacoes.length > 0)) && (
+      {motiveTableRows.length > 0 && (
         <Panel
           title="Condenações por Motivo do Processo"
           subtitle="Histórico de condenações por assunto e faixa provável de variação"
@@ -440,7 +449,7 @@ function Overview({ data, navigate, catalogTerm }) {
                 </tr>
               </thead>
               <tbody>
-                {(data.condenacaoPorMotivo?.length ? data.condenacaoPorMotivo : data.rankingCondenacoes).map((item, index) => {
+                {motiveTableRows.map((item, index) => {
                   const totalProc = item.total_processos ?? item.total ?? item.count ?? null;
                   const condenacoes = item.condenacoes ?? item.quantidade_condenacoes ?? item.quantidade ?? 0;
                   const taxa = item.taxa_condenacao ?? item.taxa_no_motivo ?? item.taxa_condenacao_no_motivo ?? item.taxa_perda_no_motivo ?? null;
@@ -480,6 +489,31 @@ function Overview({ data, navigate, catalogTerm }) {
             <BarChart3 size={15} /> Taxas por assunto conforme os dados disponíveis. O símbolo — indica informação não disponibilizada.
           </div>
         </Panel>
+      )}
+
+      {/* Bloco dedicado para Processos em Fase de Execução / Sentença Aplicada */}
+      {execPhase && execPhase.total_processos > 0 && (
+        <section className="card panel execution-phase-card" aria-label="Processos em Fase de Execução / Sentença Aplicada">
+          <div className="execution-phase-header">
+            <div className="execution-phase-copy">
+              <h3>Processos em Fase de Execução / Sentença Aplicada</h3>
+              <p>{EXECUTION_PHASE_DESCRIPTION}</p>
+            </div>
+            <div className="execution-phase-kpi">
+              <strong>{formatNumber(execPhase.total_processos)} processo(s)</strong>
+              <span>{formatPercent(execPhase.percentual_total)} do total identificado</span>
+            </div>
+          </div>
+          {Array.isArray(execPhase.rotulos) && execPhase.rotulos.length > 0 && (
+            <div className="execution-phase-badges">
+              {execPhase.rotulos.map((rotulo, idx) => (
+                <span key={`${rotulo}-${idx}`} className="tag gray execution-phase-badge">
+                  {rotulo}
+                </span>
+              ))}
+            </div>
+          )}
+        </section>
       )}
 
 
@@ -1096,6 +1130,7 @@ function CompanyShareActions({ data }) {
         ranking_motivos: data.reasons || [],
         ranking_motivos_condenacao: data.rankingCondenacoes || [],
         condenacao_por_motivo: data.condenacaoPorMotivo || [],
+        execution_phase_summary: data.executionPhaseSummary || null,
         plus_previsao_condenacao: data.predictions || [],
         idoneidade_economica: data.idoneidadeEconomica || {},
         ai_analysis: data.aiAnalysis || {},
@@ -1103,7 +1138,7 @@ function CompanyShareActions({ data }) {
       };
 
       // Prioriza POST com os dados já carregados na tela (elimina 404 mesmo sem persistência prévia)
-      let response = await fetch(`${API_BASE}/api/v1/report/pdf`, {
+      let response = await apiFetch('/report/pdf', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(pdfPayload),
@@ -1112,9 +1147,9 @@ function CompanyShareActions({ data }) {
       // Fallback para GET por ID ou query string ?empresa=...
       if (!response || !response.ok) {
         const fallbackUrl = id
-          ? `${API_BASE}/api/v1/history/${id}/summary.pdf`
-          : `${API_BASE}/api/v1/report/pdf?empresa=${encodeURIComponent(data.name || '')}`;
-        response = await fetch(fallbackUrl);
+          ? `/history/${id}/summary.pdf`
+          : `/report/pdf?empresa=${encodeURIComponent(data.name || '')}`;
+        response = await apiFetch(fallbackUrl);
       }
 
       if (!response.ok) {
@@ -1164,7 +1199,7 @@ function CompanyShareActions({ data }) {
   );
 }
 
-export default function App() {
+function AppShell() {
   const [route, setRoute] = useState(() => parseRoute(window.location.hash));
   const { page, searchId } = route;
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -1250,6 +1285,9 @@ export default function App() {
               condenacaoPorMotivo: (updated.condenacaoPorMotivo && updated.condenacaoPorMotivo.length > 0)
                 ? updated.condenacaoPorMotivo
                 : prev?.condenacaoPorMotivo || [],
+              executionPhaseSummary: updated.executionPhaseSummary?.total_processos > 0
+                ? updated.executionPhaseSummary
+                : prev?.executionPhaseSummary || updated.executionPhaseSummary,
             }));
           }
           clearInterval(intervalId);
@@ -1586,4 +1624,43 @@ export default function App() {
       </div>
     </div>
   );
+}
+
+// ---------------------------------------------------------------------------
+// Porta de entrada de autenticação: decide entre Login, Cadastro e o app.
+// ---------------------------------------------------------------------------
+function authRouteOf(hash) {
+  const clean = String(hash || '').split('?')[0].replace(/\/+$/, '');
+  if (clean === '#/login') return 'login';
+  if (clean === '#/register') return 'register';
+  return null;
+}
+
+export default function App() {
+  const { status, isAuthenticated } = useAuth();
+  const [hash, setHash] = useState(() => window.location.hash);
+
+  useEffect(() => {
+    const onHash = () => setHash(window.location.hash);
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
+
+  const authRoute = authRouteOf(hash);
+
+  useEffect(() => {
+    if (status === 'loading') return;
+    if (!isAuthenticated && !authRoute) {
+      // Guarda a rota pedida para voltar a ela depois do login.
+      saveReturnTo(hash);
+      window.location.hash = '#/login';
+    } else if (isAuthenticated && authRoute) {
+      window.location.hash = consumeReturnTo();
+    }
+  }, [status, isAuthenticated, authRoute, hash]);
+
+  if (status === 'loading') return <AuthSplash />;
+  if (!isAuthenticated) return authRoute === 'register' ? <RegisterPage /> : <LoginPage />;
+  if (authRoute) return <AuthSplash label="Redirecionando..." />;
+  return <AppShell />;
 }

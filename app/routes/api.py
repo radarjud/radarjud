@@ -11,6 +11,7 @@ import hmac
 import asyncio
 import logging
 import threading
+from typing import Any
 from pathlib import Path
 import gc
 from datetime import datetime, timedelta, timezone
@@ -19,7 +20,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Blueprint, Response, request, jsonify, current_app, g
 from sqlalchemy import text
 
-from app.services.prediction_engine import build_sector_benchmark
+from app.services.prediction_engine import (
+    build_execution_phase_summary,
+    build_sector_benchmark,
+    normalize_execution_phase_payload,
+)
 from app.utils.rate_limiter import limit_rate
 
 from app.extensions import db
@@ -47,7 +52,7 @@ from app.utils.sanitizer import (
     validate_webhook_url,
     validate_alert_email,
 )
-from app.utils.crypto import generate_movements_hash
+from app.utils.crypto import generate_movements_hash, make_json_safe
 from app.utils.auth import get_current_user_optional, require_auth, require_role
 from app.models.tenant import Tenant
 from app.models.audit_log import AuditLog
@@ -173,10 +178,18 @@ def prune_old_searches(retention_days: Optional[int] = None) -> int:
 
 
 def fast_extract_cnpjs_from_texts(processes_dict: dict) -> list:
-    """Extrai CNPJs únicos por raiz (8 primeiros dígitos) diretamente dos textos do Comunica PJe em 1ms."""
+    """Extrai CNPJs únicos por raiz (8 primeiros dígitos) diretamente dos metadados/textos do Comunica PJe em 1ms."""
     seen_roots = {}
     for proc in processes_dict.values():
-        for txt in proc.get("publicacoes_texto", []):
+        for c in proc.get("cnpjs_encontrados", []) or []:
+            digits = re.sub(r"\D", "", str(c))
+            if len(digits) == 14:
+                root = digits[:8]
+                if root not in seen_roots:
+                    seen_roots[root] = digits
+                    if len(seen_roots) >= 3:
+                        return list(seen_roots.values())
+        for txt in (proc.get("publicacoes_texto") or ([proc["resumoPublicacao"]] if proc.get("resumoPublicacao") else [])):
             for match in CNPJ_REGEX.findall(str(txt)):
                 digits = re.sub(r"\D", "", match)
                 if len(digits) == 14:
@@ -186,6 +199,24 @@ def fast_extract_cnpjs_from_texts(processes_dict: dict) -> list:
                         if len(seen_roots) >= 3:
                             return list(seen_roots.values())
     return list(seen_roots.values())
+
+
+def _compact_raw_metadata(raw_meta: Any) -> Any:
+    """Remove HTML bruto (`publicacoes_texto`/`texto`) e normaliza datas para JSON no PostgreSQL."""
+    if not isinstance(raw_meta, dict):
+        return make_json_safe(raw_meta)
+    cleaned = {
+        k: v
+        for k, v in raw_meta.items()
+        if k not in ("publicacoes_texto", "textos_pje", "texto", "teor", "conteudo", "textoPublicacao", "raw_metadata")
+    }
+    if isinstance(cleaned.get("movimentos"), list) and len(cleaned["movimentos"]) > 20:
+        cleaned["movimentos"] = [
+            {"codigo": m.get("codigo"), **({"dataHora": m["dataHora"]} if m.get("dataHora") else {})}
+            for m in cleaned["movimentos"][:20]
+            if isinstance(m, dict) and m.get("codigo") is not None
+        ]
+    return make_json_safe(cleaned) if cleaned else None
 
 # Integração com radarjusAgent (Google ADK + Vertex AI)
 RADARJUS_AGENT_DIR = Path(__file__).resolve().parents[2] / "radarjusAgent"
@@ -480,10 +511,10 @@ def _deep_scan_background_worker(
             search.condenacao_por_motivo = deep_results.get("condenacao_por_motivo", [])
             search.predictions_summary = deep_results.get("plus_previsao_condenacao", [])
             search.overall_risk_score = deep_results.get("score_risco_terceirizacao", 0.0)
-            search.ai_analysis = deep_results.get("ai_analysis", {})
+            search.ai_analysis = make_json_safe(deep_results.get("ai_analysis", {}))
             if "condenacoes_subsidiarias_tomadoras_count" in deep_results:
                 search.condenacoes_subsidiarias_tomadoras_count = deep_results.get("condenacoes_subsidiarias_tomadoras_count", 0)
-                search.tomadoras_subsidiarias_pj = deep_results.get("tomadoras_subsidiarias_pj", [])
+                search.tomadoras_subsidiarias_pj = make_json_safe(deep_results.get("tomadoras_subsidiarias_pj", []))
             if search.contratos_poder_publico is None or (
                 isinstance(search.contratos_poder_publico, dict) and search.contratos_poder_publico.get("total_contratos", 0) == 0
             ):
@@ -494,12 +525,16 @@ def _deep_scan_background_worker(
                     (econ.get("cnpjs_consolidados")[0] if econ.get("cnpjs_consolidados") else None) or
                     econ.get("cnpj")
                 ) if isinstance(econ, dict) else None
-                search.contratos_poder_publico = public_contracts_service.get_public_contracts(
+                search.contratos_poder_publico = make_json_safe(public_contracts_service.get_public_contracts(
                     cnpj=deep_cnpj,
                     company_name=search.company_name,
-                )
+                ))
             search.movements_hash = deep_results.get("movements_hash")
-            search.economic_standing = deep_results["idoneidade_economica"]
+            if isinstance(deep_results.get("idoneidade_economica"), dict) and deep_results.get("execution_phase_summary") is not None:
+                deep_results["idoneidade_economica"]["execution_phase_summary"] = make_json_safe(
+                    deep_results["execution_phase_summary"]
+                )
+            search.economic_standing = make_json_safe(deep_results["idoneidade_economica"])
             if search.economic_standing and isinstance(search.economic_standing, dict):
                 search.cnae_codigo = search.economic_standing.get("cnae_codigo") or search.cnae_codigo
                 search.cnae_descricao = search.economic_standing.get("cnae_descricao") or search.cnae_descricao
@@ -535,7 +570,7 @@ def _deep_scan_background_worker(
                             subsidiary_contractors_json=proc.get("subsidiary_contractors") or [],
                             data_distribuicao=proc.get("data_distribuicao"),
                             valor_causa=proc.get("valor_causa"),
-                            raw_metadata=proc.get("raw_metadata"),
+                            raw_metadata=_compact_raw_metadata(proc.get("raw_metadata")),
                         )
                         new_records.append(record)
                         existing_numbers.add(num)
@@ -549,6 +584,7 @@ def _deep_scan_background_worker(
                             db.session.rollback()
                             logger.debug("Lote de processos %d tratado defensivamente: %s", i, batch_err)
                     del new_records
+                gc.collect()
             except Exception as rec_err:
                 logger.debug("Persistência detalhada de processos ignorada: %s", rec_err)
 
@@ -682,7 +718,19 @@ def search_company():
         return jsonify({"error": "empresas so são pesquisadas por razão social ou CNPJ"}), 400
 
     # 1. Resolução inteligente de estratégia de busca (BROAD_BRAND vs STRICT_RAZAO vs STRICT_CNPJ)
-    search_strategy = resolve_search_strategy(raw_query, brasil_api_fetcher=fetch_cnpj_brasilapi)
+    def _cnpj_name_resolver(cnpj_val: str) -> str | None:
+        try:
+            from app.models.CompanyRegistry import CompanyRegistry
+            clean_c = re.sub(r"\D", "", str(cnpj_val or ""))
+            if len(clean_c) == 14:
+                reg = CompanyRegistry.query.filter_by(cnpj=clean_c).first()
+                if reg and reg.razao_social:
+                    return reg.razao_social
+        except Exception:
+            pass
+        return fetch_cnpj_brasilapi(cnpj_val)
+
+    search_strategy = resolve_search_strategy(raw_query, brasil_api_fetcher=_cnpj_name_resolver)
     query_term = search_strategy["comunica_query_term"]
     display_title = search_strategy["display_title"]
     is_broad_brand = search_strategy["is_broad_brand"]
@@ -736,7 +784,8 @@ def search_company():
                 and cached_data.get("scan_scope_version") == LABOR_SCOPE_VERSION
             ):
                 logger.info("Cache em memória (TTL 15 min) ativado para '%s'. Resposta instantânea em 0.05s.", cache_key)
-                res_copy = dict(cached_data)
+                res_copy = normalize_execution_phase_payload(dict(cached_data))
+                res_copy["execution_phase_summary"] = make_json_safe(res_copy.get("execution_phase_summary"))
                 res_copy["cached"] = True
                 res_copy["cache_level"] = "L0_MEMORY_CACHE"
                 resp = jsonify(res_copy)
@@ -761,22 +810,26 @@ def search_company():
                 .order_by(CompanySearch.updated_at.desc())
                 .first()
             )
-            # Só retorna cache se houver processos (> 0), for recente (SEARCH_CACHE_TTL_HOURS) e varredura COMPLETA.
-            # Buscas PARTIAL nunca são usadas como cache completo para pular novas varreduras.
+            # Só retorna cache se houver processos (> 0), for recente (SEARCH_CACHE_TTL_HOURS),
+            # varredura COMPLETA e escopo trabalhista válido (ignora buscas PARTIAL e legadas).
             try:
                 cache_ttl_hours = max(1, int(os.getenv("SEARCH_CACHE_TTL_HOURS", "24") or 24))
             except ValueError:
                 cache_ttl_hours = 24
+            cached_econ = cached_search.economic_standing if (cached_search and isinstance(cached_search.economic_standing, dict)) else {}
+            saved_cache_key = (
+                (cached_econ.get("browser_search_strategy") or {}).get("cache_key")
+                or cached_econ.get("search_cache_key")
+            )
             if (
                 cached_search
                 and (cached_search.total_processes or 0) > 0
                 and cached_search.is_recent(hours=cache_ttl_hours)
-                and cached_search.scan_status == "COMPLETED"
+                and cached_search.scan_status in ("COMPLETED", "BROWSER_PARTIAL")
                 and _is_valid_labor_cache(cached_search)
-                and (not browser_requested or ((cached_search.economic_standing or {})
-                     .get("browser_search_strategy", {}).get("cache_key") == cache_key))
+                and (not browser_requested or not saved_cache_key or saved_cache_key == cache_key)
             ):
-                logger.info("Curto-circuito Nível 1 ativado para '%s' (search_id=%d).", normalized_name, cached_search.id)
+                logger.info("Curto-circuito Nível 1 ativado para '%s' (search_id=%d, status=%s).", normalized_name, cached_search.id, cached_search.scan_status)
                 proc_dicts = [p.to_dict() for p in cached_search.processes]
                 res = cached_search.to_dict()
                 res["empresa"] = cached_search.company_name
@@ -791,7 +844,12 @@ def search_company():
                 res["score_risco_terceirizacao"] = cached_search.overall_risk_score or 0.0
                 res["overall_risk_score"] = cached_search.overall_risk_score or 0.0
 
-                if proc_dicts and len(proc_dicts) >= (cached_search.total_processes or 0):
+                needs_metrics_refresh = (
+                    not cached_search.outcomes_summary
+                    or cached_search.ranking_motivos is None
+                    or cached_search.predictions_summary is None
+                )
+                if needs_metrics_refresh and proc_dicts and len(proc_dicts) >= (cached_search.total_processes or 0):
                     fresh_metrics = orchestrator.predictor.generate_dashboard_metrics(
                         cached_search.company_name, proc_dicts
                     )
@@ -803,6 +861,7 @@ def search_company():
                     res["ranking_motivos"] = fresh_metrics.get("ranking_motivos", cached_search.ranking_motivos or [])
                     res["ranking_motivos_condenacao"] = fresh_metrics.get("ranking_motivos_condenacao", cached_search.ranking_motivos_condenacao or [])
                     res["condenacao_por_motivo"] = fresh_metrics.get("condenacao_por_motivo", cached_search.condenacao_por_motivo or [])
+                    res["execution_phase_summary"] = fresh_metrics.get("execution_phase_summary")
                     res["probabilidade_condenacao_geral_pct"] = fresh_metrics.get("probabilidade_condenacao_geral_pct")
                     res["taxa_historica_condenacao_pct"] = fresh_metrics.get("taxa_historica_condenacao_pct")
                     cached_search.ranking_motivos = fresh_metrics.get("ranking_motivos", cached_search.ranking_motivos or [])
@@ -810,17 +869,34 @@ def search_company():
                     cached_search.condenacao_por_motivo = fresh_metrics.get("condenacao_por_motivo", cached_search.condenacao_por_motivo or [])
                     cached_search.predictions_summary = fresh_metrics["plus_previsao_condenacao"]
                     cached_search.overall_risk_score = fresh_metrics["score_risco_terceirizacao"]
-                # Análise de Idoneidade Econômica & Risco de Calote Subsidiário (Súmula 331 TST)
-                econ_data = economic_service.evaluate_economic_standing(
-                    company_name=cached_search.company_name,
-                    cnpj=cnpj_used,
-                    company_processes=proc_dicts,
-                    p_condenacao_trabalhista=res.get("probabilidade_condenacao_geral_pct") or 0.0,
-                    search_strategy=search_strategy,
+                elif res.get("execution_phase_summary") is None and proc_dicts:
+                    res["execution_phase_summary"] = build_execution_phase_summary(proc_dicts)
+
+                res = normalize_execution_phase_payload(res)
+                res["execution_phase_summary"] = make_json_safe(res.get("execution_phase_summary"))
+
+                # Reutiliza idoneidade econômica persistida no cache L1 (< 300ms) salvo se ausente ou homônimo INAPTA defasado
+                stale_inapta = (
+                    isinstance(cached_econ, dict)
+                    and cached_econ.get("situacao_cadastral") == "INAPTA"
+                    and (cached_search.total_processes or 0) >= 25
                 )
-                saved_browser_strategy = (cached_search.economic_standing or {}).get("browser_search_strategy")
-                if saved_browser_strategy:
-                    econ_data = {**econ_data, "browser_search_strategy": saved_browser_strategy}
+                econ_dirty = False
+                if cached_econ and not stale_inapta:
+                    econ_data = dict(cached_econ)
+                else:
+                    econ_data = economic_service.evaluate_economic_standing(
+                        company_name=cached_search.company_name,
+                        cnpj=cnpj_used,
+                        company_processes=proc_dicts,
+                        p_condenacao_trabalhista=res.get("probabilidade_condenacao_geral_pct") or 0.0,
+                        search_strategy=search_strategy,
+                    )
+                    saved_browser_strategy = cached_econ.get("browser_search_strategy") if isinstance(cached_econ, dict) else None
+                    if saved_browser_strategy:
+                        econ_data = {**econ_data, "browser_search_strategy": saved_browser_strategy}
+                    econ_dirty = True
+
                 res["idoneidade_economica"] = econ_data
                 res["logo"] = econ_data.get("logo", {})
                 res["capital_social_consolidado"] = econ_data.get("valor_formatado") or econ_data.get("capital_social_formatado")
@@ -832,11 +908,15 @@ def search_company():
                     res["score_risco_terceirizacao"] = econ_data["indice_exposicao_financeira"]
                     res["overall_risk_score"] = econ_data["indice_exposicao_financeira"]
 
-                # Re-executa o Agente ADK sobre os metadados (incluindo idoneidade econômica) para garantir parecer sempre atualizado
-                fresh_ai = orchestrator.ai_analyzer.analyze_company(res)
-                if fresh_ai:
-                    res["ai_analysis"] = fresh_ai
-                    cached_search.ai_analysis = fresh_ai
+                # Reutiliza parecer de IA persistido quando disponível (evita chamada Gemini em L1 hit)
+                if isinstance(cached_search.ai_analysis, dict) and cached_search.ai_analysis:
+                    res["ai_analysis"] = cached_search.ai_analysis
+                else:
+                    fresh_ai = orchestrator.ai_analyzer.analyze_company(res)
+                    if fresh_ai:
+                        res["ai_analysis"] = fresh_ai
+                        cached_search.ai_analysis = fresh_ai
+                        econ_dirty = True
 
                 # Contratos com o Poder Público (US-20): hidratação resiliente se ainda não computado
                 from app.services.public_contracts_service import public_contracts_service
@@ -846,29 +926,35 @@ def search_company():
                     (econ_data.get("cnpjs_consolidados")[0] if econ_data.get("cnpjs_consolidados") else None) or
                     econ_data.get("cnpj")
                 ) if isinstance(econ_data, dict) else None
-                if not cached_search.contratos_poder_publico or cached_search.contratos_poder_publico.get("total_contratos", 0) == 0:
+                if cached_search.contratos_poder_publico is not None:
+                    res["contratos_poder_publico"] = cached_search.contratos_poder_publico
+                else:
                     contratos_pub = public_contracts_service.get_public_contracts(
                         cnpj=clean_search_cnpj,
                         company_name=cached_search.company_name,
                     )
-                    if contratos_pub.get("total_contratos", 0) > 0 or not cached_search.contratos_poder_publico:
-                        cached_search.contratos_poder_publico = contratos_pub
-                        res["contratos_poder_publico"] = contratos_pub
+                    cached_search.contratos_poder_publico = make_json_safe(contratos_pub)
+                    res["contratos_poder_publico"] = contratos_pub
+                    econ_dirty = True
                 res["cached"] = True
                 res["cache_level"] = "L1_DATABASE"
                 res["search_id"] = cached_search.id
                 res["processos"] = proc_dicts
                 res["parecer_agente_adk"] = res.get("ai_analysis", {})
 
-                # Atualiza os dados de idoneidade no banco de dados para eliminar dados defasados
-                try:
-                    cached_search.economic_standing = econ_data
-                    if econ_data and isinstance(econ_data, dict):
-                        cached_search.cnae_codigo = econ_data.get("cnae_codigo") or cached_search.cnae_codigo
-                        cached_search.cnae_descricao = econ_data.get("cnae_descricao") or cached_search.cnae_descricao
-                    db.session.commit()
-                except Exception:
-                    pass
+                # Persiste atualização apenas se houve recálculo (evita round-trip extra no Supabase)
+                if econ_dirty or needs_metrics_refresh:
+                    try:
+                        if isinstance(econ_data, dict) and res.get("execution_phase_summary") is not None:
+                            econ_data["execution_phase_summary"] = make_json_safe(res["execution_phase_summary"])
+                        cached_search.economic_standing = make_json_safe(econ_data)
+                        cached_search.ai_analysis = make_json_safe(cached_search.ai_analysis)
+                        if econ_data and isinstance(econ_data, dict):
+                            cached_search.cnae_codigo = econ_data.get("cnae_codigo") or cached_search.cnae_codigo
+                            cached_search.cnae_descricao = econ_data.get("cnae_descricao") or cached_search.cnae_descricao
+                        db.session.commit()
+                    except Exception:
+                        db.session.rollback()
 
                 resp = jsonify(res)
                 if current_user and current_user.tenant_id:
@@ -985,6 +1071,7 @@ def search_company():
             econ_data = {}
         econ_data = {
             **econ_data,
+            "search_cache_key": cache_key,
             "scan_scope_version": LABOR_SCOPE_VERSION,
             "labor_scan_cursor": {
                 "courts_queue": courts_queue,
@@ -996,9 +1083,12 @@ def search_company():
                 "partial_courts": [],
             },
         }
+        if fast_results.get("execution_phase_summary") is not None:
+            econ_data["execution_phase_summary"] = make_json_safe(fast_results["execution_phase_summary"])
         if browser_owned:
             econ_data["browser_search_strategy"] = search_strategy
         fast_results["scan_scope_version"] = LABOR_SCOPE_VERSION
+        fast_results["execution_phase_summary"] = make_json_safe(fast_results.get("execution_phase_summary"))
         fast_results["idoneidade_economica"] = econ_data
         fast_results["logo"] = econ_data.get("logo", {})
         fast_results["capital_social_consolidado"] = econ_data.get("valor_formatado") or econ_data.get("capital_social_formatado")
@@ -1047,14 +1137,14 @@ def search_company():
                 ranking_motivos_condenacao=fast_results.get("ranking_motivos_condenacao", []),
                 condenacao_por_motivo=fast_results.get("condenacao_por_motivo", []),
                 predictions_summary=fast_results.get("plus_previsao_condenacao", []),
-                economic_standing=econ_data,
+                economic_standing=make_json_safe(econ_data),
                 cnae_codigo=econ_data.get("cnae_codigo") if isinstance(econ_data, dict) else None,
                 cnae_descricao=econ_data.get("cnae_descricao") if isinstance(econ_data, dict) else None,
                 condenacoes_subsidiarias_tomadoras_count=fast_results.get("condenacoes_subsidiarias_tomadoras_count", 0),
-                tomadoras_subsidiarias_pj=fast_results.get("tomadoras_subsidiarias_pj", []),
-                contratos_poder_publico=contratos_pub,
+                tomadoras_subsidiarias_pj=make_json_safe(fast_results.get("tomadoras_subsidiarias_pj", [])),
+                contratos_poder_publico=make_json_safe(contratos_pub),
                 overall_risk_score=fast_results.get("score_risco_terceirizacao", 0.0),
-                ai_analysis=fast_results.get("ai_analysis", {}),
+                ai_analysis=make_json_safe(fast_results.get("ai_analysis", {})),
                 movements_hash=new_hash,
                 scan_status=initial_status,
                 last_checked_at=get_utc_now(),
@@ -1085,11 +1175,10 @@ def search_company():
                     subsidiary_contractors_json=proc.get("subsidiary_contractors") or [],
                     data_distribuicao=proc.get("data_distribuicao"),
                     valor_causa=proc.get("valor_causa"),
-                    raw_metadata=proc.get("raw_metadata"),
+                    raw_metadata=_compact_raw_metadata(proc.get("raw_metadata")),
                 )
                 db.session.add(record)
             db.session.commit()
-
             # Expurgo oportunista (no máximo 1x/hora) para proteger o limite de disco no Render Free
             global _LAST_PRUNE_TS
             now_ts = time.time()
@@ -1100,6 +1189,7 @@ def search_company():
                 except Exception as prune_err:
                     db.session.rollback()
                     logger.debug("Expurgo oportunista ignorado: %s", prune_err)
+            gc.collect()
         except Exception as db_exc:
             db.session.rollback()
             logger.debug("Persistência no DB ignorada ou indisponível: %s", db_exc)
@@ -1765,11 +1855,11 @@ def incremental_sync(search_id: int):
         ai_res = orchestrator.ai_analyzer.analyze_company(metrics)
 
         search.total_processes = metrics.get("total_processos", search.total_processes)
-        search.outcomes_summary = metrics.get("desfechos_sentencas", search.outcomes_summary)
-        search.ranking_motivos = metrics.get("ranking_motivos", search.ranking_motivos)
-        search.predictions_summary = metrics.get("plus_previsao_condenacao", search.predictions_summary)
+        search.outcomes_summary = make_json_safe(metrics.get("desfechos_sentencas", search.outcomes_summary))
+        search.ranking_motivos = make_json_safe(metrics.get("ranking_motivos", search.ranking_motivos))
+        search.predictions_summary = make_json_safe(metrics.get("plus_previsao_condenacao", search.predictions_summary))
         search.overall_risk_score = metrics.get("score_risco_terceirizacao", search.overall_risk_score)
-        search.ai_analysis = ai_res
+        search.ai_analysis = make_json_safe(ai_res)
         search.movements_hash = new_hash
         search.last_checked_at = datetime.utcnow()
 
@@ -2347,7 +2437,7 @@ def ingest_deep_scan():
                 has_expert_report=has_expert,
                 data_distribuicao=parsed_proc.get("data_distribuicao"),
                 valor_causa=parsed_proc.get("valor_causa"),
-                raw_metadata=parsed_proc,
+                raw_metadata=_compact_raw_metadata(parsed_proc),
             )
             new_records.append(record)
             existing_records[cnj] = record
@@ -2381,6 +2471,8 @@ def ingest_deep_scan():
         )
         if browser_strategy:
             econ_data = {**econ_data, "browser_search_strategy": browser_strategy}
+        if isinstance(econ_data, dict) and fresh_metrics.get("execution_phase_summary") is not None:
+            econ_data["execution_phase_summary"] = make_json_safe(fresh_metrics["execution_phase_summary"])
 
         ai_payload = {**fresh_metrics, "empresa": search.company_name, "processos": proc_dicts}
         ai_res = orchestrator.ai_analyzer.analyze_company(ai_payload)
@@ -2395,11 +2487,11 @@ def ingest_deep_scan():
         search.condenacao_por_motivo = fresh_metrics.get("condenacao_por_motivo", [])
         search.predictions_summary = fresh_metrics.get("plus_previsao_condenacao", [])
         search.overall_risk_score = fresh_metrics.get("score_risco_terceirizacao", 0.0)
-        search.economic_standing = econ_data
+        search.economic_standing = make_json_safe(econ_data)
         if econ_data and isinstance(econ_data, dict):
             search.cnae_codigo = econ_data.get("cnae_codigo") or search.cnae_codigo
             search.cnae_descricao = econ_data.get("cnae_descricao") or search.cnae_descricao
-        search.ai_analysis = ai_res
+        search.ai_analysis = make_json_safe(ai_res)
         if browser_finished:
             if search.scan_status != "COMPLETED":
                 search.scan_status = "COMPLETED" if is_final_batch else "BROWSER_PARTIAL"
@@ -2717,7 +2809,7 @@ def get_search_history():
         }), 200
     except Exception as exc:
         logger.error("Erro ao listar histórico de pesquisas: %s", exc)
-        return jsonify({"error": "Não foi possível carregar o histórico."}), 500
+        return jsonify({"total": 0, "items": []}), 200
 
 
 @api_bp.route("/history/<int:search_id>", methods=["GET", "DELETE"])
@@ -2727,7 +2819,11 @@ def get_search_detail(search_id: int):
     GET: Retorna os dados detalhados e a lista de processos de uma análise específica.
     DELETE: Remove um registro específico do histórico.
     """
-    search = db.session.get(CompanySearch, search_id)
+    try:
+        search = db.session.get(CompanySearch, search_id)
+    except Exception as db_exc:
+        logger.error("Falha ao recuperar search_id %d do banco: %s", search_id, db_exc)
+        return jsonify({"error": "Registro não encontrado."}), 404
     if not search:
         return jsonify({"error": "Registro não encontrado."}), 404
 
@@ -2762,10 +2858,14 @@ def get_search_detail(search_id: int):
             )
             result["plus_previsao_condenacao"] = fresh_metrics["plus_previsao_condenacao"]
             result["score_risco_terceirizacao"] = fresh_metrics["score_risco_terceirizacao"]
+            result["ranking_motivos"] = fresh_metrics.get("ranking_motivos", search.ranking_motivos or [])
             result["ranking_motivos_condenacao"] = fresh_metrics.get("ranking_motivos_condenacao", [])
             result["condenacao_por_motivo"] = fresh_metrics.get("condenacao_por_motivo", search.condenacao_por_motivo or [])
+            result["execution_phase_summary"] = make_json_safe(fresh_metrics.get("execution_phase_summary"))
             result["previsao_bloqueada"] = fresh_metrics.get("previsao_bloqueada", False)
             result["motivo_bloqueio_previsao"] = fresh_metrics.get("motivo_bloqueio_previsao")
+        result = normalize_execution_phase_payload(result)
+        result["execution_phase_summary"] = make_json_safe(result.get("execution_phase_summary"))
         result["sinais_solvencia_publica"] = result.get("sinais_solvencia_publica") or (result.get("idoneidade_economica") or {}).get("sinais_solvencia_publica")
         result["parecer_agente_adk"] = result.get("ai_analysis", {})
         if not result.get("contratos_poder_publico") or (
@@ -2784,8 +2884,9 @@ def get_search_detail(search_id: int):
                 company_name=search.company_name,
             )
             if contratos_det.get("total_contratos", 0) > 0 or not result.get("contratos_poder_publico"):
-                result["contratos_poder_publico"] = contratos_det
-                search.contratos_poder_publico = contratos_det
+                safe_contratos_det = make_json_safe(contratos_det)
+                result["contratos_poder_publico"] = safe_contratos_det
+                search.contratos_poder_publico = safe_contratos_det
                 try:
                     db.session.commit()
                 except Exception:
@@ -3048,6 +3149,8 @@ def _search_record_to_pdf_payload(search: CompanySearch) -> dict:
         if search.economic_standing.get("risco_calote_subsidiario") is not None:
             result["risco_subsidiario"] = search.economic_standing["risco_calote_subsidiario"]
     result["parecer_agente_adk"] = result.get("ai_analysis") or {}
+    result = normalize_execution_phase_payload(result)
+    result["execution_phase_summary"] = make_json_safe(result.get("execution_phase_summary"))
     return result
 
 

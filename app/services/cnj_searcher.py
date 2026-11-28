@@ -1,9 +1,10 @@
 # Copyright (c) 2026 Equipe RadarJus - Todos os direitos reservados (Lei nº 9.609/1998).
 # Proibida a reprodução, distribuição ou uso comercial sem autorização expressa dos autores.
 
+import gc
+import html
 import os
 import re
-import gc
 import hashlib
 import math
 import time
@@ -30,6 +31,29 @@ from app.utils.sanitizer import (
 from app.utils.http_client import request_gov_br_with_fallback
 
 logger = logging.getLogger(__name__)
+
+# Calibragem de coleta para Render Free (512 MB RAM, pico < 380 MB, Gunicorn --timeout 120)
+SYNC_SCAN_TIME_BUDGET_SECONDS = 50.0
+SYNC_SCAN_MAX_PAGES = 15
+SYNC_SCAN_MAX_RECORDS = 1500
+MAX_SNIPPET_CHARS = 1200
+MAX_SNIPPETS_PER_PROCESS = 2
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
+_CNPJ_IN_TEXT_RE = re.compile(r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b")
+
+
+def _strip_html_to_text(raw_text: Any, max_len: int = MAX_SNIPPET_CHARS) -> str:
+    """Remove tags HTML brutas da publicação do PJe e compacta o resumo em texto plano."""
+    if not raw_text:
+        return ""
+    cleaned = html.unescape(str(raw_text))
+    if "<" in cleaned:
+        cleaned = _HTML_TAG_RE.sub(" ", cleaned)
+    cleaned = _WHITESPACE_RE.sub(" ", cleaned).strip()
+    if max_len and len(cleaned) > max_len:
+        return cleaned[:max_len]
+    return cleaned
 
 TJ_MAP = {
     1: "tjac", 2: "tjal", 3: "tjap", 4: "tjam", 5: "tjba", 6: "tjce",
@@ -737,6 +761,8 @@ class CNJProcessSearcher:
         adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+        self.last_scan_truncated = False
+        self.last_stop_reason: Optional[str] = None
         
         # Suporte a proxy dedicado isolado (não interfere no pip/build do Render)
         proxy_url = os.getenv("PJE_PROXY_URL") or os.getenv("JUDICIAL_PROXY_URL")
@@ -820,8 +846,12 @@ class CNJProcessSearcher:
         processes: Dict[str, Any],
         discovered_entities: Optional[Set[str]] = None,
         is_tst_override: bool = False,
+        max_records: Optional[int] = None,
     ):
-        """Extrai números CNJ de 20 dígitos, textos, metadados e filiais descobertas."""
+        """
+        Extrai números CNJ de 20 dígitos, metadados, CNPJs e snippet compacto em texto plano,
+        descartando o HTML bruto `texto` imediatamente para manter o pico de RAM abaixo de 380 MB.
+        """
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -843,6 +873,9 @@ class CNJProcessSearcher:
             )
             cnj = self.normalize_cnj(raw_num)
             if not cnj:
+                continue
+
+            if max_records and cnj not in processes and len(processes) >= max_records:
                 continue
 
             trib_sigla = "tst" if is_tst_override else (item.get("siglaTribunal", "") or "")
@@ -888,15 +921,29 @@ class CNJProcessSearcher:
                             if discovered_entities is not None:
                                 discovered_entities.add(clean_cnpj)
 
-            texto = (
+            raw_texto = (
                 item.get("texto")
                 or item.get("teor")
                 or item.get("conteudo")
                 or item.get("textoPublicacao")
                 or ""
             )
-            if texto and texto not in entry["publicacoes_texto"]:
-                entry["publicacoes_texto"].append(texto)
+            if raw_texto:
+                for match in _CNPJ_IN_TEXT_RE.findall(str(raw_texto)):
+                    clean_c = re.sub(r"\D", "", match)
+                    if len(clean_c) == 14:
+                        if clean_c not in entry.setdefault("cnpjs_encontrados", []):
+                            entry["cnpjs_encontrados"].append(clean_c)
+                        if discovered_entities is not None:
+                            discovered_entities.add(clean_c)
+                compact_texto = _strip_html_to_text(raw_texto, max_len=MAX_SNIPPET_CHARS)
+                if (
+                    compact_texto
+                    and len(entry["publicacoes_texto"]) < MAX_SNIPPETS_PER_PROCESS
+                    and compact_texto not in entry["publicacoes_texto"]
+                ):
+                    entry["publicacoes_texto"].append(compact_texto)
+                del raw_texto
 
             classe = item.get("nomeClasse") or item.get("nome_classe") or item.get("classe") or ""
             if classe and classe not in entry["classes_pje"]:
@@ -1024,6 +1071,7 @@ class CNJProcessSearcher:
         itens_por_pagina: int = 100,
         time_budget_seconds: Optional[float] = None,
         prev_page_signature: Optional[str] = None,
+        max_records: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Varre sequencialmente o Comunica PJe em fluxo streaming por lote com RAM constante,
@@ -1056,6 +1104,8 @@ class CNJProcessSearcher:
         known_cnjs_set: Set[str] = set(known_cnjs) if known_cnjs is not None else set()
         pages_read = 0
         hit_max_pages = False
+        truncated = False
+        stop_reason: Optional[str] = None
         anti_loop_triggered = False
         rate_limited = False
         retry_after = 0
@@ -1082,11 +1132,13 @@ class CNJProcessSearcher:
                 return p_num, None, err
 
         page = start_page
-        batch_start_time = time.time()
+        batch_start_time = time.monotonic()
         while True:
             # Trava de teto configurado por ambiente (SCAN_MAX_PAGES)
             if effective_max_pages > 0 and page > effective_max_pages:
                 hit_max_pages = True
+                truncated = True
+                stop_reason = stop_reason or "MAX_PAGES"
                 motivo = "TETO_MAX_PAGES_ATINGIDO"
                 break
 
@@ -1095,10 +1147,19 @@ class CNJProcessSearcher:
                 motivo = "LOTE_CURTO_CONCLUIDO"
                 break
 
+            # Limite máximo de registros por chamada (quando especificado)
+            if max_records is not None and max_records > 0 and len(all_processes) >= max_records:
+                truncated = True
+                stop_reason = "MAX_RECORDS"
+                motivo = "MAX_RECORDS"
+                break
+
             # Limite orçamentário por time-box (proteção ativa contra timeout HTTP no Render Free)
-            if time_budget_seconds is not None and time_budget_seconds > 0 and pages_read > 0:
-                elapsed = time.time() - batch_start_time
+            if time_budget_seconds is not None and time_budget_seconds > 0:
+                elapsed = time.monotonic() - batch_start_time
                 if elapsed >= time_budget_seconds:
+                    truncated = True
+                    stop_reason = "TIME_BUDGET"
                     motivo = "LOTE_CURTO_CONCLUIDO"
                     logger.info(
                         "[SCAN_PAGE] Time-box atingido (%.2fs >= %.2fs) após %d páginas lidas na página %d. Encerrando lote com segurança.",
@@ -1130,9 +1191,11 @@ class CNJProcessSearcher:
             # Processa respostas estritamente em ordem crescente para nunca pular páginas
             for p_num in chunk_pages:
                 if time_budget_seconds is not None and time_budget_seconds > 0 and pages_read > 0:
-                    elapsed = time.time() - batch_start_time
+                    elapsed = time.monotonic() - batch_start_time
                     if elapsed >= time_budget_seconds:
                         page = p_num
+                        truncated = True
+                        stop_reason = "TIME_BUDGET"
                         motivo = "LOTE_CURTO_CONCLUIDO"
                         logger.info(
                             "[SCAN_PAGE] Time-box atingido (%.2fs >= %.2fs) após %d páginas lidas na página %d. Encerrando lote com segurança.",
@@ -1432,6 +1495,8 @@ class CNJProcessSearcher:
             "is_completed": is_completed,
             "motivo_encerramento": motivo,
             "last_page_signature": last_page_signature,
+            "truncated": truncated or hit_max_pages,
+            "stop_reason": stop_reason or motivo,
         }
 
     def paginate_labor_courts_batch(
@@ -1855,18 +1920,21 @@ class CNJProcessSearcher:
     def fetch_comunica_pje_all_branches(
         self,
         brand_term: str,
-        max_pages: int = 20
+        max_pages: int = SYNC_SCAN_MAX_PAGES,
+        time_budget_seconds: float = SYNC_SCAN_TIME_BUDGET_SECONDS,
+        max_records: int = SYNC_SCAN_MAX_RECORDS,
     ) -> Tuple[Dict[str, Any], Set[str]]:
         """
-        Deep Scan em segundo plano: Varre em paralelo até 12 páginas (até 600 publicações) no Comunica PJe
-        usando a Marca/Nome Raiz da empresa para capturar processos de TODAS as filiais e empresas do grupo.
-        Retorna tupla com (processes_map, discovered_entities).
+        Varre até 15 páginas (ou até 1.500 processos / orçamento máximo de 50s) no Comunica PJe
+        usando a Marca/Nome Raiz da empresa, descartando HTML bruto no parse para manter RAM < 380 MB.
         """
         processes: Dict[str, Any] = {}
         discovered_entities: Set[str] = set()
         clean_brand = brand_term.strip()
+        started_at = time.monotonic()
+        truncated = False
+        stop_reason: Optional[str] = None
 
-        # Página 1 inicial para extrair count e primeiras 50 publicações
         params_p1 = {
             "nomeParte": clean_brand,
             "pagina": 1,
@@ -1885,20 +1953,25 @@ class CNJProcessSearcher:
                     items = payload
                 else:
                     items = []
-                self._parse_comunica_items(items, processes, discovered_entities)
+                self._parse_comunica_items(items, processes, discovered_entities, max_records=max_records)
                 has_more = len(items) == 50
+                del items, payload
         except Exception as exc:
             logger.error("Erro na página 1 do Deep Scan Comunica PJe: %s", exc)
 
-        # Determina quantas páginas varrer
         if total_count and isinstance(total_count, int) and total_count > 0:
             calc_pages = (total_count + 49) // 50
             target_pages = min(max_pages, calc_pages)
+            if calc_pages > max_pages:
+                truncated = True
+                stop_reason = "MAX_PAGES"
         else:
             target_pages = max_pages if has_more else 1
 
-        if target_pages >= 2:
+        if target_pages >= 2 and (not max_records or len(processes) < max_records):
             def _fetch_single_page(p_num: int) -> List[Any]:
+                if time_budget_seconds and (time.monotonic() - started_at) >= time_budget_seconds:
+                    return []
                 p = {"nomeParte": clean_brand, "pagina": p_num, "itensPorPagina": 50}
                 try:
                     r = self._request_gov("GET", self.COMUNICA_URL, params=p, timeout=5.0)
@@ -1911,34 +1984,66 @@ class CNJProcessSearcher:
                     logger.debug("Erro ao paginar Comunica PJe página %d: %s", p_num, e)
                 return []
 
-            with ThreadPoolExecutor(max_workers=10) as executor:
+            with ThreadPoolExecutor(max_workers=6) as executor:
                 futures = {executor.submit(_fetch_single_page, p): p for p in range(2, target_pages + 1)}
                 for f in as_completed(futures):
+                    if time_budget_seconds and (time.monotonic() - started_at) >= time_budget_seconds:
+                        truncated = True
+                        stop_reason = "TIME_BUDGET"
+                        for pending in futures:
+                            pending.cancel()
+                        break
                     page_items = f.result()
                     if page_items:
-                        self._parse_comunica_items(page_items, processes, discovered_entities)
+                        self._parse_comunica_items(
+                            page_items,
+                            processes,
+                            discovered_entities,
+                            max_records=max_records,
+                        )
+                        del page_items
+                    if max_records and len(processes) >= max_records:
+                        truncated = True
+                        stop_reason = "MAX_RECORDS"
+                        for pending in futures:
+                            pending.cancel()
+                        break
 
-        # Varredura complementar no TST
-        try:
-            params_tst = {
-                "nomeParte": clean_brand,
-                "siglaTribunal": "TST",
-                "pagina": 1,
-                "itensPorPagina": 50,
-            }
-            resp_tst = self._request_gov("GET", self.COMUNICA_URL, params=params_tst, timeout=5.0)
-            if resp_tst.ok:
-                py_tst = resp_tst.json()
-                tst_items = py_tst if isinstance(py_tst, list) else (
-                    py_tst.get("items") or py_tst.get("itens") or []
-                )
-                self._parse_comunica_items(tst_items, processes, discovered_entities, is_tst_override=True)
-        except Exception as exc:
-            logger.debug("Consulta complementar TST tratada silenciosamente: %s", exc)
+        remaining_budget = (
+            time_budget_seconds - (time.monotonic() - started_at)
+            if time_budget_seconds
+            else 5.0
+        )
+        if remaining_budget > 2.0 and (not max_records or len(processes) < max_records):
+            try:
+                params_tst = {
+                    "nomeParte": clean_brand,
+                    "siglaTribunal": "TST",
+                    "pagina": 1,
+                    "itensPorPagina": 50,
+                }
+                resp_tst = self._request_gov("GET", self.COMUNICA_URL, params=params_tst, timeout=min(5.0, remaining_budget))
+                if resp_tst.ok:
+                    py_tst = resp_tst.json()
+                    tst_items = py_tst if isinstance(py_tst, list) else (
+                        py_tst.get("items") or py_tst.get("itens") or []
+                    )
+                    self._parse_comunica_items(
+                        tst_items,
+                        processes,
+                        discovered_entities,
+                        is_tst_override=True,
+                        max_records=max_records,
+                    )
+            except Exception as exc:
+                logger.debug("Consulta complementar TST tratada silenciosamente: %s", exc)
 
+        gc.collect()
+        self.last_scan_truncated = truncated
+        self.last_stop_reason = stop_reason
         logger.info(
-            "fetch_comunica_pje_all_branches('%s') concluiu: %d processos únicos, %d filiais/entidades descobertas.",
-            clean_brand, len(processes), len(discovered_entities)
+            "fetch_comunica_pje_all_branches('%s') concluiu em %.2fs: %d processos únicos, %d entidades, truncated=%s (%s).",
+            clean_brand, time.monotonic() - started_at, len(processes), len(discovered_entities), truncated, stop_reason,
         )
         return processes, discovered_entities
 
@@ -2143,6 +2248,13 @@ class CNJProcessSearcher:
         raw_trib = dj.get("tribunal") or com_data.get("siglaTribunal") or com_data.get("tribunal")
         canonical_tribunal = normalize_court_code(raw_trib, cnj=cnj)
 
+        resumo_pub = _strip_html_to_text((raw_texts or [""])[0], max_len=500)
+        compact_movs = [
+            {"codigo": m.get("codigo"), **({"dataHora": m["dataHora"]} if m.get("dataHora") else {})}
+            for m in movimentos
+            if isinstance(m, dict) and m.get("codigo") is not None
+        ]
+
         return {
             "numeroProcesso": cnj,
             "numero_processo": cnj,
@@ -2169,12 +2281,14 @@ class CNJProcessSearcher:
                 "possuiSinalRevelia": tem_revelia,
                 "encontradoNoDatajud": bool(dj),
             },
-            "publicacoes_texto": com_data.get("publicacoes_texto", []),
+            # Descarta o campo texto HTML bruto imediatamente após extrair os indicadores/resumo (RAM < 380 MB)
+            "publicacoes_texto": [],
             "destinatarios_nomes": com_data.get("destinatarios_nomes", []),
+            "cnpjs_encontrados": com_data.get("cnpjs_encontrados", []),
             "classes_pje": classes_list,
-            "resumoPublicacao": (com_data.get("publicacoes_texto") or [""])[0][:500],
+            "resumoPublicacao": resumo_pub,
             "raw_metadata": dj if dj else None,
-            "movimentos": movimentos,
+            "movimentos": compact_movs,
         }
 
     def _merge_process_data(self, cnj: str, com_data: Dict[str, Any], dj: Dict[str, Any]) -> Dict[str, Any]:

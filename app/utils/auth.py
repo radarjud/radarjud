@@ -35,7 +35,10 @@ def get_current_user_optional() -> Optional[User]:
             uid_int = int(user_id)
         except (ValueError, TypeError):
             uid_int = user_id
-        user = db.session.get(User, uid_int)
+        try:
+            user = db.session.get(User, uid_int)
+        except Exception:
+            user = None
         if user and user.is_active:
             g.current_user = user
             g.current_tenant_id = user.tenant_id
@@ -73,7 +76,10 @@ def require_auth(f: Callable) -> Callable:
         except (ValueError, TypeError):
             uid_int = user_id
 
-        user = db.session.get(User, uid_int)
+        try:
+            user = db.session.get(User, uid_int)
+        except Exception:
+            user = None
         if not user or not user.is_active:
             return jsonify({"error": "Usuário inexistente ou inativo."}), 401
 
@@ -109,7 +115,10 @@ def require_role(*allowed_roles: str) -> Callable:
             except (ValueError, TypeError):
                 uid_int = user_id
 
-            user = db.session.get(User, uid_int)
+            try:
+                user = db.session.get(User, uid_int)
+            except Exception:
+                user = None
             if not user or not user.is_active:
                 return jsonify({"error": "Usuário inexistente ou inativo."}), 401
 

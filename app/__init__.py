@@ -127,7 +127,7 @@ def ensure_database_schema(db_instance):
         logger.warning("Aviso durante ensure_database_schema: %s", exc)
 
 
-def create_app(config_name: str = None) -> Flask:
+def create_app(config_name: str = None, seed_catalog: bool = True) -> Flask:
     """
     Application Factory para o LexGuard AI.
     Configura banco de dados PostgreSQL, CORS, logs e rotas da API.
@@ -188,6 +188,11 @@ def create_app(config_name: str = None) -> Flask:
         from app.routes.api import get_search_processes
         return get_search_processes(company_search_id=company_search_id)
 
+    @app.route("/api/auth/logout", methods=["POST", "GET"])
+    def _api_auth_logout():
+        from app.routes.auth import logout
+        return logout()
+
     # Rota raiz informativa
     @app.route("/", methods=["GET"])
     def index():
@@ -220,48 +225,22 @@ def create_app(config_name: str = None) -> Flask:
             db.create_all()
             ensure_database_schema(db)
 
-            # Pré-semeia e sincroniza CompanyRegistry com os metadados de grandes corporações para máxima velocidade
+            # Semeia usuários padrão de sistema (Admin e Analista) com idempotência estrita
             try:
-                import re
-                from app.models.CompanyRegistry import CompanyRegistry
-                from app.models.company_search import get_utc_now
-                from app.services.economic_service import OFFICIAL_CORPORATE_METADATA
-                now = get_utc_now()
-                for c_cnpj, meta in OFFICIAL_CORPORATE_METADATA.items():
-                    c_clean = re.sub(r"\D", "", c_cnpj)
-                    meta_cap = float(meta.get("capital_social") or 0.0)
-                    existing = CompanyRegistry.query.filter_by(cnpj=c_clean).first()
-                    if not existing:
-                        reg = CompanyRegistry(
-                            cnpj=c_clean,
-                            razao_social=meta["razao_social"][:255],
-                            nome_fantasia=meta.get("nome_fantasia", "")[:255] or None,
-                            situacao_cadastral=meta.get("descricao_situacao_cadastral", "ATIVA")[:50],
-                            matriz_filial="1" if meta.get("identificador_matriz_filial") == 1 else "2",
-                            municipio=meta.get("municipio", "")[:150] or None,
-                            uf=meta.get("uf", "")[:2] or None,
-                            capital_social=meta_cap,
-                            cnae_codigo=meta.get("cnae_codigo"),
-                            cnae_descricao=meta.get("cnae_descricao"),
-                            created_at=now,
-                            updated_at=now,
-                        )
-                        db.session.add(reg)
-                    else:
-                        changed = False
-                        if meta_cap > 0.0 and float(existing.capital_social or 0.0) == 0.0:
-                            existing.capital_social = meta_cap
-                            changed = True
-                        if not existing.cnae_codigo and meta.get("cnae_codigo"):
-                            existing.cnae_codigo = meta["cnae_codigo"]
-                            existing.cnae_descricao = meta.get("cnae_descricao")
-                            changed = True
-                        if changed:
-                            existing.updated_at = now
-                db.session.commit()
-            except Exception as e_seed:
+                from app.seeds.user_seed import seed_default_users
+                seed_default_users(commit=True)
+            except Exception as e_user_seed:
                 db.session.rollback()
-                app.logger.debug("Sincronização de CompanyRegistry ignorada/já presente: %s", e_seed)
+                app.logger.debug("Seed de usuários padrão ignorado/já presente: %s", e_user_seed)
+
+            # Pré-semeia e sincroniza CompanyRegistry com o catálogo completo quando vazio ou incompleto
+            if seed_catalog:
+                try:
+                    from app.seeds.catalog_seed import seed_company_registry
+                    seed_company_registry(enrich_via_brasilapi=False, commit=True)
+                except Exception as e_seed:
+                    db.session.rollback()
+                    app.logger.debug("Sincronização de CompanyRegistry ignorada/já presente: %s", e_seed)
         except Exception as exc:
             app.logger.warning("Não foi possível conectar imediatamente ao PostgreSQL para db.create_all(): %s", exc)
 

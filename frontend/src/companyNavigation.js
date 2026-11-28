@@ -1,13 +1,24 @@
 const COMPANY_PAGES = new Set(['overview', 'processes', 'predictions']);
-const PAGES = new Set(['search', 'catalog', 'overview', 'processes', 'predictions', 'history', 'compare']);
+const AUTH_PAGES = new Set(['login', 'register']);
+const PAGES = new Set(['search', 'catalog', 'overview', 'processes', 'predictions', 'history', 'compare', 'login', 'register']);
 
 export function isCompanyPage(page) {
   return COMPANY_PAGES.has(page);
 }
 
+export function isAuthPage(page) {
+  return AUTH_PAGES.has(page);
+}
+
 export function validSearchId(value) {
   return /^[1-9]\d*$/.test(String(value ?? '')) && Number.isSafeInteger(Number(value))
     ? String(value) : null;
+}
+
+export function isProtectedRoute(page, id) {
+  if (isAuthPage(page)) return false;
+  if (isCompanyPage(page) && validSearchId(id) !== null) return false;
+  return true;
 }
 
 export function parseRoute(hash) {

@@ -838,4 +838,102 @@
     flex-direction: column;
     gap: 12px;
   }
+  .execution-phase-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .execution-phase-kpi {
+    text-align: left;
+  }
+}
+
+/* Card dedicado: Processos em Fase de Execução / Sentença Aplicada */
+.execution-phase-card {
+  background: #fbfcfd;
+  border: 1px solid #dde4ea;
+  border-left: 4px solid #475569;
+  min-width: 0;
+}
+.execution-phase-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+.execution-phase-copy {
+  min-width: 0;
+  flex: 1;
+}
+.execution-phase-copy h3 {
+  font-size: 15px;
+  color: #17283a;
+  margin: 0 0 6px;
+}
+.execution-phase-copy p {
+  font-size: 12px;
+  line-height: 1.6;
+  color: #5d6d7d;
+  margin: 0;
+}
+.execution-phase-kpi {
+  text-align: right;
+  flex-shrink: 0;
+}
+.execution-phase-kpi strong {
+  display: block;
+  font-size: 18px;
+  color: #245a81;
+  letter-spacing: -0.3px;
+}
+.execution-phase-kpi span {
+  display: block;
+  font-size: 11px;
+  color: #6d7b88;
+  margin-top: 2px;
+}
+.execution-phase-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+.execution-phase-badge {
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: normal;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.compare-execution-phase {
+  margin-top: 12px;
+  padding: 12px;
+  background: #f8fafb;
+  border: 1px solid #e2e8ee;
+  border-left: 3px solid #475569;
+  border-radius: 10px;
+  min-width: 0;
+}
+.compare-execution-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.compare-execution-top strong {
+  font-size: 12px;
+  color: #17283a;
+}
+.compare-execution-count {
+  font-size: 12px;
+  font-weight: 700;
+  color: #245a81;
+}
+.compare-execution-phase p {
+  font-size: 11px;
+  line-height: 1.5;
+  color: #5d6d7d;
+  margin: 0;
 }
