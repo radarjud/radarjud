@@ -50,7 +50,7 @@ ul { margin: 4pt 0 8pt; padding-left: 15pt; }
 {% set comp = report.compliance %}
 {% macro pct(value) -%}{% if value is none or value == '' %}—{% else %}{{ ('%.1f'|format(value|float)).replace('.', ',') }}%{% endif %}{%- endmacro %}
 {% macro scan_label(status) -%}
-{{ {'COMPLETED':'Concluída','PARTIAL_FAST_PATH':'Em andamento','SCANNING_BACKGROUND':'Varredura em segundo plano','BROWSER_PENDING':'Aguardando varredura','BROWSER_PARTIAL':'Parcialmente concluída','PROCESSING':'Processando','PENDING':'Pendente','FAILED':'Falha na varredura'}.get(status, 'Não informado') }}
+{{ {'COMPLETED':'Concluída','PARTIAL':'Varredura Parcial','PARTIAL_FAST_PATH':'Em andamento','SCANNING_BACKGROUND':'Varredura em segundo plano','BROWSER_PENDING':'Aguardando varredura','BROWSER_PARTIAL':'Parcialmente concluída','PROCESSING':'Processando','PENDING':'Pendente','FAILED':'Falha na varredura'}.get(status, 'Não informado') }}
 {%- endmacro %}
 <table class="header"><colgroup><col style="width:63%"><col style="width:37%"></colgroup><tr>
 <td class="header-title">RADARJUS v2.0 · INTELIGÊNCIA PREDITIVA &amp; COMPLIANCE<br>{{ report.company_name }}</td>

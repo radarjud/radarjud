@@ -553,11 +553,15 @@ class LegalAIAnalyzer:
             if sub_count > 0
             else "Nenhuma condenação subsidiária de contratante identificada na amostra"
         )
-        alerta_sub_txt = (
-            f"Histórico de Responsabilidade Subsidiária: {sub_count} processos com condenação subsidiária atribuída a contratantes anteriores ({', '.join(sub_tomadoras[:3])})."
-            if sub_count > 0
-            else "Nenhuma condenação subsidiária de contratante identificada na amostra."
-        )
+        tomadoras_str = ", ".join(str(t).strip() for t in sub_tomadoras[:3] if t and str(t).strip())
+        if sub_count > 0:
+            alerta_sub_txt = (
+                f"Histórico de Responsabilidade Subsidiária: {sub_count} processos com condenação subsidiária atribuída a contratantes anteriores ({tomadoras_str})."
+                if tomadoras_str
+                else f"Histórico de Responsabilidade Subsidiária: {sub_count} processos com condenação subsidiária atribuída a contratantes anteriores."
+            )
+        else:
+            alerta_sub_txt = "Nenhuma condenação subsidiária de contratante identificada na amostra."
 
         # Caso 2: Empresa com processos abertos, mas sem histórico anterior julgado (condenações/improcedências/acordos)
         if total_julgados == 0:

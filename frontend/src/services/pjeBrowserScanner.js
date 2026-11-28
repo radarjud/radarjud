@@ -1,4 +1,4 @@
-const PAGE_SIZE = 100;
+const BROWSER_PAGE_LIMIT = 50; // Limite oficial da API do Comunica PJe por requisição (US-23)
 const MAX_PAGES = 10;
 const BASE = 'https://comunicaapi.pje.jus.br/api/v1/comunicacao';
 
@@ -19,16 +19,29 @@ export async function fetchPjePage(termo, cnpj, page, signal, timeout = 6000) {
     signal?.removeEventListener('abort', abort);
     throw new Error('Razão social ou nome empresarial obrigatório para consultar o PJe');
   }
-  url.searchParams.set('nomeParte', termo);
+  const cleanTerm = String(termo || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\w\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  url.searchParams.set('nomeParte', cleanTerm || termo);
   url.searchParams.set('pagina', String(page));
-  url.searchParams.set('itensPorPagina', String(PAGE_SIZE));
+  // Limite estrito oficial da API do CNJ é no máximo 50 itens por página (US-23)
+  url.searchParams.set('itensPorPagina', String(BROWSER_PAGE_LIMIT));
   const options = { signal: controller.signal, headers: { Accept: 'application/json' } };
   try {
     let response;
     try {
       response = await fetch(url.toString(), options);
+      if (response.status === 429) {
+        throw new Error('Rate limit 429');
+      }
     } catch (error) {
       controller.signal.throwIfAborted();
+      if (error?.message === 'Rate limit 429') {
+        throw new Error('PJe HTTP 429');
+      }
       // Fallback de conectividade/CORS, não para respostas de bloqueio ou rate limit.
       response = await fetch(`/api/cnj-proxy?target=${encodeURIComponent(url.toString())}`, options);
     }
@@ -45,27 +58,72 @@ export async function fetchPjePage(termo, cnpj, page, signal, timeout = 6000) {
 }
 
 export async function runBrowserDeepScan(termo, cnpj, page1Count, onProgress, { signal, page1Items = [], fetchPage = fetchPjePage } = {}) {
-  const totalPages = Math.min(Math.ceil(page1Count / PAGE_SIZE), MAX_PAGES);
+  const totalPages = Math.min(Math.ceil(page1Count / 100), MAX_PAGES);
   const seen = new Set(page1Items.map(processKey).filter(Boolean));
   const items = [];
   const failedPages = [];
   let received = page1Items.length;
+  let prevCommIds = '';
+  let consecutiveZeroNewPages = 0;
+
   for (let start = 2; start <= totalPages; start += 3) {
     signal?.throwIfAborted();
     const pages = Array.from({ length: Math.min(3, totalPages - start + 1) }, (_, i) => start + i);
     const results = await Promise.allSettled(pages.map(page => fetchPage(termo, cnpj, page, signal)));
     signal?.throwIfAborted();
+
+    let stopEarly = false;
     results.forEach((result, i) => {
-      if (result.status === 'rejected') { failedPages.push(pages[i]); return; }
-      received += result.value.items.length;
-      for (const item of result.value.items) {
+      if (result.status === 'rejected') {
+        failedPages.push(pages[i]);
+        return;
+      }
+      const pageItems = result.value?.items || [];
+      received += pageItems.length;
+
+      // Trava 1: IDs de comunicação idênticos aos da página anterior (loop real)
+      const currentCommIds = pageItems
+        .map(it => String(it?.id || it?.idComunicacao || it?.numero_processo || it?.numeroProcesso || ''))
+        .filter(Boolean)
+        .sort()
+        .join(',');
+      if (currentCommIds && prevCommIds && currentCommIds === prevCommIds) {
+        stopEarly = true;
+      }
+      prevCommIds = currentCommIds;
+
+      let newCount = 0;
+      for (const item of pageItems) {
         const key = processKey(item);
         if (!key || seen.has(key)) continue;
         seen.add(key);
         items.push(item);
+        newCount++;
+      }
+
+      // Trava 2: Encerra apenas se 3 páginas consecutivas não trouxerem nenhum CNJ novo
+      if (newCount === 0 && pageItems.length > 0) {
+        consecutiveZeroNewPages++;
+        if (consecutiveZeroNewPages >= 3) {
+          stopEarly = true;
+        }
+      } else if (newCount > 0) {
+        consecutiveZeroNewPages = 0;
       }
     });
-    onProgress?.({ received, total: Math.min(page1Count, MAX_PAGES * PAGE_SIZE), unique: seen.size, failedPages: [...failedPages] });
+
+    onProgress?.({
+      received,
+      total: Math.min(page1Count, MAX_PAGES * 100),
+      unique: seen.size,
+      failedPages: [...failedPages],
+    });
+
+    if (stopEarly) {
+      break;
+    }
   }
-  return { items, failedPages, received, totalPages };
+
+  const isCompleted = failedPages.length === 0;
+  return { items, failedPages, received, totalPages, isCompleted };
 }

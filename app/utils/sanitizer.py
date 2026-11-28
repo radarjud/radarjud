@@ -43,6 +43,39 @@ def remove_accents(text: str) -> str:
     return "".join(c for c in normalized if not unicodedata.combining(c))
 
 
+def normalize_search_term_generic(term: str) -> str:
+    """
+    Normaliza de forma 100% genérica qualquer razão social ou nome empresarial:
+    - Converte para ASCII simples sem acentuação gráfica.
+    - Substitui hífens, barras, pontos, vírgulas e pontuações coladas por espaço.
+    - Colapsa múltiplos espaços em branco em um único espaço.
+    - Preserva o texto limpo sem pontuações que quebrem buscas em APIs judiciais (PJe/DataJud).
+    """
+    if not term:
+        return ""
+    ascii_text = remove_accents(str(term)).upper()
+    cleaned = re.sub(r"[^\w\s]", " ", ascii_text)
+    return " ".join(cleaned.split())
+
+
+def extract_corporate_core_name(term: str) -> str:
+    """
+    Remove sufixos societários comuns (LTDA, S.A., S/A, EIRELI, ME, EPP, etc.)
+    de forma puramente genérica, retornando o núcleo da razão social para fallback de busca.
+    """
+    normalized = normalize_search_term_generic(term)
+    if not normalized:
+        return ""
+    without_suffix = re.sub(
+        r"\b(LTDA|LIMITADA|S\s*A|SA|SOCIEDADE\s+ANONIMA|EIRELI|ME|MICROEMPRESA|EPP|CIA|COMPANHIA)\b",
+        " ",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    collapsed = " ".join(without_suffix.split())
+    return collapsed if len(collapsed) >= 3 else normalized
+
+
 def is_cnpj(value: str) -> bool:
     """
     Verifica se a string fornecida corresponde estruturalmente a um CNPJ
@@ -258,10 +291,12 @@ def resolve_search_strategy(user_input: str, brasil_api_fetcher=None) -> dict:
         razao = brasil_api_fetcher(cnpj_clean) if brasil_api_fetcher else None
         query_term = razao or cnpj_clean
         comunica_term = sanitize_company_name(query_term)
+        core_fallback = extract_corporate_core_name(razao) if razao else None
         cache_key = f"STRICT_CNPJ::{comunica_term}::{cnpj_clean}"
         return {
             "mode": "STRICT_CNPJ",
             "comunica_query_term": comunica_term,
+            "fallback_query_term": core_fallback if (core_fallback and core_fallback != comunica_term) else None,
             "display_title": razao or f"CNPJ: {user_input.strip()}",
             "is_broad_brand": False,
             "aggregate_all_branches": False,
@@ -273,10 +308,12 @@ def resolve_search_strategy(user_input: str, brasil_api_fetcher=None) -> dict:
     elif mode == "STRICT_RAZAO":
         sanitized = sanitize_company_name(user_input)
         comunica_term = sanitized or user_input.strip().upper()
+        core_fallback = extract_corporate_core_name(user_input)
         cache_key = f"STRICT_RAZAO::{comunica_term}::"
         return {
             "mode": "STRICT_RAZAO",
             "comunica_query_term": comunica_term,
+            "fallback_query_term": core_fallback if (core_fallback and core_fallback != comunica_term) else None,
             "display_title": user_input.strip().upper(),
             "is_broad_brand": False,
             "aggregate_all_branches": False,

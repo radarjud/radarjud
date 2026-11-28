@@ -372,3 +372,38 @@ def test_bayesian_simplex_and_blocking_rule_not_broken(app_instance):
             + p.get("probabilidade_vencer_pct", 0.0)
         )
         assert round(soma_simplex, 1) == 100.0
+
+
+def test_alerta_sumula_331_omits_empty_parentheses_when_no_contractors():
+    """
+    Garante que o alerta de responsabilidade subsidiária não exiba '()' vazio
+    quando nenhum nome de contratante anterior for extraído.
+    """
+    from app.services.ai_analyzer import LegalAIAnalyzer
+
+    analyzer = LegalAIAnalyzer()
+    res_empty = analyzer.analyze_company({
+        "empresa": "TERCEIRIZADA SEM NOMES LTDA",
+        "total_processos": 10,
+        "desfechos_sentencas": {"condenacoes": 0, "improcedentes": 0, "acordos": 0, "em_aberto": 10},
+        "ranking_motivos": [],
+        "plus_previsao_condenacao": [],
+        "condenacoes_subsidiarias_tomadoras_count": 4,
+        "tomadoras_subsidiarias_pj": [],
+    })
+    alerts_empty = " ".join(res_empty.get("alertas_sumula_331", []))
+    assert "4 processos com condenação subsidiária atribuída a contratantes anteriores." in alerts_empty
+    assert "()" not in alerts_empty
+
+    res_with_names = analyzer.analyze_company({
+        "empresa": "TERCEIRIZADA COM NOMES LTDA",
+        "total_processos": 10,
+        "desfechos_sentencas": {"condenacoes": 0, "improcedentes": 0, "acordos": 0, "em_aberto": 10},
+        "ranking_motivos": [],
+        "plus_previsao_condenacao": [],
+        "condenacoes_subsidiarias_tomadoras_count": 2,
+        "tomadoras_subsidiarias_pj": ["BANCO ALFA S.A.", "PETROBRAS"],
+    })
+    alerts_with_names = " ".join(res_with_names.get("alertas_sumula_331", []))
+    assert "(BANCO ALFA S.A., PETROBRAS)." in alerts_with_names
+

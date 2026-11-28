@@ -209,6 +209,7 @@ function normalize(raw) {
     logo: logo,
     processes: Array.isArray(payload.processos) ? payload.processos
       : Array.isArray(payload.process_records) ? payload.process_records : [],
+    tstCount: payload.tst_count != null ? Number(payload.tst_count) : null,
     searchId: payload.search_id ?? payload.id ?? null,
     searchedAt: payload.updated_at || payload.created_at || null,
     scanStatus: payload.scan_status || 'COMPLETED',
@@ -386,8 +387,16 @@ function Overview({ data, navigate, catalogTerm }) {
   const ai = data?.aiAnalysis;
 
   const isFastPath = ['PARTIAL_FAST_PATH', 'BROWSER_PENDING', 'SCANNING_BACKGROUND'].includes(data?.scanStatus);
+  const isPartial = ['PARTIAL', 'PARTIAL_MAX_PAGES', 'BROWSER_PARTIAL'].includes(data?.scanStatus);
   const isCompleted = data?.scanStatus === 'COMPLETED';
-  const tstCount = (data?.processes || []).filter(p => p.is_tst_recurso || p.tribunal === 'tst' || p.tribunal === 'TST' || String(p.grau || '').toUpperCase().includes('TST') || String(p.numero_processo || p.numero_cnj || '').includes('.5.00.')).length;
+  const tstCount = data?.tstCount != null
+    ? data.tstCount
+    : (data?.processes || []).filter(p => (
+        p.is_tst_recurso ||
+        String(p.tribunal || '').toUpperCase() === 'TST' ||
+        String(p.grau || '').toUpperCase().includes('TST') ||
+        /\.5\.00\./.test(String(p.numero_processo || ''))
+      )).length;
 
   return (
     <div className="stack">
@@ -416,7 +425,7 @@ function Overview({ data, navigate, catalogTerm }) {
               Fast-Path ativo (&lt; 3s) · Varrendo em 2º plano
             </Tag>
           )}
-          {data?.scanStatus === 'BROWSER_PARTIAL' && <Tag type="amber">Varredura parcial encerrada</Tag>}
+          {isPartial && <Tag type="amber">Varredura Parcial</Tag>}
           {isCompleted && <Tag type="green"><Check size={13} style={{ display: 'inline', marginRight: '4px' }} /> Varredura Completa</Tag>}
           {tstCount > 0 && (
             <Tag type="purple">
@@ -1317,6 +1326,7 @@ function AppShell() {
   const [analyzing, setAnalyzing] = useState('');
   const activeSearch = useRef(null);
   const [scanProgress, setScanProgress] = useState(null);
+  const stopRequestedRef = useRef(false);
   function cancelSearch() {
     activeSearch.current?.abort();
     activeSearch.current = null;
@@ -1365,7 +1375,7 @@ function AppShell() {
 
   // Polling automático para atualizar tela quando o Deep Scan em segundo plano finalizar
   useEffect(() => {
-    if (scanProgress?.running || !data?.searchId || !['PARTIAL_FAST_PATH', 'SCANNING_BACKGROUND', 'BROWSER_PENDING'].includes(data?.scanStatus)) return;
+    if (scanProgress?.running || !data?.searchId || !['PARTIAL_FAST_PATH', 'SCANNING_BACKGROUND', 'BROWSER_PENDING', 'IN_PROGRESS'].includes(data?.scanStatus)) return;
     let active = true;
     const intervalId = setInterval(async () => {
       try {
@@ -1407,6 +1417,7 @@ function AppShell() {
     const { signal } = controller;
     const current = () => activeSearch.current === controller && !signal.aborted;
     setScanProgress(null);
+    stopRequestedRef.current = false;
     setBusy(true);
     setError('');
     try {
@@ -1440,26 +1451,130 @@ function AppShell() {
       navigate('overview', normalized.searchId);
       setBusy(false);
       setAnalyzing('');
-      if (!validSearchId(normalized.searchId) || normalized.scanStatus !== 'BROWSER_PENDING') return;
-      setScanProgress({ running: true, message: `Consolidando varredura: ${first.items.length}/${Math.min(first.count, 1000)} comunicações...` });
-      try {
-        const scan = await runBrowserDeepScan(pjeTerm, cnpj, first.count, progress => {
-          if (current()) setScanProgress({ running: true, message: `Consolidando varredura: ${progress.received}/${progress.total} comunicações...` });
-        }, { signal, page1Items: first.items });
-        if (!current()) return;
-        {
-          await request('/ingest-deep-scan', {
-            method: 'POST', signal, body: JSON.stringify({ search_id: Number(normalized.searchId), items: scan.items, browser_scan_finished: true, is_final_batch: scan.failedPages.length === 0 && scan.received >= first.count && first.count <= 1000 }),
-          });
-          if (!current()) return;
-          const updated = normalize(await request(`/history/${normalized.searchId}`, { signal }));
-          if (current() && validSearchId(updated?.searchId) === validSearchId(normalized.searchId)) {
-            setData(prev => validSearchId(prev?.searchId) === validSearchId(normalized.searchId) ? updated : prev);
+      if (!validSearchId(normalized.searchId)) return;
+      // Se a busca tiver mais páginas pendentes, executa varredura profunda em lotes curtos
+      if (['PARTIAL_FAST_PATH', 'IN_PROGRESS', 'BROWSER_PENDING'].includes(normalized.scanStatus)) {
+        setScanProgress({ running: true, message: `Varrendo processos em lotes: ${normalized.totalProcesses || 50} identificados...` });
+        try {
+          // Sem teto de páginas ou de lotes: o loop só termina quando o backend devolve fim real
+          // (COMPLETED / has_more=false), quando o usuário pede para calcular, ou após falhas
+          // consecutivas que não se recuperam com espera progressiva.
+          const MAX_CONSECUTIVE_FAILURES = 6;
+          const MAX_WAIT_SECONDS = 60;
+          let currentPage = 2;
+          let prevSignature = null;
+          let isDone = false;
+          let finalStatus = null;
+          let consecutiveFailures = 0;
+
+          const waitWithBackoff = async (baseSeconds, reason) => {
+            consecutiveFailures += 1;
+            const waitSec = Math.min(MAX_WAIT_SECONDS, Math.max(1, Number(baseSeconds) || 3) * consecutiveFailures);
+            setScanProgress({ running: true, message: `${reason}: aguardando ${waitSec}s e retomando na página ${currentPage}...` });
+            await new Promise(r => setTimeout(r, waitSec * 1000));
+          };
+
+          while (!isDone && current()) {
+            if (stopRequestedRef.current) break;
+            let batchRes;
+            try {
+              batchRes = await request(`/deep-scan-batch/${normalized.searchId}`, {
+                method: 'POST',
+                signal,
+                body: JSON.stringify({ page: currentPage, batch_size: 10, prev_page_signature: prevSignature }),
+              });
+            } catch (batchErr) {
+              if (!current()) break;
+              const status = batchErr?.status;
+              // 429, 5xx (inclui timeout do Render) e falha de rede são transitórios: espera e retoma.
+              const transient = status === undefined || status === 429 || status >= 500;
+              if (transient && consecutiveFailures < MAX_CONSECUTIVE_FAILURES) {
+                await waitWithBackoff(3, status === 429 ? 'Limite de requisições' : 'Instabilidade temporária');
+                continue;
+              }
+              throw batchErr;
+            }
+
+            if (!current() || stopRequestedRef.current) break;
+
+            if (batchRes?.status === 'RATE_LIMITED' || batchRes?.status === 'UPSTREAM_RETRY') {
+              if (batchRes?.last_page_signature) prevSignature = batchRes.last_page_signature;
+              currentPage = Number(batchRes?.next_page) || currentPage;
+              const reason = batchRes.status === 'RATE_LIMITED' ? 'Limite judicial (429)' : 'Tribunal instável';
+              await waitWithBackoff(batchRes?.retry_after_seconds, reason);
+              continue;
+            }
+
+            consecutiveFailures = 0;
+            const currentTotal = batchRes?.total_acumulado ?? batchRes?.data?.total_processos ?? 0;
+            if (current()) {
+              const layerLabel = batchRes?.layer === 2 ? 'Camada 2 · ' : 'Camada 1 · ';
+              const progressMessage = batchRes?.current_court && batchRes?.total_courts
+                ? `Varrendo Justiça do Trabalho (${layerLabel}${batchRes.current_court} — ${Math.min((batchRes.courts_completed ?? 0) + 1, batchRes.total_courts)}/${batchRes.total_courts} tribunais): ${currentTotal} processos trabalhistas identificados...`
+                : `Varrendo processos em lotes: ${currentTotal} identificados (página ${currentPage})...`;
+              setScanProgress({
+                running: true,
+                message: progressMessage,
+              });
+              if (batchRes?.data) {
+                const liveUpdate = normalize(batchRes.data);
+                if (liveUpdate && current()) {
+                  setData(prev => validSearchId(prev?.searchId) === validSearchId(normalized.searchId) ? liveUpdate : prev);
+                }
+              }
+            }
+
+            if (batchRes?.is_completed || batchRes?.status === 'COMPLETED' || batchRes?.has_more === false) {
+              finalStatus = batchRes?.status;
+              isDone = true;
+              break;
+            }
+
+            if (batchRes?.last_page_signature) prevSignature = batchRes.last_page_signature;
+            const nextPage = Number(batchRes?.next_page);
+            // No modo por tribunal, next_page volta para 1 ao avançar de TRT; no legado nunca retrocede.
+            currentPage = batchRes?.total_courts
+              ? (nextPage >= 1 ? nextPage : 1)
+              : (nextPage > currentPage ? nextPage : currentPage + 1);
           }
+
+          if (current()) {
+            if (stopRequestedRef.current) {
+              setScanProgress({ running: true, message: 'Calculando métricas com processos coletados...' });
+              try {
+                const finalBatchRes = await request(`/deep-scan-batch/${normalized.searchId}`, {
+                  method: 'POST',
+                  signal,
+                  body: JSON.stringify({ finalize: true, manual_stop: true }),
+                });
+                if (finalBatchRes?.status) finalStatus = finalBatchRes.status;
+                if (finalBatchRes?.data) {
+                  const finalLive = normalize(finalBatchRes.data);
+                  if (finalLive && current()) {
+                    setData(prev => validSearchId(prev?.searchId) === validSearchId(normalized.searchId) ? finalLive : prev);
+                  }
+                }
+              } catch (_) {}
+            }
+            const finalData = normalize(await request(`/history/${normalized.searchId}`, { signal }));
+            if (current() && validSearchId(finalData?.searchId) === validSearchId(normalized.searchId)) {
+              setData(prev => validSearchId(prev?.searchId) === validSearchId(normalized.searchId) ? finalData : prev);
+            }
+            const isPartialResult = (
+              stopRequestedRef.current ||
+              ['PARTIAL', 'PARTIAL_MAX_PAGES', 'BROWSER_PARTIAL'].includes(finalStatus) ||
+              ['PARTIAL', 'PARTIAL_MAX_PAGES', 'BROWSER_PARTIAL'].includes(finalData?.scanStatus)
+            );
+            setScanProgress({
+              running: false,
+              message: isPartialResult
+                ? 'Varredura parcial concluída com os dados coletados até o momento (interrompida antes do fim).'
+                : 'Varredura concluída com sucesso.',
+            });
+          }
+        } catch {
+          if (current()) setScanProgress({ running: false, message: 'Varredura parcial concluída: os dados acumulados foram preservados.' });
         }
-        if (current()) setScanProgress({ running: false, message: scan.failedPages.length || (first.count <= 1000 && scan.received < first.count) ? 'Varredura parcial: nem todas as comunicações foram coletadas.' : first.count > 1000 ? 'Varredura limitada às primeiras 10 páginas.' : 'Varredura do navegador concluída.' });
-      } catch {
-        if (current()) setScanProgress({ running: false, message: 'Não foi possível consolidar toda a varredura. Os resultados iniciais foram preservados.' });
       }
     } catch (failure) {
       if (current()) setError(failure.message || 'Não foi possível pesquisar a empresa.');
@@ -1580,7 +1695,24 @@ function AppShell() {
             ) : <div className="loading" role="status"><RefreshCw className="spin" /> Carregando consulta compartilhada...</div>
           )}
           {isCompanyPage(page) && !needsSharedData && <>
-            {scanProgress && <p role="status" className="company-share-message">{scanProgress.message}</p>}
+            {scanProgress && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 14px', background: '#eef6fc', borderRadius: '8px', marginBottom: '14px', border: '1px solid #d0e3f0', flexWrap: 'wrap', gap: '8px' }}>
+                <p role="status" className="company-share-message" style={{ margin: 0, fontWeight: 500, color: '#1a4060' }}>{scanProgress.message}</p>
+                {scanProgress.running && (
+                  <button
+                    type="button"
+                    className="secondary"
+                    style={{ fontSize: '12px', padding: '4px 10px', whiteSpace: 'nowrap' }}
+                    onClick={() => {
+                      stopRequestedRef.current = true;
+                      setScanProgress(p => p ? { ...p, message: 'Finalizando e calculando métricas com processos coletados...' } : null);
+                    }}
+                  >
+                    Calcular com dados já coletados
+                  </button>
+                )}
+              </div>
+            )}
             {visibleData && <CompanyShareActions key={visibleData.searchId ?? visibleData.name} data={visibleData} />}
             {page === 'overview' && <Overview data={visibleData} navigate={navigate} catalogTerm={catalog.term} />}
             {page === 'processes' && <Processes data={visibleData} />}
