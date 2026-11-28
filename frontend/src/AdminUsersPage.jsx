@@ -146,7 +146,7 @@ export default function AdminUsersPage() {
       <div className="card panel" style={{ background: '#ffffff', borderRadius: '12px', border: '1px solid #e2e8f0', padding: '20px' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
           <div>
-            <h3 style={{ margin: 0, fontSize: '18px', color: '#0f172a' }}>Membros da Organização</h3>
+            <h3 style={{ margin: 0, fontSize: '18px', color: '#0f172a' }}>Usuários da Plataforma</h3>
             <span style={{ fontSize: '13px', color: '#64748b' }}>Total de {data?.total ?? 0} usuário(s) ativos</span>
           </div>
         </div>
@@ -163,6 +163,7 @@ export default function AdminUsersPage() {
                 <tr style={{ borderBottom: '1px solid #e2e8f0', color: '#64748b', fontWeight: 600 }}>
                   <th style={{ padding: '12px 14px' }}>Usuário</th>
                   <th style={{ padding: '12px 14px' }}>E-mail</th>
+                  <th style={{ padding: '12px 14px' }}>Organização</th>
                   <th style={{ padding: '12px 14px' }}>Perfil de Acesso</th>
                   <th style={{ padding: '12px 14px' }}>Plano do Usuário</th>
                   <th style={{ padding: '12px 14px' }}>Status</th>
@@ -198,6 +199,11 @@ export default function AdminUsersPage() {
                       <td style={{ padding: '14px', color: '#475569' }}>
                         <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
                           <Mail size={13} color="#94a3b8" /> {u.email}
+                        </span>
+                      </td>
+                      <td style={{ padding: '14px', color: '#334155', fontWeight: 500 }}>
+                        <span style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                          <CreditCard size={13} color="#94a3b8" /> {u.tenant_name || 'RadarJus Matriz'}
                         </span>
                       </td>
                       <td style={{ padding: '14px' }}>

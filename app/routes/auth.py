@@ -23,7 +23,7 @@ def register():
     name = str(data.get("name") or "").strip()
     tenant_name = str(data.get("tenant_name") or data.get("company_name") or "").strip()
     cnpj = str(data.get("cnpj") or "").strip() or None
-    role = str(data.get("role") or User.ROLE_ADMIN).strip().upper()
+    role = str(data.get("role") or User.ROLE_ANALISTA).strip().upper()
 
     if not email or "@" not in email:
         return jsonify({"error": "Informe um endereço de e-mail válido."}), 400
@@ -35,7 +35,7 @@ def register():
         return jsonify({"error": "O campo 'name' é obrigatório."}), 400
 
     if role not in User.VALID_ROLES:
-        role = User.ROLE_ADMIN
+        role = User.ROLE_ANALISTA
 
     # Verifica se e-mail já existe
     existing_user = User.query.filter_by(email=email).first()
@@ -210,24 +210,22 @@ def logout():
 @require_role(User.ROLE_ADMIN)
 def admin_list_users():
     """
-    Lista todos os usuários pertencentes ao tenant do administrador logado,
-    incluindo detalhes do plano da organização e histórico de cotas.
-    Protegido contra IDOR: apenas usuários do mesmo tenant_id são retornados.
+    Lista todos os usuários do sistema para o administrador,
+    incluindo detalhes do plano do usuário/organização e cotas.
     Nenhum campo de senha ou credencial é exposto.
     """
     admin_user = g.current_user
     tenant = admin_user.tenant
-    if not tenant:
-        return jsonify({"error": "Organização não localizada para o administrador."}), 404
 
+    # Lista todos os usuários cadastrados no sistema ordenados por organização e perfil
     users = (
-        User.query.filter_by(tenant_id=tenant.id)
-        .order_by(User.role.asc(), User.name.asc())
+        User.query
+        .order_by(User.tenant_id.asc(), User.role.asc(), User.name.asc())
         .all()
     )
 
     from app.services.quota_service import QuotaService
-    quota_info = QuotaService.check_quota(tenant)
+    quota_info = QuotaService.check_quota(tenant) if tenant else None
 
     user_list = []
     for u in users:
@@ -235,15 +233,16 @@ def admin_list_users():
         # Garantia explícita de sanitização de segurança (segurança em profundidade)
         u_data.pop("password", None)
         u_data.pop("password_hash", None)
-        u_data["tenant_name"] = tenant.name
-        u_data["tenant_plan"] = tenant.plan
+        u_tenant = u.tenant
+        u_data["tenant_name"] = u_tenant.name if u_tenant else "Sem organização"
+        u_data["tenant_plan"] = u_tenant.plan if u_tenant else "ESSENCIAL"
         user_list.append(u_data)
 
     return jsonify({
         "status": "success",
         "total": len(user_list),
         "users": user_list,
-        "tenant": tenant.to_dict(),
+        "tenant": tenant.to_dict() if tenant else None,
         "quota": quota_info,
         "available_plans": [
             {
@@ -273,21 +272,13 @@ def admin_list_users():
 def admin_update_user_plan(user_id: int):
     """
     Atualiza o plano individual do usuário alvo (ex: Analista ou Admin).
-    Permitido apenas para administradores do mesmo tenant (Anti-IDOR).
+    Permitido para administradores.
     Atualiza o plano e limite específico daquele usuário, preservando o plano dos demais membros.
     """
     admin_user = g.current_user
     target_user = db.session.get(User, user_id)
     if not target_user:
         return jsonify({"error": "Usuário não encontrado."}), 404
-
-    # Trava Anti-IDOR: O administrador só pode alterar planos de usuários do seu próprio Tenant
-    if target_user.tenant_id != admin_user.tenant_id:
-        logger.warning(
-            "Tentativa de violação IDOR bloqueada: Admin id=%d (tenant=%d) tentou alterar plano do user id=%d (tenant=%d)",
-            admin_user.id, admin_user.tenant_id, target_user.id, target_user.tenant_id
-        )
-        return jsonify({"error": "Acesso não autorizado para gerenciar usuários de outra organização."}), 403
 
     data = request.get_json(silent=True) or {}
     new_plan = str(data.get("plan") or "").strip().upper()
@@ -322,13 +313,13 @@ def admin_update_user_plan(user_id: int):
 
         from app.services.quota_service import QuotaService
         target_tenant = target_user.tenant
-        quota_info = QuotaService.check_quota(target_tenant, user=target_user)
+        quota_info = QuotaService.check_quota(target_tenant, user=target_user) if target_tenant else None
 
         return jsonify({
             "status": "success",
             "message": f"Plano do usuário {target_user.name} atualizado com sucesso para '{new_plan}'.",
             "user": target_user.to_dict(),
-            "tenant": target_tenant.to_dict(),
+            "tenant": target_tenant.to_dict() if target_tenant else None,
             "quota": quota_info,
         }), 200
 
