@@ -738,15 +738,16 @@ def search_company():
                     (econ_data.get("cnpjs_consolidados")[0] if econ_data.get("cnpjs_consolidados") else None) or
                     econ_data.get("cnpj")
                 ) if isinstance(econ_data, dict) else None
-                if not cached_search.contratos_poder_publico or cached_search.contratos_poder_publico.get("total_contratos", 0) == 0:
+                if cached_search.contratos_poder_publico is not None:
+                    res["contratos_poder_publico"] = cached_search.contratos_poder_publico
+                else:
                     contratos_pub = public_contracts_service.get_public_contracts(
                         cnpj=clean_search_cnpj,
                         company_name=cached_search.company_name,
                     )
-                    if contratos_pub.get("total_contratos", 0) > 0 or not cached_search.contratos_poder_publico:
-                        cached_search.contratos_poder_publico = make_json_safe(contratos_pub)
-                        res["contratos_poder_publico"] = contratos_pub
-                        econ_dirty = True
+                    cached_search.contratos_poder_publico = make_json_safe(contratos_pub)
+                    res["contratos_poder_publico"] = contratos_pub
+                    econ_dirty = True
                 res["cached"] = True
                 res["cache_level"] = "L1_DATABASE"
                 res["search_id"] = cached_search.id
