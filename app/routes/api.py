@@ -20,7 +20,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Blueprint, Response, request, jsonify, current_app, g
 from sqlalchemy import text
 
-from app.services.prediction_engine import build_sector_benchmark
+from app.services.prediction_engine import (
+    build_execution_phase_summary,
+    build_sector_benchmark,
+    normalize_execution_phase_payload,
+)
 from app.utils.rate_limiter import limit_rate
 
 from app.extensions import db
@@ -357,6 +361,10 @@ def _deep_scan_background_worker(
                     company_name=search.company_name,
                 ))
             search.movements_hash = deep_results.get("movements_hash")
+            if isinstance(deep_results.get("idoneidade_economica"), dict) and deep_results.get("execution_phase_summary") is not None:
+                deep_results["idoneidade_economica"]["execution_phase_summary"] = make_json_safe(
+                    deep_results["execution_phase_summary"]
+                )
             search.economic_standing = make_json_safe(deep_results["idoneidade_economica"])
             if search.economic_standing and isinstance(search.economic_standing, dict):
                 search.cnae_codigo = search.economic_standing.get("cnae_codigo") or search.cnae_codigo
@@ -597,7 +605,8 @@ def search_company():
                 SEARCH_CACHE.pop(cache_key, None)
             elif time.time() - ts < CACHE_TTL and (cached_data.get("total_processos") or 0) > 0:
                 logger.info("Cache em memória (TTL 15 min) ativado para '%s'. Resposta instantânea em 0.05s.", cache_key)
-                res_copy = dict(cached_data)
+                res_copy = normalize_execution_phase_payload(dict(cached_data))
+                res_copy["execution_phase_summary"] = make_json_safe(res_copy.get("execution_phase_summary"))
                 res_copy["cached"] = True
                 res_copy["cache_level"] = "L0_MEMORY_CACHE"
                 resp = jsonify(res_copy)
@@ -679,6 +688,7 @@ def search_company():
                     res["ranking_motivos"] = fresh_metrics.get("ranking_motivos", cached_search.ranking_motivos or [])
                     res["ranking_motivos_condenacao"] = fresh_metrics.get("ranking_motivos_condenacao", cached_search.ranking_motivos_condenacao or [])
                     res["condenacao_por_motivo"] = fresh_metrics.get("condenacao_por_motivo", cached_search.condenacao_por_motivo or [])
+                    res["execution_phase_summary"] = fresh_metrics.get("execution_phase_summary")
                     res["probabilidade_condenacao_geral_pct"] = fresh_metrics.get("probabilidade_condenacao_geral_pct")
                     res["taxa_historica_condenacao_pct"] = fresh_metrics.get("taxa_historica_condenacao_pct")
                     cached_search.ranking_motivos = fresh_metrics.get("ranking_motivos", cached_search.ranking_motivos or [])
@@ -686,6 +696,11 @@ def search_company():
                     cached_search.condenacao_por_motivo = fresh_metrics.get("condenacao_por_motivo", cached_search.condenacao_por_motivo or [])
                     cached_search.predictions_summary = fresh_metrics["plus_previsao_condenacao"]
                     cached_search.overall_risk_score = fresh_metrics["score_risco_terceirizacao"]
+                elif res.get("execution_phase_summary") is None and proc_dicts:
+                    res["execution_phase_summary"] = build_execution_phase_summary(proc_dicts)
+
+                res = normalize_execution_phase_payload(res)
+                res["execution_phase_summary"] = make_json_safe(res.get("execution_phase_summary"))
 
                 # Reutiliza idoneidade econômica persistida no cache L1 (< 300ms) salvo se ausente ou homônimo INAPTA defasado
                 stale_inapta = (
@@ -756,6 +771,8 @@ def search_company():
                 # Persiste atualização apenas se houve recálculo (evita round-trip extra no Supabase)
                 if econ_dirty or needs_metrics_refresh:
                     try:
+                        if isinstance(econ_data, dict) and res.get("execution_phase_summary") is not None:
+                            econ_data["execution_phase_summary"] = make_json_safe(res["execution_phase_summary"])
                         cached_search.economic_standing = make_json_safe(econ_data)
                         cached_search.ai_analysis = make_json_safe(cached_search.ai_analysis)
                         if econ_data and isinstance(econ_data, dict):
@@ -870,8 +887,11 @@ def search_company():
         )
         if isinstance(econ_data, dict):
             econ_data = {**econ_data, "search_cache_key": cache_key}
+            if fast_results.get("execution_phase_summary") is not None:
+                econ_data["execution_phase_summary"] = make_json_safe(fast_results["execution_phase_summary"])
         if browser_owned:
             econ_data = {**econ_data, "browser_search_strategy": search_strategy}
+        fast_results["execution_phase_summary"] = make_json_safe(fast_results.get("execution_phase_summary"))
         fast_results["idoneidade_economica"] = econ_data
         fast_results["logo"] = econ_data.get("logo", {})
         fast_results["capital_social_consolidado"] = econ_data.get("valor_formatado") or econ_data.get("capital_social_formatado")
@@ -1823,6 +1843,8 @@ def ingest_deep_scan():
         )
         if browser_strategy:
             econ_data = {**econ_data, "browser_search_strategy": browser_strategy}
+        if isinstance(econ_data, dict) and fresh_metrics.get("execution_phase_summary") is not None:
+            econ_data["execution_phase_summary"] = make_json_safe(fresh_metrics["execution_phase_summary"])
 
         ai_payload = {**fresh_metrics, "empresa": search.company_name, "processos": proc_dicts}
         ai_res = orchestrator.ai_analyzer.analyze_company(ai_payload)
@@ -2173,10 +2195,14 @@ def get_search_detail(search_id: int):
             )
             result["plus_previsao_condenacao"] = fresh_metrics["plus_previsao_condenacao"]
             result["score_risco_terceirizacao"] = fresh_metrics["score_risco_terceirizacao"]
+            result["ranking_motivos"] = fresh_metrics.get("ranking_motivos", search.ranking_motivos or [])
             result["ranking_motivos_condenacao"] = fresh_metrics.get("ranking_motivos_condenacao", [])
             result["condenacao_por_motivo"] = fresh_metrics.get("condenacao_por_motivo", search.condenacao_por_motivo or [])
+            result["execution_phase_summary"] = make_json_safe(fresh_metrics.get("execution_phase_summary"))
             result["previsao_bloqueada"] = fresh_metrics.get("previsao_bloqueada", False)
             result["motivo_bloqueio_previsao"] = fresh_metrics.get("motivo_bloqueio_previsao")
+        result = normalize_execution_phase_payload(result)
+        result["execution_phase_summary"] = make_json_safe(result.get("execution_phase_summary"))
         result["sinais_solvencia_publica"] = result.get("sinais_solvencia_publica") or (result.get("idoneidade_economica") or {}).get("sinais_solvencia_publica")
         result["parecer_agente_adk"] = result.get("ai_analysis", {})
         if not result.get("contratos_poder_publico") or (
@@ -2460,6 +2486,8 @@ def _search_record_to_pdf_payload(search: CompanySearch) -> dict:
         if search.economic_standing.get("risco_calote_subsidiario") is not None:
             result["risco_subsidiario"] = search.economic_standing["risco_calote_subsidiario"]
     result["parecer_agente_adk"] = result.get("ai_analysis") or {}
+    result = normalize_execution_phase_payload(result)
+    result["execution_phase_summary"] = make_json_safe(result.get("execution_phase_summary"))
     return result
 
 

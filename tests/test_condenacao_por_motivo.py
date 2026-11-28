@@ -262,3 +262,127 @@ def test_payload_endpoints_overview_history_e_export_pdf(client):
     assert res_pdf_get.status_code == 200
     assert res_pdf_get.content_type == "application/pdf"
     assert res_pdf_get.data.startswith(b"%PDF")
+
+
+def test_execution_phase_separated_from_ranking_and_cpm(client, app):
+    """
+    Processos estritamente em fase de execução / cumprimento de sentença devem:
+    1. Ser excluídos de ranking_motivos, ranking_motivos_condenacao e condenacao_por_motivo;
+    2. Ser contabilizados em execution_phase_summary com percentual e descrição canônica;
+    3. Manter apenas os motivos materiais em processos mistos (ex.: ['Execução de Sentença', 'Horas Extras']);
+    4. Preservar a soma dos desfechos == total_processos e contagem de execução como condenação;
+    5. Ter fallback dinâmico em cache L1 / registros legados sem execution_phase_summary persistido.
+    """
+    from app.services.prediction_engine import normalize_execution_phase_payload
+    from app.services.tpu_constants import EXECUTION_PHASE_DESCRIPTION, is_execution_phase_label
+
+    assert is_execution_phase_label("Execução de Sentença") is True
+    assert is_execution_phase_label("CUMPRIMENTO PROVISÓRIO") is True
+    assert is_execution_phase_label("Liquidação de Sentença") is True
+    assert is_execution_phase_label("Carta Precatória Executória") is True
+    assert is_execution_phase_label("Horas Extras e Intervalo") is False
+
+    processes = [
+        # 2 processos puros de execução/cumprimento
+        {
+            "numero_processo": "00010010020245060001",
+            "primary_subject": "Execução de Sentença",
+            "subjects": ["Execução de Sentença"],
+            "sentence_outcome": "em_aberto",
+        },
+        {
+            "numero_processo": "00010020020245060001",
+            "primary_subject": "Cumprimento Provisório de Sentença",
+            "subjects": ["Cumprimento Provisório de Sentença"],
+            "classes_pje": ["Cumprimento de Sentença Trabalhista"],
+            "sentence_outcome": "condenacoes",
+        },
+        # 1 processo misto: execução + assunto material real -> mantém apenas Horas Extras
+        {
+            "numero_processo": "00010030020245060001",
+            "primary_subject": "Execução de Sentença",
+            "subjects": ["Execução de Sentença", "Horas Extras"],
+            "sentence_outcome": "condenacoes",
+        },
+        # 1 processo material puro
+        {
+            "numero_processo": "00010040020245060001",
+            "primary_subject": "Verbas Rescisórias",
+            "subjects": ["Verbas Rescisórias"],
+            "sentence_outcome": "improcedentes",
+        },
+    ]
+
+    predictor = BayesianRiskPredictor()
+    metrics = predictor.generate_dashboard_metrics("EMPRESA EXECUCAO S.A.", processes)
+
+    assert metrics["total_processos"] == 4
+    assert sum(metrics["desfechos_sentencas"].values()) == 4
+    # 2 execução + 1 misto condenado = 3 condenações
+    assert metrics["desfechos_sentencas"]["condenacoes"] == 3
+
+    motivos_ranking = [r["motivo"] for r in metrics["ranking_motivos"]]
+    assert "Horas Extras" in motivos_ranking
+    assert "Verbas Rescisórias" in motivos_ranking
+    assert not any(is_execution_phase_label(m) for m in motivos_ranking)
+
+    motivos_cond = [r["motivo"] for r in metrics["ranking_motivos_condenacao"]]
+    assert "Horas Extras" in motivos_cond
+    assert not any(is_execution_phase_label(m) for m in motivos_cond)
+
+    motivos_cpm = [c["motivo"] for c in metrics["condenacao_por_motivo"]]
+    assert "Horas Extras / Jornada" in motivos_cpm
+    assert "Verbas Rescisórias" in motivos_cpm
+    assert "Execução / Cumprimento de Sentença" not in motivos_cpm
+    assert sum(c["total_processos"] for c in metrics["condenacao_por_motivo"]) == 2
+
+    exec_sum = metrics["execution_phase_summary"]
+    assert exec_sum["total_processos"] == 2
+    assert exec_sum["percentual_total"] == 50.0
+    assert exec_sum["descricao"] == EXECUTION_PHASE_DESCRIPTION
+    assert len(exec_sum["rotulos"]) >= 2
+
+    # Fallback em cache L1 / payload legado sem execution_phase_summary
+    legacy_payload = {
+        "empresa": "LEGADA S.A.",
+        "total_processos": 10,
+        "ranking_motivos": [
+            {"motivo": "Execução de Sentença", "quantidade": 4, "porcentagem": 40.0},
+            {"motivo": "Horas Extras", "quantidade": 6, "porcentagem": 60.0},
+        ],
+        "ranking_motivos_condenacao": [
+            {"motivo": "Execução de Sentença", "quantidade": 4, "condenacoes": 4},
+            {"motivo": "Horas Extras", "quantidade": 3, "condenacoes": 3},
+        ],
+        "condenacao_por_motivo": [
+            {"motivo": "Execução / Cumprimento de Sentença", "total_processos": 4, "condenacoes": 4, "taxa_condenacao": 100.0, "faixa_variacao": "60,0% a 99,0%"},
+            {"motivo": "Horas Extras / Jornada", "total_processos": 6, "condenacoes": 3, "taxa_condenacao": 50.0, "faixa_variacao": "20,0% a 80,0%"},
+        ],
+    }
+    normalized_l1 = normalize_execution_phase_payload(dict(legacy_payload))
+    assert normalized_l1["execution_phase_summary"]["total_processos"] == 4
+    assert normalized_l1["execution_phase_summary"]["percentual_total"] == 40.0
+    assert len(normalized_l1["ranking_motivos"]) == 1
+    assert normalized_l1["ranking_motivos"][0]["motivo"] == "Horas Extras"
+    assert len(normalized_l1["condenacao_por_motivo"]) == 1
+
+    # Cache L1 no banco (CompanySearch legado sem execution_phase_summary explícito)
+    with app.app_context():
+        legacy_row = CompanySearch(
+            company_name="LEGADO EXEC LTDA",
+            normalized_name="LEGADO EXEC LTDA",
+            total_processes=10,
+            outcomes_summary={"condenacoes": 4, "acordos": 1, "improcedentes": 3, "em_aberto": 2},
+            ranking_motivos=legacy_payload["ranking_motivos"],
+            ranking_motivos_condenacao=legacy_payload["ranking_motivos_condenacao"],
+            condenacao_por_motivo=legacy_payload["condenacao_por_motivo"],
+            predictions_summary=[],
+            overall_risk_score=30.0,
+            scan_status="COMPLETED",
+            last_checked_at=get_utc_now(),
+        )
+        db.session.add(legacy_row)
+        db.session.commit()
+        row_dict = legacy_row.to_dict()
+        assert row_dict["execution_phase_summary"]["total_processos"] == 4
+        assert all(not is_execution_phase_label(r["motivo"]) for r in row_dict["ranking_motivos"])

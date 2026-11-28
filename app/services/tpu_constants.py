@@ -4,6 +4,121 @@ Mapeamento de códigos de movimentos decisórios, perícias e taxas basais estat
 para o modelo Dirichlet-Multinomial / Beta-Binomial (Empirical Bayes).
 """
 
+import unicodedata
+from typing import Any, List, Optional, Tuple
+
+
+def normalize_subject_text(text: Any) -> str:
+    """Normaliza acentos (NFKD), caixa e espaços para matching determinístico."""
+    if not text:
+        return ""
+    decomposed = unicodedata.normalize("NFKD", str(text))
+    stripped = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return " ".join(stripped.lower().split())
+
+
+# Classificação centralizada da fase de execução / cumprimento de sentença
+EXECUTION_PHASE_DESCRIPTION = (
+    "Ações que já concluíram a fase de conhecimento e encontram-se em etapa "
+    "de cumprimento, liquidação ou cobrança de sentença."
+)
+
+EXECUTION_PHASE_TERMS = (
+    "execuc",
+    "cumprimento de senten",
+    "cumprimento provisorio",
+    "cumprimento definitivo",
+    "liquidac",
+    "carta precatoria executoria",
+    "carta de sentenca",
+    "penhora",
+    "sisbajud",
+    "expropriac",
+)
+
+
+def is_execution_phase_label(label: Any) -> bool:
+    """
+    Identifica se um assunto ou classe processual corresponde estritamente à fase de
+    execução / cumprimento / liquidação de sentença (normalizando acentos e case).
+    """
+    norm = normalize_subject_text(label)
+    if not norm:
+        return False
+    return any(term in norm for term in EXECUTION_PHASE_TERMS)
+
+
+def extract_class_names(classes_pje: Optional[List[Any]]) -> List[str]:
+    """Extrai nomes textuais de classes processuais (dicts ou strings)."""
+    names: List[str] = []
+    if not isinstance(classes_pje, list):
+        return names
+    for cls_item in classes_pje:
+        if isinstance(cls_item, dict):
+            nome = cls_item.get("nome") or cls_item.get("descricao")
+            if nome and str(nome).strip():
+                names.append(str(nome).strip())
+        elif isinstance(cls_item, str) and cls_item.strip():
+            names.append(cls_item.strip())
+    return names
+
+
+def classify_execution_vs_material_labels(
+    subjects: List[str],
+    classes_pje: Optional[List[Any]] = None,
+) -> Tuple[List[str], List[str], bool]:
+    """
+    Separa rótulos materiais de rótulos estritamente de execução/cumprimento.
+
+    Retorna (material_labels, execution_labels, is_execution_only):
+    - Se houver assuntos materiais e também rótulos de execução (processo misto),
+      remove apenas os rótulos de execução de material_labels e marca is_execution_only=False.
+    - Se todos os assuntos/classes informados forem apenas de execução/cumprimento,
+      retorna material_labels=[], execution_labels=[...], is_execution_only=True.
+    """
+    clean_subjects = [str(s).strip() for s in (subjects or []) if s and str(s).strip()]
+    execution_labels: List[str] = []
+    material_labels: List[str] = []
+
+    for label in clean_subjects:
+        if is_execution_phase_label(label):
+            if label not in execution_labels:
+                execution_labels.append(label)
+        else:
+            material_labels.append(label)
+
+    class_names = extract_class_names(classes_pje)
+    exec_classes = [c for c in class_names if is_execution_phase_label(c)]
+    for ec in exec_classes:
+        if ec not in execution_labels:
+            execution_labels.append(ec)
+
+    # Considera somente fase de execução quando não existe nenhum assunto material real
+    # (ou quando assuntos são ausentes/genéricos e a classe/assunto é de execução)
+    generic_placeholders = {
+        "outros motivos trabalhistas",
+        "reclamacao em apuracao",
+        "reclamacao trabalhista (geral)",
+        "obrigacao / reclamacao em apuracao inicial",
+        "assunto nao especificado",
+        "nao informado",
+        "direito do trabalho",
+        "atos processuais",
+    }
+    substantive_materials = [
+        m for m in material_labels if normalize_subject_text(m) not in generic_placeholders
+    ]
+
+    if not substantive_materials and execution_labels:
+        return [], execution_labels, True
+
+    # Se houver assuntos materiais reais junto com execução (processo misto),
+    # ignoramos os rótulos de execução e mantemos os assuntos materiais.
+    if substantive_materials:
+        return material_labels, execution_labels, False
+
+    return material_labels, execution_labels, False
+
 # Códigos TPU de Movimentos Decisórios (Sentenças / Acórdãos / Homologações / Extinções)
 TPU_OUTCOME_CODES = {
     219: {
