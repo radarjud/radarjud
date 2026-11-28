@@ -1,6 +1,6 @@
-# RadarJud — frontend React
+# RadarJus — frontend React
 
-Frontend independente (React 18 + Vite) com identidade visual e navegação baseada no Figma RadarJud.
+Frontend independente (React 18 + Vite) com identidade visual e navegação baseada no Figma RadarJus.
 
 ## Instalação
 

@@ -16,7 +16,7 @@ class ErrorBoundary extends React.Component {
   }
 
   componentDidCatch(error, info) {
-    console.error('RadarJud: erro ao renderizar a tela', error, info);
+    console.error('RadarJus: erro ao renderizar a tela', error, info);
   }
 
   render() {
