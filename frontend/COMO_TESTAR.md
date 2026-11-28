@@ -1,4 +1,4 @@
-# Teste de navegação — RadarJud React
+# Teste de navegação — RadarJus React
 
 O frontend funciona mesmo com a API desligada. Abra `http://localhost:5173/#/overview`, `/#/processes` e `/#/predictions`.
 

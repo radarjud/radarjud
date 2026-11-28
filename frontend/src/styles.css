@@ -937,3 +937,211 @@
   color: #5d6d7d;
   margin: 0;
 }
+
+/* =========================================================================
+   NOVA TABELA DE MOTIVOS DOS PROCESSOS (ZERO ROLAGEM HORIZONTAL - SEÇÃO 4.3)
+   ========================================================================= */
+.motive-table-container {
+  width: 100%;
+  overflow-x: hidden;
+  box-sizing: border-box;
+}
+
+table.motive-table {
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+}
+
+.motive-table th,
+.motive-table td {
+  box-sizing: border-box;
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+.motive-table th {
+  background: #f1f4f6;
+  color: #6d7b88;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  padding: 12px 10px;
+}
+
+.motive-table td {
+  padding: 14px 10px;
+  border-bottom: 1px solid #edf0f2;
+  font-size: 12px;
+}
+
+.motive-table .mobile-col-label {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  .motive-table-container {
+    overflow-x: hidden !important;
+  }
+
+  table.motive-table {
+    display: block;
+    width: 100% !important;
+    min-width: 0 !important;
+  }
+
+  table.motive-table thead {
+    display: none;
+  }
+
+  table.motive-table tbody {
+    display: block;
+    width: 100%;
+  }
+
+  table.motive-table tr.motive-table-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    grid-template-areas:
+      "motivo taxa"
+      "metrics metrics"
+      "faixa faixa";
+    gap: 8px;
+    margin-bottom: 12px;
+    padding: 14px;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.03);
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  table.motive-table tr.motive-table-row td {
+    display: block;
+    padding: 0;
+    border: none;
+    text-align: left !important;
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  table.motive-table tr.motive-table-row td.col-motivo {
+    grid-area: motivo;
+    font-size: 13px;
+    font-weight: 700;
+    color: #17283a;
+  }
+
+  table.motive-table tr.motive-table-row td.col-taxa {
+    grid-area: taxa;
+    text-align: right !important;
+  }
+
+  table.motive-table tr.motive-table-row td.col-mapeados {
+    grid-column: 1;
+    font-size: 12px;
+    color: #4b5e70;
+    margin-top: 4px;
+  }
+
+  table.motive-table tr.motive-table-row td.col-condenacoes {
+    grid-column: 2;
+    text-align: right !important;
+    font-size: 12px;
+    margin-top: 4px;
+  }
+
+  table.motive-table tr.motive-table-row td.col-faixa {
+    grid-area: faixa;
+    font-size: 11px;
+    color: #556677;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px dashed #edf0f2;
+  }
+
+  .motive-table .mobile-col-label {
+    display: inline;
+    font-weight: 600;
+    color: #718096;
+    margin-right: 4px;
+  }
+}
+
+/* =========================================================================
+   PAINEL COMPARATIVO: TRTs vs. TST (SEÇÃO 4.4)
+   ========================================================================= */
+.instancias-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 20px;
+  margin-top: 8px;
+}
+
+.instancia-card {
+  padding: 20px;
+  background: #ffffff;
+  border: 1px solid #e7ecf0;
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+}
+
+.instancia-card-header {
+  margin-bottom: 16px;
+}
+
+.instancia-card-header h4 {
+  margin: 8px 0 0;
+  font-size: 15px;
+  color: #1a2a3a;
+}
+
+.instancia-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  background: #f8fafb;
+  padding: 14px;
+  border-radius: 9px;
+  border: 1px solid #edf0f2;
+}
+
+.instancia-stat-item small {
+  display: block;
+  font-size: 10px;
+  font-weight: 600;
+  color: #68798a;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+
+.instancia-stat-item strong {
+  font-size: 16px;
+  color: #17283a;
+  font-weight: 700;
+}
+
+.amostra-reduzida-alert {
+  margin-top: 14px;
+  padding: 10px 14px;
+  background: #fffbf0;
+  border: 1px solid #fae8b8;
+  border-left: 3px solid #d99b26;
+  border-radius: 8px;
+  font-size: 12px;
+  color: #8c6014;
+  line-height: 1.5;
+}
+
+@media (max-width: 900px) {
+  .instancias-grid {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+}

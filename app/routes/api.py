@@ -334,11 +334,25 @@ def _deep_scan_background_worker(
                         primary_code = assuntos[0].get("codigo") if assuntos else None
                         dist_date = parse_iso_date(pdata.get("dataUltimaPublicacao"))
 
+                        from app.services.cnj_searcher import is_tst_process
+                        raw_trib = str(pdata.get("siglaTribunal") or pdata.get("tribunal") or "")[:50]
+                        is_tst_flag = is_tst_process(
+                            numero_processo=cnj,
+                            tribunal=raw_trib,
+                            grau="TST (Recursal)" if pdata.get("is_tst_recurso") else "G1",
+                            is_tst_recurso=bool(pdata.get("is_tst_recurso")),
+                            primary_subject=primary_name,
+                            observation=primary_name,
+                            classes_pje=classes_list,
+                            texts=raw_texts,
+                        )
+                        trib_val = "TST" if is_tst_flag else raw_trib
+
                         rec = ProcessRecord(
                             company_search_id=search_id,
                             numero_processo=cnj,
-                            tribunal=str(pdata.get("siglaTribunal") or pdata.get("tribunal") or "")[:50],
-                            grau="TST (Recursal)" if pdata.get("is_tst_recurso") else "G1",
+                            tribunal=trib_val,
+                            grau="TST (Recursal)" if is_tst_flag else "G1",
                             nivel_sigilo=0,
                             primary_subject=primary_name,
                             primary_subject_code=primary_code,
@@ -484,8 +498,6 @@ def _deep_scan_background_worker(
             deep_results["logo"] = econ.get("logo", {})
             if econ.get("indice_exposicao_financeira") is not None:
                 deep_results["indice_exposicao_financeira"] = econ["indice_exposicao_financeira"]
-                deep_results["score_risco_terceirizacao"] = econ["indice_exposicao_financeira"]
-                deep_results["overall_risk_score"] = econ["indice_exposicao_financeira"]
             deep_results["capital_social_consolidado"] = econ.get("valor_formatado") or econ.get("capital_social_formatado") or cap_display.get("valor_formatado")
             deep_results["unidades_consolidadas"] = econ.get("unidades_consolidadas") or cap_display.get("unidades_consolidadas", 1)
             deep_results["observacao_porte"] = econ.get("observacao_porte") or cap_display.get("observacao_porte", "")
@@ -747,7 +759,10 @@ def search_company():
         and type(browser_count) is int and browser_count >= 0
         and isinstance(client_prefetched_items, list)
         and 0 < len(client_prefetched_items) <= 100
-        and len(client_prefetched_items) == min(browser_count, 100)
+        and (
+            len(client_prefetched_items) == browser_count
+            or len(client_prefetched_items) >= min(browser_count, 50)
+        )
         and all(isinstance(item, dict) and orchestrator.searcher.normalize_cnj(
             item.get("numero_processo") or item.get("numeroProcesso") or item.get("numeroprocessocommascara")
         ) for item in client_prefetched_items)
@@ -905,8 +920,6 @@ def search_company():
                 res["sinais_solvencia_publica"] = econ_data.get("sinais_solvencia_publica")
                 if econ_data.get("indice_exposicao_financeira") is not None:
                     res["indice_exposicao_financeira"] = econ_data["indice_exposicao_financeira"]
-                    res["score_risco_terceirizacao"] = econ_data["indice_exposicao_financeira"]
-                    res["overall_risk_score"] = econ_data["indice_exposicao_financeira"]
 
                 # Reutiliza parecer de IA persistido quando disponível (evita chamada Gemini em L1 hit)
                 if isinstance(cached_search.ai_analysis, dict) and cached_search.ai_analysis:
@@ -1022,7 +1035,7 @@ def search_company():
         new_hash = fast_results.get("movements_hash")
         initial_status = fast_results.get("scan_status", "COMPLETED")
         if browser_owned and fast_results.get("total_processos", 0) > 0:
-            initial_status = "BROWSER_PENDING" if browser_count > 100 else "COMPLETED"
+            initial_status = "BROWSER_PENDING" if browser_count > len(client_prefetched_items) else "COMPLETED"
         else:
             browser_owned = False
 
@@ -1097,8 +1110,6 @@ def search_company():
         fast_results["sinais_solvencia_publica"] = econ_data.get("sinais_solvencia_publica")
         if econ_data.get("indice_exposicao_financeira") is not None:
             fast_results["indice_exposicao_financeira"] = econ_data["indice_exposicao_financeira"]
-            fast_results["score_risco_terceirizacao"] = econ_data["indice_exposicao_financeira"]
-            fast_results["overall_risk_score"] = econ_data["indice_exposicao_financeira"]
 
         # Sincroniza o parecer do Agente ADK com a idoneidade econômica calculada
         fresh_ai = orchestrator.ai_analyzer.analyze_company(fast_results)
@@ -1793,8 +1804,6 @@ def get_search_status(search_id: int):
                 response["data"]["logo"] = search.economic_standing.get("logo", {})
                 if search.economic_standing.get("indice_exposicao_financeira") is not None:
                     response["data"]["indice_exposicao_financeira"] = search.economic_standing["indice_exposicao_financeira"]
-                    response["data"]["score_risco_terceirizacao"] = search.economic_standing["indice_exposicao_financeira"]
-                    response["data"]["overall_risk_score"] = search.economic_standing["indice_exposicao_financeira"]
 
         return jsonify(response), 200
     except Exception as exc:
@@ -1895,6 +1904,8 @@ def _recalculate_search_metrics(search: CompanySearch):
             ProcessRecord.subjects_json,
             ProcessRecord.has_subsidiary_liability,
             ProcessRecord.subsidiary_contractors_json,
+            ProcessRecord.grau,
+            ProcessRecord.observation,
         )
         .filter(ProcessRecord.company_search_id == search_id)
         .all()
@@ -1910,6 +1921,8 @@ def _recalculate_search_metrics(search: CompanySearch):
             "subjects": r[5] or ([r[4]] if r[4] else []),
             "has_subsidiary_liability": r[6],
             "subsidiary_contractors": r[7],
+            "grau": r[8] or "G1",
+            "observation": r[9],
         }
         for r in procs_raw
     ]
@@ -2096,6 +2109,10 @@ def deep_scan_batch(search_id: int):
                 numero_processo=cnj,
                 tribunal=raw_trib,
                 is_tst_recurso=bool(pdata.get("is_tst_recurso")),
+                primary_subject=primary_name,
+                observation=primary_name,
+                classes_pje=classes_list,
+                texts=raw_texts,
             )
             trib_val = "TST" if is_tst_flag else str(raw_trib or "")[:50]
 
@@ -2665,6 +2682,55 @@ def get_search_processes(company_search_id: int):
             else:
                 query = query.filter(ProcessRecord.sentence_outcome == o)
 
+        # Filtro: instancia (tst, trts, execucao)
+        instancia = request.args.get("instancia") or request.args.get("instance")
+        if instancia and instancia.strip():
+            inst = instancia.strip().lower()
+            if inst in ("tst", "instancia_maxima", "instância máxima", "maxima"):
+                query = query.filter(
+                    db.or_(
+                        ProcessRecord.tribunal.ilike("%TST%"),
+                        ProcessRecord.numero_processo.ilike("%.5.00.%"),
+                        ProcessRecord.grau.ilike("%TST%"),
+                        ProcessRecord.primary_subject.ilike("%recurso de revista%"),
+                        ProcessRecord.primary_subject.ilike("%airr%"),
+                        ProcessRecord.observation.ilike("%recurso de revista%"),
+                        ProcessRecord.observation.ilike("%airr%"),
+                        ProcessRecord.observation.ilike("%(TST)%"),
+                    )
+                )
+            elif inst in ("trts", "trt", "instancias_ordinarias", "ordinarias"):
+                query = query.filter(
+                    db.not_(
+                        db.or_(
+                            ProcessRecord.tribunal.ilike("%TST%"),
+                            ProcessRecord.numero_processo.ilike("%.5.00.%"),
+                            ProcessRecord.grau.ilike("%TST%"),
+                            ProcessRecord.primary_subject.ilike("%recurso de revista%"),
+                            ProcessRecord.primary_subject.ilike("%airr%"),
+                            ProcessRecord.observation.ilike("%recurso de revista%"),
+                            ProcessRecord.observation.ilike("%airr%"),
+                            ProcessRecord.observation.ilike("%(TST)%"),
+                        )
+                    )
+                )
+            elif inst in ("execucao", "execução", "em_execucao", "em execução"):
+                query = query.filter(
+                    db.or_(
+                        ProcessRecord.sentence_outcome.in_(["execucao", "cumprimento_sentenca"]),
+                        ProcessRecord.primary_subject.ilike("%execuc%"),
+                        ProcessRecord.primary_subject.ilike("%cumprimento de senten%"),
+                        ProcessRecord.primary_subject.ilike("%liquidac%"),
+                        ProcessRecord.primary_subject.ilike("%penhora%"),
+                        ProcessRecord.primary_subject.ilike("%sisbajud%"),
+                        ProcessRecord.observation.ilike("%execuc%"),
+                        ProcessRecord.observation.ilike("%cumprimento de senten%"),
+                        ProcessRecord.observation.ilike("%liquidac%"),
+                        ProcessRecord.observation.ilike("%penhora%"),
+                        ProcessRecord.observation.ilike("%sisbajud%"),
+                    )
+                )
+
         # Filtro opcional de busca textual
         search_query = request.args.get("search")
         if search_query and search_query.strip():
@@ -2682,12 +2748,45 @@ def get_search_processes(company_search_id: int):
         offset = (page - 1) * per_page
         records = query.order_by(ProcessRecord.id.asc()).offset(offset).limit(per_page).all()
 
-        items = [
-            {
+        items = []
+        for r in records:
+            is_tst = (
+                "TST" in str(r.tribunal or "").upper()
+                or ".5.00." in str(r.numero_processo or "")
+                or "TST" in str(r.grau or "").upper()
+            )
+            raw_out = str(r.sentence_outcome or "").lower()
+            is_finalized_tst = is_tst and raw_out not in ("em_aberto", "")
+
+            is_exec = (
+                any(k in str(r.primary_subject or "").lower() for k in ("execuc", "cumprimento de senten", "liquidac", "penhora", "sisbajud"))
+                or any(k in str(r.observation or "").lower() for k in ("execuc", "cumprimento de senten", "liquidac", "penhora", "sisbajud"))
+            )
+
+            if is_tst:
+                fase_proc = "INSTANCIA_MAXIMA"
+            elif is_exec:
+                fase_proc = "EXECUCAO"
+            elif "RECURS" in str(r.grau or "").upper() or "2" in str(r.grau or ""):
+                fase_proc = "RECURSAL"
+            else:
+                fase_proc = "CONHECIMENTO"
+
+            tag_inst = (
+                "Não cabem mais recursos (Instância Máxima — TST)"
+                if is_finalized_tst
+                else None
+            )
+
+            items.append({
                 "id": r.id,
                 "numero_processo": r.numero_processo,
+                "numero_cnj": r.numero_processo,
                 "tribunal": r.tribunal,
                 "grau": r.grau,
+                "fase_processual": fase_proc,
+                "instancia_maxima_finalizado": bool(is_finalized_tst),
+                "tag_instancia": tag_inst,
                 "data_distribuicao": r.data_distribuicao.isoformat() if r.data_distribuicao else None,
                 "valor_causa": float(r.valor_causa) if r.valor_causa is not None else None,
                 "primary_subject": r.primary_subject,
@@ -2697,9 +2796,7 @@ def get_search_processes(company_search_id: int):
                 "sentence_outcome": r.sentence_outcome,
                 "has_expert_report": r.has_expert_report,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
-            }
-            for r in records
-        ]
+            })
 
         return jsonify({
             "search_id": search.id,
@@ -2858,6 +2955,12 @@ def get_search_detail(search_id: int):
             )
             result["plus_previsao_condenacao"] = fresh_metrics["plus_previsao_condenacao"]
             result["score_risco_terceirizacao"] = fresh_metrics["score_risco_terceirizacao"]
+            result["overall_risk_score"] = fresh_metrics["overall_risk_score"]
+            result["risco_subsidiario"] = fresh_metrics["risco_subsidiario"]
+            result["fase_execucao"] = fresh_metrics["fase_execucao"]
+            result["comparativo_instancias"] = fresh_metrics["comparativo_instancias"]
+            result["motivos_processo"] = fresh_metrics.get("motivos_processo", fresh_metrics.get("condenacao_por_motivo", []))
+            result["processos_amostra"] = fresh_metrics.get("processos_amostra", [])
             result["ranking_motivos"] = fresh_metrics.get("ranking_motivos", search.ranking_motivos or [])
             result["ranking_motivos_condenacao"] = fresh_metrics.get("ranking_motivos_condenacao", [])
             result["condenacao_por_motivo"] = fresh_metrics.get("condenacao_por_motivo", search.condenacao_por_motivo or [])
@@ -3057,14 +3160,8 @@ def compare_companies():
                 fast_res["cnpj"] = econ.get("cnpj_utilizado")
             elif target_cnpj:
                 fast_res["cnpj"] = target_cnpj
-            if econ.get("risco_calote_subsidiario") is not None:
-                fast_res["risco_subsidiario"] = econ["risco_calote_subsidiario"]
-            elif econ.get("indice_exposicao_financeira") is not None:
-                fast_res["risco_subsidiario"] = econ["indice_exposicao_financeira"]
             if econ.get("indice_exposicao_financeira") is not None:
                 fast_res["indice_exposicao_financeira"] = econ["indice_exposicao_financeira"]
-                fast_res["score_risco_terceirizacao"] = econ["indice_exposicao_financeira"]
-                fast_res["overall_risk_score"] = econ["indice_exposicao_financeira"]
 
             ckey = strat.get("cache_key") or f"{strat['mode']}::{q_term}::{target_cnpj or ''}"
             _prune_search_cache_if_needed()
@@ -3146,8 +3243,6 @@ def _search_record_to_pdf_payload(search: CompanySearch) -> dict:
         result["idoneidade_economica"] = search.economic_standing
         if search.economic_standing.get("indice_exposicao_financeira") is not None:
             result["indice_exposicao_financeira"] = search.economic_standing["indice_exposicao_financeira"]
-        if search.economic_standing.get("risco_calote_subsidiario") is not None:
-            result["risco_subsidiario"] = search.economic_standing["risco_calote_subsidiario"]
     result["parecer_agente_adk"] = result.get("ai_analysis") or {}
     result = normalize_execution_phase_payload(result)
     result["execution_phase_summary"] = make_json_safe(result.get("execution_phase_summary"))
@@ -3430,7 +3525,7 @@ def handle_pdf_export_request(
         "condenacao_por_motivo": [],
         "plus_previsao_condenacao": [],
         "indice_exposicao_financeira": econ_data.get("indice_exposicao_financeira", 0.0),
-        "score_risco_terceirizacao": econ_data.get("indice_exposicao_financeira", 0.0),
+        "score_risco_terceirizacao": 0.0,
         "idoneidade_economica": econ_data,
         "search_strategy": strategy,
         "scan_status": "COMPLETED",

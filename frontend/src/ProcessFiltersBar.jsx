@@ -40,6 +40,16 @@ export default function ProcessFiltersBar({
         </label>
 
         <label>
+          Instância
+          <select {...field('instancia')}>
+            <option value="">Todas as instâncias</option>
+            <option value="trts">TRTs (Instâncias Ordinárias)</option>
+            <option value="tst">TST (Instância Máxima)</option>
+            <option value="execucao">Em Execução</option>
+          </select>
+        </label>
+
+        <label>
           Desfecho
           <select {...field('outcome')}>
             <option value="">Todos</option>

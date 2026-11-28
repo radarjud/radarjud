@@ -256,6 +256,8 @@ class CompanySearch(db.Model):
                         ProcessRecord.numero_processo,
                         ProcessRecord.tribunal,
                         ProcessRecord.grau,
+                        ProcessRecord.primary_subject,
+                        ProcessRecord.observation,
                     )
                     .filter(ProcessRecord.company_search_id == self.id)
                     .all()
@@ -265,8 +267,14 @@ class CompanySearch(db.Model):
 
         if rows is not None:
             return sum(
-                1 for num, trib, grau in rows
-                if is_tst_process(numero_processo=num, tribunal=trib, grau=grau)
+                1 for num, trib, grau, subj, obs in rows
+                if is_tst_process(
+                    numero_processo=num,
+                    tribunal=trib,
+                    grau=grau,
+                    primary_subject=subj,
+                    observation=obs,
+                )
             )
 
         return sum(
@@ -275,6 +283,8 @@ class CompanySearch(db.Model):
                 numero_processo=getattr(p, "numero_processo", None),
                 tribunal=getattr(p, "tribunal", None),
                 grau=getattr(p, "grau", None),
+                primary_subject=getattr(p, "primary_subject", None),
+                observation=getattr(p, "observation", None),
             )
         )
 

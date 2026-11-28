@@ -177,7 +177,7 @@ export default function CatalogPage({
         <input
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-          placeholder="Nome da empresa (ex.: RadarJud, Google, Petrobras)"
+          placeholder="Nome da empresa (ex.: RadarJus, Google, Petrobras)"
           aria-label="Nome da empresa"
           required
           minLength={3}

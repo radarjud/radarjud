@@ -585,10 +585,15 @@ def is_tst_process(
     tribunal: Any = None,
     grau: Any = None,
     is_tst_recurso: bool = False,
+    primary_subject: Any = None,
+    observation: Any = None,
+    classes_pje: Any = None,
+    texts: Any = None,
 ) -> bool:
     """
     Identifica se um processo pertence ao TST (Tribunal Superior do Trabalho)
-    pela flag recursal, sigla do tribunal, grau ou segmento '.5.00.' do número CNJ.
+    pela flag recursal, sigla do tribunal, grau, segmento '.5.00.' do número CNJ
+    ou recursos dirigidos à Instância Máxima (Recurso de Revista / AIRR / TST).
     """
     if is_tst_recurso:
         return True
@@ -597,12 +602,41 @@ def is_tst_process(
     if "TST" in str(grau or "").upper():
         return True
     cnj_str = str(numero_processo or "").strip()
-    if not cnj_str:
-        return False
-    if ".5.00." in cnj_str:
-        return True
-    digits = re.sub(r"\D", "", cnj_str)
-    return len(digits) == 20 and digits[13:16] == "500"
+    if cnj_str:
+        if ".5.00." in cnj_str:
+            return True
+        digits = re.sub(r"\D", "", cnj_str)
+        if len(digits) == 20 and digits[13:16] == "500":
+            return True
+
+    corpus = []
+    if primary_subject:
+        corpus.append(str(primary_subject))
+    if observation:
+        corpus.append(str(observation))
+    if isinstance(classes_pje, list):
+        corpus.extend(str(c) for c in classes_pje if c)
+    elif classes_pje:
+        corpus.append(str(classes_pje))
+    if isinstance(texts, list):
+        corpus.extend(str(t) for t in texts[:5] if t)
+    elif texts:
+        corpus.append(str(texts))
+
+    search_text = " ".join(corpus).lower()
+    if search_text:
+        tst_patterns = [
+            r"\brecurso\s+de\s+revista\b",
+            r"\bairr\b",
+            r"\bagravo\s+de\s+instrumento\s+em\s+recurso\s+de\s+revista\b",
+            r"\btribunal\s+superior\s+do\s+trabalho\b",
+            r"\btst\b",
+        ]
+        for pat in tst_patterns:
+            if re.search(pat, search_text):
+                return True
+
+    return False
 
 
 def _adaptive_rate_limit_pause(resp: Any) -> float:
@@ -955,6 +989,19 @@ class CNJProcessSearcher:
             tipo_doc = item.get("tipoDocumento") or item.get("tipo_documento") or item.get("tipoComunicacao") or ""
             if tipo_doc and tipo_doc not in entry["tipos_doc_pje"]:
                 entry["tipos_doc_pje"].append(tipo_doc)
+
+            # Detecção de Recurso de Revista / AIRR / TST no texto ou metadados da publicação
+            if not entry.get("is_tst_recurso"):
+                if is_tst_process(
+                    numero_processo=cnj,
+                    tribunal=entry.get("siglaTribunal"),
+                    observation=entry.get("orgaoJulgador"),
+                    classes_pje=entry.get("classes_pje"),
+                    texts=entry.get("publicacoes_texto"),
+                ):
+                    entry["is_tst_recurso"] = True
+                    if not entry.get("siglaTribunal") or entry["siglaTribunal"].lower() in ("n/a", "none"):
+                        entry["siglaTribunal"] = "tst"
 
     def fetch_single_comunica_page(
         self,
