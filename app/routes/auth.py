@@ -272,16 +272,16 @@ def admin_list_users():
 @require_role(User.ROLE_ADMIN)
 def admin_update_user_plan(user_id: int):
     """
-    Atualiza o plano da organização do usuário.
+    Atualiza o plano individual do usuário alvo (ex: Analista ou Admin).
     Permitido apenas para administradores do mesmo tenant (Anti-IDOR).
-    Atualiza o plano do Tenant e recalcula os limites de cotas mensais.
+    Atualiza o plano e limite específico daquele usuário, preservando o plano dos demais membros.
     """
     admin_user = g.current_user
     target_user = db.session.get(User, user_id)
     if not target_user:
         return jsonify({"error": "Usuário não encontrado."}), 404
 
-    # Trava Anti-IDOR: O administrador só pode alterar planos do seu próprio Tenant
+    # Trava Anti-IDOR: O administrador só pode alterar planos de usuários do seu próprio Tenant
     if target_user.tenant_id != admin_user.tenant_id:
         logger.warning(
             "Tentativa de violação IDOR bloqueada: Admin id=%d (tenant=%d) tentou alterar plano do user id=%d (tenant=%d)",
@@ -299,10 +299,10 @@ def admin_update_user_plan(user_id: int):
             "valid_plans": list(valid_plans)
         }), 400
 
-    target_tenant = target_user.tenant
-    old_plan = target_tenant.plan
-    target_tenant.plan = new_plan
-    target_tenant.limite_mensal_consultas = Tenant.DEFAULT_QUOTAS.get(new_plan)
+    old_plan = target_user.effective_plan
+    # Atualiza especificamente o plano e a cota individual do usuário alvo
+    target_user.plan = new_plan
+    target_user.limite_mensal_consultas = Tenant.DEFAULT_QUOTAS.get(new_plan)
 
     # Suporte adicional opcional: alteração de role (ex: promover para ADMIN ou ANALISTA)
     new_role = data.get("role")
@@ -316,16 +316,17 @@ def admin_update_user_plan(user_id: int):
     try:
         db.session.commit()
         logger.info(
-            "Plano atualizado com sucesso pelo Admin id=%d: Tenant id=%d alterado de %s para %s (Limite: %s)",
-            admin_user.id, target_tenant.id, old_plan, new_plan, target_tenant.limite_mensal_consultas
+            "Plano individual atualizado com sucesso pelo Admin id=%d: Usuário id=%d (email=%s) alterado de %s para %s (Limite: %s)",
+            admin_user.id, target_user.id, target_user.email, old_plan, new_plan, target_user.limite_mensal_consultas
         )
 
         from app.services.quota_service import QuotaService
-        quota_info = QuotaService.check_quota(target_tenant)
+        target_tenant = target_user.tenant
+        quota_info = QuotaService.check_quota(target_tenant, user=target_user)
 
         return jsonify({
             "status": "success",
-            "message": f"Plano atualizado com sucesso para '{new_plan}'.",
+            "message": f"Plano do usuário {target_user.name} atualizado com sucesso para '{new_plan}'.",
             "user": target_user.to_dict(),
             "tenant": target_tenant.to_dict(),
             "quota": quota_info,

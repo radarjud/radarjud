@@ -23,7 +23,7 @@ export default function AdminUsersPage() {
       // Inicializa estado dos planos selecionados por usuário
       const initialPlans = {};
       (res.users || []).forEach(u => {
-        initialPlans[u.id] = res.tenant?.plan || 'ESSENCIAL';
+        initialPlans[u.id] = u.plan || res.tenant?.plan || 'ESSENCIAL';
       });
       setSelectedPlan(initialPlans);
     } catch (err) {
@@ -47,18 +47,18 @@ export default function AdminUsersPage() {
         method: 'PUT',
         body: JSON.stringify({ plan: newPlan }),
       });
-      setSuccessMsg(`Plano da organização atualizado para "${res.tenant?.plan || newPlan}" com sucesso!`);
-      // Atualiza os dados locais
+      setSuccessMsg(`Plano do usuário atualizado para "${res.user?.plan || newPlan}" com sucesso!`);
+      // Atualiza os dados locais apenas do usuário modificado
       setData(prev => {
         if (!prev) return prev;
         return {
           ...prev,
-          tenant: res.tenant,
-          quota: res.quota || prev.quota,
-          users: prev.users.map(u => ({
+          users: prev.users.map(u => (u.id === userId ? {
             ...u,
-            tenant_plan: res.tenant?.plan || newPlan,
-          })),
+            plan: res.user?.plan || newPlan,
+            user_plan: res.user?.plan || newPlan,
+            effective_plan: res.user?.effective_plan || newPlan,
+          } : u)),
         };
       });
       setSelectedPlan(prev => ({ ...prev, [userId]: newPlan }));
@@ -164,7 +164,7 @@ export default function AdminUsersPage() {
                   <th style={{ padding: '12px 14px' }}>Usuário</th>
                   <th style={{ padding: '12px 14px' }}>E-mail</th>
                   <th style={{ padding: '12px 14px' }}>Perfil de Acesso</th>
-                  <th style={{ padding: '12px 14px' }}>Plano da Organização</th>
+                  <th style={{ padding: '12px 14px' }}>Plano do Usuário</th>
                   <th style={{ padding: '12px 14px' }}>Status</th>
                   <th style={{ padding: '12px 14px', textAlign: 'right' }}>Ação de Plano</th>
                 </tr>
@@ -172,7 +172,8 @@ export default function AdminUsersPage() {
               <tbody>
                 {(data?.users || []).map((u) => {
                   const isCurrentUserUpdating = updatingUserId === u.id;
-                  const currentPlan = selectedPlan[u.id] || data?.tenant?.plan || 'ESSENCIAL';
+                  const currentPlan = selectedPlan[u.id] || u.plan || data?.tenant?.plan || 'ESSENCIAL';
+                  const activeUserPlan = u.plan || data?.tenant?.plan || 'ESSENCIAL';
                   return (
                     <tr key={u.id} style={{ borderBottom: '1px solid #f1f5f9' }}>
                       <td style={{ padding: '14px', fontWeight: 600, color: '#0f172a' }}>
@@ -207,7 +208,7 @@ export default function AdminUsersPage() {
                       </td>
                       <td style={{ padding: '14px' }}>
                         <span className="tag green" style={{ fontSize: '11px', fontWeight: 600 }}>
-                          {planLabel(data?.tenant?.plan)}
+                          {planLabel(activeUserPlan)}
                         </span>
                       </td>
                       <td style={{ padding: '14px' }}>
@@ -238,7 +239,7 @@ export default function AdminUsersPage() {
                             type="button"
                             className="primary"
                             onClick={() => handlePlanChange(u.id, currentPlan)}
-                            disabled={isCurrentUserUpdating || currentPlan === data?.tenant?.plan}
+                            disabled={isCurrentUserUpdating || currentPlan === activeUserPlan}
                             style={{ fontSize: '12px', padding: '6px 12px', whiteSpace: 'nowrap' }}
                           >
                             {isCurrentUserUpdating ? (

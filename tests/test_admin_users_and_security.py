@@ -146,7 +146,7 @@ def test_admin_board_list_and_update_plan_flow(client):
     assert list_data["tenant"]["plan"] == "ESSENCIAL"
     assert list_data["quota"]["limit"] == 30
 
-    # 3. Admin Alfa altera plano para PRO
+    # 3. Admin Alfa altera plano de user_alfa para PRO (isolado para este usuário)
     update_pro = client.put(
         f"/api/v1/auth/admin/users/{user_alfa_id}/plan",
         headers={"Authorization": f"Bearer {token_alfa}"},
@@ -154,10 +154,17 @@ def test_admin_board_list_and_update_plan_flow(client):
     )
     assert update_pro.status_code == 200
     pro_data = update_pro.get_json()
-    assert pro_data["tenant"]["plan"] == "PRO"
+    assert pro_data["user"]["plan"] == "PRO"
     assert pro_data["quota"]["limit"] == 150
 
-    # 4. Admin Alfa altera plano para ENTERPRISE (Ilimitado)
+    # Valida que a alteração de user_alfa NÃO afetou analista2
+    with client.application.app_context():
+        u_analista_check = db.session.get(User, analista_id)
+        assert u_analista_check.plan is None
+        assert u_analista_check.effective_plan == "ESSENCIAL"
+        assert u_analista_check.effective_limit == 30
+
+    # 4. Admin Alfa altera plano de analista para ENTERPRISE (Ilimitado)
     update_ent = client.patch(
         f"/api/v1/auth/admin/users/{analista_id}/plan",
         headers={"Authorization": f"Bearer {token_alfa}"},
@@ -165,8 +172,15 @@ def test_admin_board_list_and_update_plan_flow(client):
     )
     assert update_ent.status_code == 200
     ent_data = update_ent.get_json()
-    assert ent_data["tenant"]["plan"] == "ENTERPRISE"
+    assert ent_data["user"]["plan"] == "ENTERPRISE"
     assert ent_data["quota"]["is_unlimited"] is True
+
+    # Valida novamente que user_alfa permaneceu PRO e analista2 virou ENTERPRISE
+    with client.application.app_context():
+        u_alfa_check = db.session.get(User, user_alfa_id)
+        u_analista_check2 = db.session.get(User, analista_id)
+        assert u_alfa_check.plan == "PRO"
+        assert u_analista_check2.plan == "ENTERPRISE"
 
     # 5. Tentativa com plano inválido
     bad_plan = client.put(
