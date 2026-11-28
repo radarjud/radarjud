@@ -484,7 +484,7 @@ def classify_process_outcome(
 def _page_signature(comm_ids: Set[str]) -> str:
     """Assinatura curta e determinística do conjunto de comunicações de uma página."""
     joined = "\n".join(sorted(comm_ids))
-    return hashlib.sha1(joined.encode("utf-8", "ignore")).hexdigest()
+    return hashlib.sha1(joined.encode("utf-8", "ignore"), usedforsecurity=False).hexdigest()
 
 
 def _total_pages_from_payload(payload: Any, itens_por_pagina: int) -> Optional[int]:
@@ -1837,7 +1837,7 @@ class CNJProcessSearcher:
         texto = str(item.get("texto") or item.get("teor") or "")[:300]
         if not (numero or texto):
             return ""
-        digest = hashlib.sha1(f"{numero}|{data}|{texto}".encode("utf-8", "ignore")).hexdigest()
+        digest = hashlib.sha1(f"{numero}|{data}|{texto}".encode("utf-8", "ignore"), usedforsecurity=False).hexdigest()
         return f"h:{digest}"
 
     def fetch_brasil_api_fast(self, cnpj: str, timeout: float = 3.5) -> Dict[str, Any]:
