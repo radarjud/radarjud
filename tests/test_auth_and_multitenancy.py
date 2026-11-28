@@ -78,6 +78,36 @@ def test_auth_me_endpoint(client):
     assert me_data["tenant"]["name"] == "Consultoria Compliance"
 
 
+def test_auth_logout_endpoint(client):
+    """Testa endpoint de logout (/api/v1/auth/logout e alias /api/auth/logout)."""
+    # 1. Logout anônimo ou sem token retorna 200
+    resp_anon = client.post("/api/v1/auth/logout")
+    assert resp_anon.status_code == 200
+    assert resp_anon.get_json()["status"] == "success"
+
+    # 2. Cadastro de usuário para obter token
+    reg_resp = client.post("/api/v1/auth/register", json={
+        "name": "Pedro Auditor",
+        "email": "pedro@auditor.com",
+        "password": "senha-segura-logout",
+        "tenant_name": "Auditoria Corp",
+    })
+    access_token = reg_resp.get_json()["access_token"]
+
+    # 3. Logout autenticado
+    resp_auth = client.post(
+        "/api/v1/auth/logout",
+        headers={"Authorization": f"Bearer {access_token}"}
+    )
+    assert resp_auth.status_code == 200
+    assert resp_auth.get_json()["status"] == "success"
+
+    # 4. Rota alias /api/auth/logout
+    resp_alias = client.post("/api/auth/logout")
+    assert resp_alias.status_code == 200
+    assert resp_alias.get_json()["status"] == "success"
+
+
 def test_auth_refresh_token_endpoint(client):
     """Testa renovação de access_token usando refresh_token válido."""
     reg_resp = client.post("/api/v1/auth/register", json={

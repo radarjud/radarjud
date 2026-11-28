@@ -163,6 +163,7 @@ def test_l1_database_cache_serves_browser_partial_without_external_calls(client,
             outcomes_summary={"condenacoes": 400, "acordos": 300, "improcedentes": 200, "em_aberto": 600},
             ranking_motivos=[{"motivo": "Horas Extras", "quantidade": 500, "porcentagem": 33.3}],
             predictions_summary=[{"motivo": "Horas Extras", "probabilidade_condenacao_pct": 62.0}],
+            contratos_poder_publico={"total_contratos": 0, "registros": [], "fonte": "CACHE"},
             economic_standing={
                 "cenario": "CENARIO_A",
                 "situacao_cadastral": "ATIVA",
